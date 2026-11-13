@@ -2923,6 +2923,9 @@ header .title{font-weight:600}
 header .range{color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
 header .sp{flex:1}
 .ghlinks{display:flex;gap:8px;font-size:12px}
+/* Base width 0: the title only fills space left over, so it never makes other items wrap. */
+header .prtitle{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:max-content;flex:1000 1 0}
+header .ghlinks:empty,header .prtitle:empty{display:none}
 .ghcard{border:1px solid var(--border);border-left:3px solid var(--muted);border-radius:6px;padding:8px 12px;margin-bottom:16px;font-size:13px}
 .ghcard .xmeta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:4px 0}
 .ghcard .xmeta .sp,.thread.gh .thead .sp{flex:1}
@@ -3030,7 +3033,7 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 </style>
 </head>
 <body>
-<header><span class="title" id="title">prv</span><span class="range" id="range"></span><span class="ghlinks" id="ghlinks"></span><span class="sp"></span>
+<header><span class="title" id="title">prv</span><span class="range" id="range"></span><span class="ghlinks" id="ghpr"></span><span class="prtitle" id="prtitle"></span><span class="ghlinks" id="ghlinks"></span><span class="sp"></span>
 <button id="xtoggle" hidden title="Show or hide the explanations next to the diff">Notes</button>
 <button id="split" title="Switch between unified and side-by-side diff">Split</button>
 <select id="theme" title="Color theme"></select>
@@ -3478,7 +3481,7 @@ function openViewComposer(){
 }
 $('#askview').addEventListener('click', () => { if (S.diff) openViewComposer(); });
 
-// GitHub: PR and Jira links in the header, the PR's comments in a card, review threads under their lines.
+// GitHub: the PR link and title and the Jira links in the header, the PR's comments in a card, review threads under their lines.
 async function loadGitHub(){
   const v = S.view, seq = S.seq;
   let g;
@@ -3503,10 +3506,9 @@ function lineK(a){
 }
 function renderGitHub(){
   const g = S.gh;
-  const links = [];
-  if (g?.pr) links.push(`<a ${ext(g.pr.url)} title="${esc(g.pr.title)}">PR #${g.pr.number}</a>`);
-  for (const j of g?.jira || []) links.push(`<a ${ext(j.url)}>${esc(j.key)}</a>`);
-  $('#ghlinks').innerHTML = links.join('');
+  $('#ghpr').innerHTML = g?.pr ? `<a ${ext(g.pr.url)}>PR #${g.pr.number}</a>` : '';
+  $('#prtitle').textContent = $('#prtitle').title = g?.pr?.title || '';
+  $('#ghlinks').innerHTML = (g?.jira || []).map(j => `<a ${ext(j.url)}>${esc(j.key)}</a>`).join('');
   setTitle();
   document.querySelectorAll('.ghrow').forEach(e => e.remove());
   const el = $('#ghcard');
