@@ -6,6 +6,9 @@ to answer.
 
 - **Ask about lines.** Click a line number (shift-click for a range), type a question. The answer
   streams in, and the thread is saved in `<git-dir>/prv/threads.json`.
+- **Chat about the PR.** In "All changes", **Chat about this PR** starts a thread about the whole PR;
+  Claude also gets the PR title, description and Jira keys. In a commit view the same button asks
+  about that commit.
 - **Explanations.** A summary of the PR, and notes next to each hunk or, per commit, next to the
   lines they explain. Run from the page, or with `prv explain` (`prv explain --commits` for line notes).
 - **AI review.** A Claude review (Fable by default) that reports defects with a failure scenario.
