@@ -20,6 +20,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import prv
 
 
+# Git config from the tests alone: commit.gpgsign or a url.*.insteadOf in ~/.gitconfig, the system
+# config or `git -c` (GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT) would change what git does in them.
+_git_home = tempfile.TemporaryDirectory()
+_git_vars = {"GIT_CONFIG_GLOBAL": os.path.join(_git_home.name, "gitconfig"), "GIT_CONFIG_NOSYSTEM": "1",
+             "GIT_CONFIG_PARAMETERS": "", "GIT_CONFIG_COUNT": "0"}
+_git_env = mock.patch.dict(os.environ, _git_vars)
+
+
+def setUpModule():
+    with open(os.path.join(_git_home.name, "gitconfig"), "w") as fh:
+        fh.write("[user]\n\temail = t@t\n\tname = t\n")
+    local = subprocess.run(["git", "rev-parse", "--local-env-vars"], check=True, capture_output=True,
+                           text=True).stdout.split()
+    _git_env.start()
+    # A git hook running the suite passes GIT_INDEX_FILE or GIT_DIR, which would send the tests' git
+    # commands to the outer repository. _git_env.stop() puts them back.
+    for k in set(local) - set(_git_vars):
+        os.environ.pop(k, None)
+
+
+def tearDownModule():
+    _git_env.stop()
+    _git_home.cleanup()
+
+
 class ParseDiffTest(unittest.TestCase):
     def test_modify_two_hunks_and_dashes_in_content(self):
         text = (
@@ -751,6 +776,21 @@ class GitHubTest(unittest.TestCase):
     def git_head(self):
         return prv.git(self.root, "rev-parse", "HEAD").strip()
 
+    def test_own_pr_needs_the_login(self):
+        pr = {"repos/scylla/db/pulls/4321/": [], "repos/scylla/db/issues/4321/": [],  # before the PR's prefix
+              "repos/scylla/db/pulls/4321": {"number": 4321, "title": "x", "state": "open", "user": {"login": "me"}}}
+        self.assertFalse(self.fetch(pr).for_view("all")["own"])  # without --allow-push the login is not read
+        for login, own in (("me", True), ("else", False)):
+            os.environ["FAKE_GH"] = json.dumps({**pr, "user": {"login": login}})
+            gh = prv.GitHub(self.repo, self.gh, login=True)
+            gh.fetch()
+            self.assertEqual(gh.for_view("all")["own"], own, login)
+        os.environ["FAKE_GH"] = json.dumps({**pr, "user": "!"})
+        gh = prv.GitHub(self.repo, self.gh, login=True)
+        gh.fetch()
+        v = gh.for_view("all")
+        self.assertEqual((v["own"], v["pr"]["number"], v["error"]), (False, 4321, None))
+
     def test_pr_found_by_directory_name(self):
         gh = self.fetch({"repos/scylla/db/pulls/4321": {"number": 4321, "title": "x", "html_url": "https://github.com/p"}})
         self.assertEqual(gh.for_view("all")["pr"]["number"], 4321)
@@ -1220,6 +1260,344 @@ class InstallTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("OWNER/NAME", r.stderr)
         self.assertFalse(os.path.lexists(self.link))
+
+
+class ChangesTest(unittest.TestCase):
+    """Commit and push, with local bare repositories in place of GitHub and a fake gh."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        t = self.root = os.path.realpath(self.tmp.name)
+        self.fork = os.path.join(t, "gh", "github.com", "me", "fork.git")
+        subprocess.run(["git", "init", "-q", "--bare", self.fork], check=True)
+        d = self.work = os.path.join(t, "work")
+        self.run_git("init", "-q", "-b", "master", d, cwd=t)
+        self.write("a.txt", "one\n")
+        self.run_git("add", ".")
+        self.run_git("commit", "-qm", "base")
+        self.run_git("checkout", "-qb", "feat")
+        self.write("a.txt", "two\n")
+        self.run_git("commit", "-qam", "c1")
+        self.run_git("remote", "add", "upstream", "https://github.com/org/repo.git")
+        # The remote names github.com, as the push target check wants; insteadOf sends it to the bare repo.
+        self.run_git("remote", "add", "fork", "https://github.com/me/fork.git")
+        self.run_git("config", f"url.{self.fork}.insteadOf", "https://github.com/me/fork.git")
+        self.run_git("push", "-q", "fork", "feat")
+        self.c1 = self.sha("HEAD")
+        gh = os.path.join(t, "gh.py")
+        with open(gh, "w") as fh:
+            fh.write(FAKE_GH)
+        os.chmod(gh, 0o755)
+        os.environ["FAKE_GH_LOG"] = os.path.join(t, "gh.log")
+        self.addCleanup(os.environ.pop, "FAKE_GH_LOG", None)
+        self.addCleanup(os.environ.pop, "FAKE_GH", None)
+        self.set_pr(self.c1)
+        self.repo = prv.Repo(d, self.sha("master"), "HEAD", "master")
+        self.runner = prv.Runner(self.repo, prv.Store(self.repo.git_dir), "/bin/false")
+        self.gh = gh
+        self.github = prv.GitHub(self.repo, gh, 7)
+        self.github.start = lambda: None  # the refresh after a push; not under test
+        self.changes = prv.Changes(self.repo, self.runner, self.github, allow_push=True)
+
+    def run_git(self, *args, cwd=None):
+        return subprocess.run(["git", *args], cwd=cwd or self.work, check=True, capture_output=True,
+                              text=True).stdout
+
+    def sha(self, rev, cwd=None):
+        return self.run_git("rev-parse", rev, cwd=cwd).strip()
+
+    def write(self, name, text):
+        with open(os.path.join(self.work, name), "w") as fh:
+            fh.write(text)
+
+    def set_pr(self, sha, state="open", user="me", merged=False):
+        os.environ["FAKE_GH"] = json.dumps({"user": {"login": "me"}, "repos/org/repo/pulls/7": {
+            "state": state, "merged_at": "2026-11-13" if merged else None, "user": {"login": user},
+            "head": {"sha": sha, "ref": "feat", "repo": {"full_name": "me/fork"}}}})
+
+    def on_github(self):
+        return self.sha("feat", cwd=self.fork)
+
+    def push_from_elsewhere(self):
+        """Another machine pushes a commit on top of c1; returns its sha."""
+        other = os.path.join(self.root, "other")
+        self.run_git("clone", "-q", "-b", "feat", self.fork, other, cwd=self.root)
+        self.run_git("-c", "user.email=o@o", "-c", "user.name=o", "commit", "-q", "--allow-empty", "-m", "x",
+                     cwd=other)
+        self.run_git("push", "-q", "origin", "feat", cwd=other)
+        return self.sha("HEAD", cwd=other)
+
+    def test_fast_forward_push(self):
+        self.write("b.txt", "b\n")
+        self.run_git("add", "b.txt")
+        self.run_git("commit", "-qm", "c2")
+        c2 = self.sha("HEAD")
+        st = self.changes.push_state()
+        self.assertEqual((st["github"], st["local"], st["force"], st["drop"]), (self.c1, c2, False, []))
+        self.assertEqual([s for _, s in st["add"]], ["c2"])
+        self.assertEqual((st["target"], st["url"]), ("me/fork:feat", "https://github.com/me/fork.git"))
+        self.assertTrue(self.changes.push(self.c1, c2)["pushed"])
+        self.assertEqual(self.on_github(), c2)
+
+    def test_rewrite_is_a_force_push_and_lists_the_dropped_commits(self):
+        self.run_git("commit", "-q", "--amend", "-m", "c1 v2")
+        st = self.changes.push_state()
+        self.assertTrue(st["force"])
+        self.assertEqual(([s for _, s in st["add"]], [s for _, s in st["drop"]]), (["c1 v2"], ["c1"]))
+        self.changes.push(self.c1, st["local"])
+        self.assertEqual(self.on_github(), st["local"])
+
+    def test_lease_refuses_a_branch_that_moved_after_github_reported_it(self):
+        self.run_git("commit", "-q", "--allow-empty", "-m", "c2")
+        x = self.push_from_elsewhere()  # GitHub's PR data still says c1
+        with self.assertRaises(prv.ChangeError) as cm:
+            self.changes.push(self.c1, self.sha("HEAD"))
+        self.assertIn("stale info", str(cm.exception))
+        self.assertEqual(self.on_github(), x)
+
+    def test_moved_pr_or_head_is_refused_before_pushing(self):
+        self.run_git("commit", "-q", "--allow-empty", "-m", "c2")
+        c2 = self.sha("HEAD")
+        for expect, local in ((self.sha("master"), c2), (self.c1, self.sha("master"))):
+            with self.assertRaises(prv.ChangeError) as cm:
+                self.changes.push(expect, local)
+            self.assertEqual(cm.exception.status, 409)
+        self.assertEqual(self.on_github(), self.c1)
+
+    def test_github_head_missing_locally_is_fetched(self):
+        y = self.push_from_elsewhere()
+        self.set_pr(y)
+        st = self.changes.push_state()
+        self.assertTrue(st["force"])  # pushing c1 would drop y
+        self.assertEqual([s for _, s in st["drop"]], ["x"])
+
+    def test_github_head_is_fetched_from_the_push_url(self):
+        # Fetches from another repository, pushes to the fork: the PR's head is only in the fork.
+        other = os.path.join(self.root, "upstream.git")
+        subprocess.run(["git", "init", "-q", "--bare", other], check=True)
+        self.run_git("remote", "set-url", "fork", other)
+        self.run_git("config", "remote.fork.pushurl", "https://github.com/me/fork.git")
+        y = self.push_from_elsewhere()
+        self.set_pr(y)
+        self.assertEqual([s for _, s in self.changes.push_state()["drop"]], ["x"])
+
+    def test_push_is_refused(self):
+        for setup, text in ((lambda: self.set_pr(self.c1, user="else"), "by @else"),
+                            (lambda: self.set_pr(self.c1, state="closed"), "is closed"),
+                            (lambda: self.set_pr(self.c1, state="closed", merged=True), "is merged")):
+            setup()
+            with self.assertRaises(prv.ChangeError) as cm:
+                self.changes.push_state()
+            self.assertIn(text, str(cm.exception))
+        self.set_pr(self.c1)
+        with self.assertRaises(prv.ChangeError) as cm:
+            prv.Changes(self.repo, self.runner, self.github).push_state()
+        self.assertEqual(cm.exception.status, 403)
+
+    def test_push_url_follows_the_other_remotes_scheme(self):
+        self.run_git("remote", "remove", "fork")
+        # A remote with the same owner/name under another host is not the PR's repository.
+        self.run_git("remote", "add", "mirror", "https://mirror.corp/github.com/me/fork.git")
+        self.assertEqual(self.changes._remote("me/fork")[1], "https://github.com/me/fork.git")
+        self.run_git("remote", "set-url", "--push", "upstream", "git@github.com:org/repo.git")
+        self.assertEqual(self.changes._remote("me/fork")[1], "git@github.com:me/fork.git")
+        self.run_git("remote", "set-url", "--push", "--delete", "upstream", ".")
+        self.assertEqual(self.changes._remote("me/fork")[1], "https://github.com/me/fork.git")
+        self.run_git("remote", "set-url", "upstream", "git@github.com:org/repo.git")
+        self.assertEqual(self.changes._remote("me/fork")[1], "git@github.com:me/fork.git")
+
+    def test_commit_and_amend(self):
+        self.write("a.txt", "three\n")
+        self.write("new.txt", "n\n")
+        self.assertIn("c2", self.changes.commit("c2", False)["head"])
+        self.assertEqual(self.run_git("status", "--porcelain"), "")
+        self.assertEqual(self.run_git("show", "--format=", "--name-only", "HEAD").split(), ["a.txt", "new.txt"])
+        self.write("new.txt", "m\n")
+        self.changes.commit("", True)  # empty message: keep c2's
+        self.assertEqual(self.run_git("log", "--format=%s", "master..HEAD").split("\n")[:2], ["c2", "c1"])
+        with self.assertRaises(prv.ChangeError):
+            self.changes.commit("c3", False)  # nothing to commit
+        with self.assertRaises(prv.ChangeError):
+            self.changes.commit("", False)  # no message
+        self.write("new.txt", "o\n")
+        self.runner.edit_lock.acquire()
+        try:
+            with self.assertRaises(prv.ChangeError) as cm:
+                self.changes.commit("c3", False)
+            self.assertEqual(cm.exception.status, 409)
+        finally:
+            self.runner.edit_lock.release()
+        self.run_git("checkout", "-q", "-f", "-B", "feat", "master")  # empty range
+        self.write("a.txt", "four\n")
+        with self.assertRaises(prv.ChangeError) as cm:
+            self.changes.commit("x", True)
+        self.assertIn("no commit in the range", str(cm.exception))
+        self.assertEqual(self.sha("HEAD"), self.sha("master"))
+
+    def test_pr_is_found_again_not_read_from_the_cache(self):
+        # github.json of an older run names PR 8, another branch of the same user.
+        os.environ["FAKE_GH"] = json.dumps({**json.loads(os.environ["FAKE_GH"]),
+                                            "repos/org/repo/commits/": [{"number": 7}],
+                                            "repos/org/repo/pulls/8": {"state": "open", "user": {"login": "me"},
+                                                                       "head": {"sha": self.c1, "ref": "other",
+                                                                                "repo": {"full_name": "me/fork"}}}})
+        github = prv.GitHub(self.repo, self.gh)
+        github.data = {"pr": {"number": 8}}
+        st = prv.Changes(self.repo, self.runner, github, allow_push=True).push_state()
+        self.assertEqual((st["number"], st["target"]), (7, "me/fork:feat"))
+
+    def test_commit_does_not_wait_for_a_push(self):
+        self.write("a.txt", "three\n")
+        with self.changes.lock:  # a push or its check
+            t = time.monotonic()
+            with self.assertRaises(prv.ChangeError) as cm:
+                self.changes.commit("c2", False)
+            self.assertLess(time.monotonic() - t, 1)
+        self.assertEqual(cm.exception.status, 409)
+        self.assertTrue(self.runner.edit_lock.acquire(blocking=False))
+        self.runner.edit_lock.release()
+
+    def test_commit_refuses_unresolved_conflicts(self):
+        self.run_git("checkout", "-qb", "side", "master")
+        self.write("a.txt", "side\n")
+        self.run_git("commit", "-qam", "side")
+        self.run_git("checkout", "-q", "feat")
+        subprocess.run(["git", "merge", "-q", "side"], cwd=self.work, capture_output=True)
+        with self.assertRaises(prv.ChangeError) as cm:
+            self.changes.commit("merge", False)
+        self.assertIn("conflicts", str(cm.exception))
+        self.assertIn("UU a.txt", self.run_git("status", "--porcelain"))
+
+    def test_refused_commit_keeps_the_staging(self):
+        hook = os.path.join(self.work, ".git", "hooks", "pre-commit")
+        with open(hook, "w") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")
+        os.chmod(hook, 0o755)
+        self.write("a.txt", "staged\n")
+        self.run_git("add", "a.txt")
+        self.write("a.txt", "unstaged\n")
+        self.write("new.txt", "n\n")
+        before = self.run_git("status", "--porcelain")
+        with self.assertRaises(prv.ChangeError):
+            self.changes.commit("c2", False)
+        self.assertEqual((self.run_git("status", "--porcelain"), self.sha("HEAD")), (before, self.c1))
+        self.assertFalse(os.path.exists(os.path.join(self.work, ".git", "index.prv-commit")))
+
+    def test_commit_without_an_index(self):
+        os.unlink(os.path.join(self.work, ".git", "index"))
+        self.write("new.txt", "n\n")
+        self.changes.commit("c2", False)  # `add -A` writes a new index from the working tree
+        self.assertEqual(self.run_git("show", "--format=", "--name-only", "HEAD").split(), ["new.txt"])
+
+    def test_amend_with_nothing_to_change_is_refused(self):
+        with self.assertRaises(prv.ChangeError) as cm:
+            self.changes.commit("", True)
+        self.assertIn("nothing to amend", str(cm.exception))
+        self.assertEqual(self.sha("HEAD"), self.c1)  # a no-op amend would still rewrite HEAD
+        self.changes.commit("c1 reworded", True)
+        self.assertEqual(self.run_git("log", "-1", "--format=%s").strip(), "c1 reworded")
+
+    def add_submodule(self):
+        """Commits a submodule `sub`, cloned from a local bare repository; returns that repository."""
+        sub, subw = os.path.join(self.root, "sub.git"), os.path.join(self.root, "subw")
+        self.run_git("init", "-q", "--bare", sub, cwd=self.root)
+        self.run_git("-c", "protocol.file.allow=always", "clone", "-q", sub, subw, cwd=self.root)
+        self.run_git("commit", "-q", "--allow-empty", "-m", "s", cwd=subw)
+        self.run_git("push", "-q", "origin", "HEAD", cwd=subw)
+        self.run_git("-c", "protocol.file.allow=always", "submodule", "-q", "add", sub, "sub")
+        self.run_git("commit", "-qm", "c2")
+        return sub
+
+    def test_amend_refuses_a_submodule_with_only_untracked_files(self):
+        self.add_submodule()
+        c2 = self.sha("HEAD")
+        with open(os.path.join(self.work, "sub", "junk"), "w") as fh:
+            fh.write("j\n")  # status shows " M sub"; `git add -A` cannot stage it
+        with self.assertRaises(prv.ChangeError) as cm:
+            self.changes.commit("", True)
+        self.assertIn("nothing to amend", str(cm.exception))
+        self.assertEqual(self.sha("HEAD"), c2)
+
+    def test_push_sends_no_tags_and_no_submodules(self):
+        sub = self.add_submodule()
+        self.run_git("commit", "-q", "--allow-empty", "-m", "s2", cwd=os.path.join(self.work, "sub"))
+        self.run_git("commit", "-qam", "c3")  # points at s2, which sub.git does not have
+        self.run_git("tag", "-a", "v1", "-m", "v1")
+        self.run_git("config", "push.followTags", "true")
+        self.run_git("config", "submodule.recurse", "true")
+        refs = self.run_git("for-each-ref", cwd=sub)
+        self.changes.push(self.c1, self.sha("HEAD"))
+        self.assertEqual((self.on_github(), self.run_git("tag", cwd=self.fork)), (self.sha("HEAD"), ""))
+        self.assertEqual(self.run_git("for-each-ref", cwd=sub), refs)
+
+    def test_remote_with_two_push_urls_is_not_the_target(self):
+        self.assertEqual(self.changes._remote("me/fork")[0], "fork")
+        self.run_git("config", "--add", "remote.fork.pushurl", "https://github.com/me/fork.git")
+        self.run_git("config", "--add", "remote.fork.pushurl", "https://example.com/elsewhere.git")
+        self.assertEqual(self.changes._remote("me/fork"), ("https://github.com/me/fork.git",) * 2)
+
+    def test_commit_sees_untracked_files_when_status_hides_them(self):
+        self.run_git("config", "status.showUntrackedFiles", "no")
+        self.write("new.txt", "n\n")
+        self.changes.commit("c2", False)
+        self.assertEqual(self.run_git("show", "--format=", "--name-only", "HEAD").split(), ["new.txt"])
+
+    def test_token_in_a_remote_url_is_hidden(self):
+        self.assertEqual(prv.hide_token("fatal: https://x:ghp_1@github.com/a/b.git and https://github.com/c"),
+                         "fatal: https://github.com/a/b.git and https://github.com/c")
+        self.assertEqual(prv.hide_token("git@github.com:a/b.git"), "git@github.com:a/b.git")
+
+    def test_timeout_kills_the_whole_process_group(self):
+        pidfile = os.path.join(self.root, "pid")
+        with self.assertRaises(prv.ChangeError) as cm:
+            # Written whole before the timeout, even on a loaded machine: a 1 s timeout was flaky.
+            prv.git_net(self.work, "-c", f"alias.slow=!sleep 60 & echo $! > {pidfile}.tmp && mv {pidfile}.tmp {pidfile}; wait",
+                        "slow", timeout=3)
+        self.assertIn("timed out", str(cm.exception))
+        with open(pidfile) as fh:
+            pid = int(fh.read())
+        for _ in range(50):  # the orphan is reaped by init once killed
+            try:
+                with open(f"/proc/{pid}/stat") as fh:
+                    stat = fh.read()
+                # Another command: the sleep is gone and its pid reused.
+                if "(sleep)" not in stat or stat.split(")")[-1].split()[0] in "ZX":
+                    break
+            except (FileNotFoundError, ProcessLookupError):  # exited between open() and read()
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(pid, signal.SIGKILL)
+            self.fail("git's child outlived the timeout")
+
+    def test_http_routes(self):
+        h = prv.make_handler(self.repo, self.runner.store, self.runner, prv.Explainer(self.repo, "/bin/false"),
+                             "tok", prv.PAGE, github=self.github, changes=self.changes)
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), h)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        url = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+        def req(path, body=None):
+            r = urllib.request.Request(url + path, headers={"X-Prv-Token": "tok", "Content-Type": "application/json"},
+                                       data=None if body is None else json.dumps(body).encode())
+            try:
+                with urllib.request.urlopen(r) as resp:
+                    return resp.status, json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+        self.assertTrue(req("/api/meta")[1]["push"])
+        self.write("b.txt", "b\n")
+        self.assertEqual(req("/api/commit", {"message": "c2"})[0], 200)
+        code, st = req("/api/push")
+        self.assertEqual((code, st["github"], st["force"]), (200, self.c1, False))
+        self.assertEqual(req("/api/push", {"expect": st["github"], "local": st["local"]})[0], 200)
+        self.assertEqual(self.on_github(), st["local"])
+        self.changes.allow_push = False
+        self.assertEqual(req("/api/push")[0], 403)
+        self.assertFalse(req("/api/meta")[1]["push"])
 
 
 class ListenTest(unittest.TestCase):

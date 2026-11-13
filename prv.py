@@ -1877,7 +1877,7 @@ class Reviewer(Explainer):
 FORBIDDEN = "wrong token: prv was restarted or the URL is incomplete; open the URL prv printed"
 
 
-def make_handler(repo, store, runner, explainer, token, page, github=None, reviewers=None):
+def make_handler(repo, store, runner, explainer, token, page, github=None, reviewers=None, changes=None):
     def _token_ok(given):
         # Bytes: compare_digest raises TypeError on non-ASCII str input.
         return secrets.compare_digest(given.encode(), token.encode())
@@ -1938,7 +1938,7 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                 return self._json({"error": FORBIDDEN}, 403)
             try:
                 if u.path == "/api/meta":
-                    return self._json(repo.meta())
+                    return self._json({**repo.meta(), "push": bool(changes and changes.allow_push)})
                 if u.path == "/api/diff":
                     paths = q.get("path")  # "Whole file": a file's old and new path
                     if paths is not None and len(paths) > 2:
@@ -1959,6 +1959,12 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                     if github is None:
                         return self._json({"disabled": True})
                     return self._json(github.for_view(repo.check_view(q.get("view", ["all"])[0])))
+                if u.path == "/api/push":
+                    if changes is None:
+                        return self._json({"error": "push is off; start prv with --allow-push"}, 403)
+                    return self._json(changes.push_state())
+            except ChangeError as e:
+                return self._json({"error": str(e)}, e.status)
             except GitError as e:
                 return self._json({"error": str(e)}, 400)
             self._json({"error": "not found"}, 404)
@@ -2029,6 +2035,20 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                 if not r.start(model, ctx):
                     return self._json({"error": "this review is already running"}, 409)
                 return self._json({"started": True})
+            if u.path in ("/api/commit", "/api/push"):
+                if changes is None:
+                    return self._json({"error": "commit and push are off"}, 403)
+                try:
+                    if u.path == "/api/commit":
+                        return self._json(changes.commit(str(body.get("message") or "").strip(),
+                                                         bool(body.get("amend"))))
+                    return self._json(changes.push(str(body.get("expect") or ""), str(body.get("local") or "")))
+                except ChangeError as e:
+                    return self._json({"error": str(e)}, e.status)
+                except GitError as e:
+                    return self._json({"error": str(e)}, 400)
+                except OSError as e:  # saving or restoring the index
+                    return self._json({"error": str(e)}, 500)
             if u.path == "/api/delete":
                 tid = str(body.get("id", ""))
                 with store.lock:
@@ -2131,6 +2151,8 @@ JIRA_URL = "https://scylladb.atlassian.net/browse/"
 JIRA_RE = re.compile(r"(?<![A-Za-z0-9])([A-Z][A-Z0-9]{1,15}-[0-9]{1,7})(?![0-9])")
 GH_REMOTE_RE = re.compile(r"github\.com[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$")
 PR_NAME_RE = re.compile(r"(?i)(?:^|[/_-])pr[_-]?([0-9]{3,7})(?:$|[/_-])")
+GH_PUSH_URL_RE = re.compile(r"(?:https://(?:[^@/]+@)?github\.com/|ssh://git@github\.com(?::22)?/|git@github\.com:)"
+                            r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?\Z")
 GH_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")  # \Z: $ would accept a trailing newline
 REF_LINE_RE = re.compile(r"(?i)^\s*(fixes|refs?|related|closes|see)\b")
 
@@ -2232,9 +2254,11 @@ class GitHub:
     """The reviewed branch's pull request: links, Jira keys and review comments, read with
     `gh api` (REST) in the background. The last result is kept in <git-dir>/prv/github.json."""
 
-    def __init__(self, repo, gh, pr=None, jira_url=JIRA_URL):
+    def __init__(self, repo, gh, pr=None, jira_url=JIRA_URL, login=False):
         self.repo = repo
         self.gh = gh
+        self.want_login = login  # --allow-push: Push shows only on the user's own PRs
+        self.login = None
         self.pr_arg = pr
         self.jira_url = jira_url
         self.path = os.path.join(repo.git_dir, "prv", "github.json")
@@ -2249,6 +2273,12 @@ class GitHub:
 
     def _api(self, path, paginate=False):
         return gh_api(self.gh, path, self.repo.root, paginate)
+
+    def read_login(self):
+        """The gh user's login, read once. Raises OSError, ValueError or AttributeError."""
+        if not self.login:
+            self.login = str(self._api("user").get("login") or "") or None
+        return self.login
 
     def _find_pr(self, owner, name):
         root = self.repo.root
@@ -2295,6 +2325,11 @@ class GitHub:
     def _fetch(self):
         repo = self.repo
         out = {"fetched": time.time(), "pr": None, "threads": [], "conversation": [], "error": None}
+        if self.want_login:
+            try:
+                self.read_login()
+            except (OSError, ValueError, AttributeError):
+                pass  # Push stays hidden until a later fetch reads the login
         branch = git(repo.root, "branch", "--show-current", check=False).strip()
         keys = jira_keys(branch, anywhere=True)
         keys += jira_keys(git(repo.root, "log", f"--max-count={MAX_COMMITS}", "--format=%B",
@@ -2377,13 +2412,205 @@ class GitHub:
     def for_view(self, view):
         with self.lock:
             d, fetching = self.data, self.fetching
-        out = {"fetching": fetching, "fetched": d.get("fetched"), "error": d.get("error"), "pr": d.get("pr"),
+        pr = d.get("pr")
+        out = {"fetching": fetching, "fetched": d.get("fetched"), "error": d.get("error"), "pr": pr,
+               "own": bool(self.login and pr and pr.get("user") == self.login),
                "jira": [{"key": k, "url": self.jira_url + k} for k in d.get("jira") or [] if isinstance(k, str)],
                "threads": [], "conversation": d.get("conversation") or []}
         if view == "all" and d.get("threads"):
             files = self.repo.diff("all")["files"]
             out["threads"] = [{**t, "anchor": place_on_diff(t, files)} for t in d["threads"]]
         return out
+
+
+class ChangeError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def hide_token(text):
+    """https://user:token@host/ -> https://host/: a remote URL can carry a token."""
+    return re.sub(r"\b(https?://)[^@/\s]+@", r"\1", text)
+
+
+def git_net(root, *args, timeout=300):
+    """git fetch, push or commit with no terminal: ssh, https, signing and hooks fail instead of waiting for input."""
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    p = subprocess.Popen(["git", *args], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                         stdin=subprocess.DEVNULL, start_new_session=True)
+    try:
+        so, se = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # The whole group: a surviving ssh or git-remote-https could still complete the push.
+        os.killpg(p.pid, signal.SIGKILL)
+        p.communicate()
+        hint = "; open Push again to see what GitHub has" if args[0] in ("push", "fetch") else ""
+        raise ChangeError(f"git {args[0]} timed out after {timeout} s{hint}")
+    out = hide_token((so + se).decode("utf-8", "replace").strip())
+    if p.returncode != 0:
+        raise ChangeError(out[-4000:] or f"git {args[0]} failed")
+    return out
+
+
+class Changes:
+    """Commit the working tree, and push HEAD to the PR's own branch. Push needs --allow-push
+    and a PR opened by the gh user; it never pushes anywhere else."""
+
+    def __init__(self, repo, runner, github=None, allow_push=False):
+        self.repo, self.runner, self.github, self.allow_push = repo, runner, github, allow_push
+        self.lock = threading.Lock()  # one commit or push at a time
+
+    def commit(self, message, amend):
+        if not self.repo.head_is_worktree():
+            raise ChangeError("prv serves a fixed BASE..HEAD range; commit in the shell")
+        if not amend and not message:
+            raise ChangeError("a commit message is needed")
+        if "\0" in message:
+            raise ChangeError("the commit message holds a NUL character")
+        # Claude must not edit files between `git add` and `git commit`.
+        if not self.runner.edit_lock.acquire(blocking=False):
+            raise ChangeError("a Claude thread is editing the working tree; wait for it to finish", 409)
+        try:
+            # Not blocking: a push holds the lock over network calls, and edit threads wait on edit_lock.
+            if not self.lock.acquire(blocking=False):
+                raise ChangeError("a push or its check is running; try again when it ends", 409)
+            try:
+                return self._commit_locked(message, amend)
+            finally:
+                self.lock.release()
+        finally:
+            self.runner.edit_lock.release()
+
+    def _commit_locked(self, message, amend):
+        root = self.repo.root
+        if amend and not git(root, "rev-list", "--max-count=1", f"{self.repo.base}..HEAD").strip():
+            raise ChangeError("no commit in the range to amend")
+        # `git add -A` stages a file with conflict markers as resolved.
+        if git(root, "ls-files", "--unmerged").strip():
+            raise ChangeError("the index has unresolved conflicts; resolve them in the shell")
+        head = git(root, "rev-parse", "HEAD").strip()
+        index = os.path.join(root, git(root, "rev-parse", "--git-path", "index").strip())
+        saved = index + ".prv-commit"
+        try:
+            shutil.copyfile(index, saved)
+        except FileNotFoundError:
+            saved = None  # no index yet (a --no-checkout clone): no staging to keep
+        try:
+            git(root, "add", "-A")  # what the "Uncommitted changes" view shows: tracked and untracked
+            # Checked after `add`: status also lists a submodule's untracked files, which `add` cannot stage.
+            if amend and not message and not git(root, "diff", "--cached", "--name-only", "--ignore-submodules=none",
+                                                 "HEAD").strip():
+                raise ChangeError("nothing to amend: no changes and no new message")
+            git_net(root, "commit", *(["--amend"] if amend else []), *(["-m", message] if message else ["--no-edit"]))
+        except (GitError, ChangeError):
+            # A refused commit (hook, no identity) keeps the user's staging as it was.
+            if saved and git(root, "rev-parse", "HEAD").strip() == head:
+                os.replace(saved, index)
+            raise
+        finally:
+            if saved and os.path.exists(saved):
+                os.unlink(saved)
+        return {"head": git(root, "log", "-1", "--format=%h %s").strip()}
+
+    def _pr(self):
+        """The PR as GitHub has it now: number, head sha, head repo and branch. Raises when push is off."""
+        if not self.allow_push:
+            raise ChangeError("push is off; start prv with --allow-push", 403)
+        gh, root = self.github, self.repo.root
+        if gh is None:
+            raise ChangeError("GitHub is off (--no-github, or no gh CLI)")
+        if not self.repo.head_is_worktree():
+            raise ChangeError("prv serves a fixed BASE..HEAD range; push in the shell")
+        target = gh_remote(root, "upstream") or gh_remote(root, "origin")
+        if not target:
+            raise ChangeError("no GitHub remote named upstream or origin")
+        try:
+            # Found again: github.json can belong to another branch or an older run.
+            n = gh._find_pr(*target)
+            if type(n) is not int:
+                raise ChangeError("no pull request found for this branch")
+            pr = gh._api(f"repos/{target[0]}/{target[1]}/pulls/{n}")
+            gh.read_login()
+            head = pr["head"]
+            sha, ref, slug = head["sha"], head["ref"], (head.get("repo") or {}).get("full_name")
+            user, state = (pr.get("user") or {}).get("login"), "merged" if pr.get("merged_at") else pr.get("state")
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError, GitError) as e:
+            raise ChangeError(f"GitHub: {e}")
+        if state != "open":
+            raise ChangeError(f"PR #{n} is {state}")
+        if not gh.login or user != gh.login:
+            raise ChangeError(f"PR #{n} is by @{user}; prv pushes only your own PRs (gh user @{gh.login})", 403)
+        if not (isinstance(sha, str) and re.fullmatch("[0-9a-f]{40}", sha) and isinstance(slug, str)
+                and GH_SLUG_RE.match(slug) and isinstance(ref, str) and not ref.startswith("-") and "\0" not in ref
+                and git(root, "check-ref-format", "--branch", ref, check=False).strip() == ref):
+            raise ChangeError(f"PR #{n}: GitHub reports no usable head repository and branch")
+        return n, sha, slug, ref
+
+    def _remote(self, slug):
+        """A remote whose push URL is the head repository on github.com, else its GitHub URL
+        in the scheme upstream or origin uses."""
+        root = self.repo.root
+        for name in git(root, "remote").split():
+            # As configured, before url.insteadOf: the host must be github.com itself, not a mirror path.
+            # One URL only: git pushes to every pushurl (or every url), not just the one matched here.
+            urls = (git(root, "config", "--get-all", f"remote.{name}.pushurl", check=False).splitlines()
+                    or git(root, "config", "--get-all", f"remote.{name}.url", check=False).splitlines())
+            m = GH_PUSH_URL_RE.match(urls[0]) if len(urls) == 1 else None
+            if m and f"{m[1]}/{m[2]}".lower() == slug.lower():
+                return name, urls[0]
+        # Push URLs too: a remote can fetch over https and push over ssh.
+        urls = [git(root, "remote", "get-url", *push, r, check=False).strip()
+                for r in ("upstream", "origin") for push in ((), ("--push",))]
+        url = (f"git@github.com:{slug}.git" if any(u.startswith(("git@", "ssh://")) for u in urls)
+               else f"https://github.com/{slug}.git")
+        return url, url
+
+    def _state(self):
+        """The page's push summary, and the remote to push to."""
+        root = self.repo.root
+        n, sha, slug, ref = self._pr()
+        remote, url = self._remote(slug)
+        local = git(root, "rev-parse", "HEAD").strip()
+        # Pushed from another machine: fetch it, or a rewrite would look like a fast-forward.
+        if not git(root, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}", check=False).strip():
+            # From the push URL: a remote's fetch URL can name another repository (url + pushurl).
+            git_net(root, "fetch", "--no-tags", "--no-recurse-submodules", url, f"refs/heads/{ref}")
+            if not git(root, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}", check=False).strip():
+                raise ChangeError(f"GitHub's head {sha[:10]} is not in {hide_token(url)} {ref}; refresh and try again")
+        force = sha != local and git(root, "merge-base", sha, local, check=False).strip() != sha
+
+        def log(rng):
+            return [line.split(" ", 1) for line in
+                    git(root, "log", "--max-count=50", "--format=%h %s", rng).splitlines() if line]
+
+        def count(rng):  # the lists stop at 50; the card says how many it left out
+            return int(git(root, "rev-list", "--count", rng).strip())
+        st = {"number": n, "target": f"{slug}:{ref}", "url": hide_token(url), "github": sha, "local": local,
+              "force": force, "add": log(f"{sha}..{local}"), "drop": log(f"{local}..{sha}") if force else [],
+              "add_n": count(f"{sha}..{local}"), "drop_n": count(f"{local}..{sha}") if force else 0,
+              "dirty": bool(git(root, "status", "--porcelain", "--untracked-files=normal").strip())}
+        return st, remote
+
+    def push_state(self):
+        with self.lock:
+            return self._state()[0]
+
+    def push(self, expect, local):
+        root = self.repo.root
+        with self.lock:
+            st, remote = self._state()
+            if st["github"] != expect or st["local"] != local:
+                raise ChangeError("the PR or HEAD moved since Push was opened; open it again", 409)
+            if expect == local:
+                raise ChangeError("nothing to push: GitHub already has HEAD")
+            ref = st["target"].split(":", 1)[1]  # a branch name cannot hold ':'
+            # The lease: refused if the branch on GitHub is no longer the commit the page showed.
+            # No submodule pushes and no tags: submodule.recurse or push.followTags would write to other refs and repos.
+            out = git_net(root, "push", "--no-recurse-submodules", "--no-follow-tags",
+                          f"--force-with-lease=refs/heads/{ref}:{expect}", remote, f"{local}:refs/heads/{ref}")
+        self.github.start()
+        return {"pushed": True, "output": out}
 
 
 # --------------------------------------------------------------------- main
@@ -2833,6 +3060,8 @@ def main(argv=None, auto_explain=None):
     ap.add_argument("--fetch", action="store_true", help="git fetch upstream (or origin) before picking the base")
     ap.add_argument("--pr", type=int, help="the GitHub PR number (default: found from the branch)")
     ap.add_argument("--no-github", action="store_true", help="do not read the PR and its comments with gh")
+    ap.add_argument("--allow-push", action="store_true",
+                    help="show Push for your own open PR: anyone with the URL can then push to its branch")
     ap.add_argument("--jira-url", default=JIRA_URL, help="prefix for Jira links (default: %(default)s)")
     args = ap.parse_args(argv)
 
@@ -2854,14 +3083,15 @@ def main(argv=None, auto_explain=None):
     runner = Runner(repo, store, args.claude)
     explainer = Explainer(repo, args.claude)
     gh = shutil.which("gh")
-    github = None if args.no_github or not gh else GitHub(repo, gh, args.pr, args.jira_url)
+    github = None if args.no_github or not gh else GitHub(repo, gh, args.pr, args.jira_url, login=args.allow_push)
     token = secrets.token_urlsafe(24)
     page = PAGE.replace("__PRV_TOKEN__", json.dumps(token))
     reviewers = {"claude": Reviewer(repo, args.claude, "claude", explainer=explainer)}
     qodo = shutil.which("qodo") or shutil.which("qodo", path=os.path.expanduser("~/.qodo/bin"))
     if qodo:
         reviewers["qodo"] = Reviewer(repo, args.claude, "qodo", qodo=qodo)
-    handler = make_handler(repo, store, runner, explainer, token, page, github, reviewers)
+    changes = Changes(repo, runner, github, args.allow_push)
+    handler = make_handler(repo, store, runner, explainer, token, page, github, reviewers, changes)
     try:
         httpd = listen(args.host, args.port, root, handler)
     except (OSError, OverflowError) as e:  # OverflowError: --port outside 0-65535
@@ -3018,6 +3248,14 @@ tr.trow>td{padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",san
 .composer .row{display:flex;gap:8px;align-items:center;font-size:12px;flex-wrap:wrap}
 .composer .row .sp{flex:1}
 .conv{margin-bottom:16px}
+.pushcard{position:fixed;top:52px;right:16px;z-index:6;width:min(560px,calc(100vw - 32px));max-height:70vh;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.25);padding:10px 14px;font-size:13px}
+.pushcard pre{white-space:pre-wrap;font-size:12px;margin:4px 0}
+.pushcard .muted{color:var(--muted);font-size:12px}
+.pushcard .warn,.commitcard .err{color:var(--err);white-space:pre-wrap}
+.pushcard .row,.commitcard .row{display:flex;gap:8px;align-items:center;margin-top:8px}
+.pushcard .sp,.commitcard .sp{flex:1}
+.commitcard{border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-bottom:16px;font-size:13px}
+.commitcard textarea{width:100%;box-sizing:border-box;min-height:70px;font-family:ui-monospace,monospace;font-size:12px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px}
 .spin::after{content:" ●";animation:bl 1s infinite}@keyframes bl{50%{opacity:.2}}
 .empty{color:var(--muted);padding:40px;text-align:center}
 .hunk{display:grid;grid-template-columns:minmax(0,1fr);position:relative}
@@ -3066,7 +3304,9 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <button id="split" title="Switch between unified and side-by-side diff">Split</button>
 <select id="theme" title="Color theme"></select>
 <button id="askview" title="Start a thread about the whole view">Ask about this view</button>
+<button id="push" hidden title="Push HEAD to the pull request's branch on GitHub">Push</button>
 <button id="refresh" title="Reload commits and diff">Refresh</button></header>
+<div class="pushcard" id="pushcard" hidden></div>
 <div class="layout"><aside id="side"></aside><main id="main"><div class="empty">Loading…</div></main></div>
 <script>
 const TOKEN = __PRV_TOKEN__;
@@ -3238,7 +3478,11 @@ function fileTable(f, i){
 function renderMain(){
   const d = S.diff, v = S.view;
   let h = '';
+  if (S.flash) { h += `<div class="msg">${esc(S.flash)}</div>`; S.flash = null; }
   if (v !== 'all' && d.message) h += `<div class="msg">${esc(d.message)}</div>`;
+  if (v === 'wt' && d.files.length && S.meta.head === 'HEAD')
+    h += `<div class="commitcard" id="commitcard"><textarea placeholder="Commit message (empty with Amend: keep the old one)"></textarea>
+<div class="row"><label title="Fold these changes into the last commit"><input type="checkbox" class="amend"> Amend the last commit</label><span class="sp"></span><button class="cgo">Commit all changes</button></div><div class="err"></div></div>`;
   if (v === 'all') {
     const cs = S.meta.commits;
     h += `<div class="msg">${cs.length ? cs.map(c => `${c.short}  ${esc(c.subject)}`).join('\n') : 'No commits in range.'}</div>`;
@@ -3509,6 +3753,56 @@ function openViewComposer(){
 }
 $('#askview').addEventListener('click', () => { if (S.diff) openViewComposer(); });
 
+// Commit: everything the "Uncommitted changes" view shows, as a new commit or into the last one.
+document.addEventListener('click', async e => {
+  const b = e.target.closest('#commitcard .cgo');
+  if (!b || b.disabled) return;
+  const c = $('#commitcard'), amend = $('.amend', c).checked, message = $('textarea', c).value.trim();
+  b.disabled = true; $('.err', c).textContent = '';
+  try {
+    const r = await api('/api/commit', {method: 'POST', body: JSON.stringify({message, amend})});
+    S.flash = `Committed ${r.head}. AI and Qodo reviews ran on the old HEAD; run them again for the new one.`;
+    await loadMeta();
+    setView('all');
+  } catch(err){ $('.err', c).textContent = err.message; b.disabled = false; }
+});
+
+// Push: HEAD to the PR's own branch. The server checks GitHub again before it pushes.
+async function openPush(){
+  const c = $('#pushcard');
+  c.hidden = false;
+  c.innerHTML = '<span class="spin">Checking GitHub</span>';
+  const close = '<div class="row"><span class="sp"></span><button data-pclose>Close</button></div>';
+  let st;
+  try { st = await api('/api/push'); }
+  catch(e){ c.innerHTML = `<div class="warn">${esc(e.message)}</div>${close}`; return; }
+  const list = (cs, n) => `<pre>${cs.map(([h, s]) => `${esc(h)}  ${esc(s)}`).join('\n')}`
+    + (n > cs.length ? `\n… and ${n - cs.length} more` : '') + '</pre>';
+  let h = `<div>Push <b>${esc(st.local.slice(0, 10))}</b> to PR #${st.number}: <b>${esc(st.target)}</b></div>`
+    + `<div class="muted">${esc(st.url)} · GitHub has ${esc(st.github.slice(0, 10))}</div>`;
+  if (st.github === st.local) h += '<div>GitHub already has HEAD.</div>';
+  if (st.add.length) h += `<div>Commits to push:</div>${list(st.add, st.add_n)}`;
+  if (st.force) h += `<div class="warn">Rewrites the branch. These commits leave the PR:</div>${list(st.drop, st.drop_n)}`;
+  if (st.dirty) h += '<div class="warn">Uncommitted changes are not pushed.</div>';
+  c.innerHTML = h + `<div class="pout"></div><div class="row"><span class="sp"></span><button data-pclose>Cancel</button>`
+    + (st.github !== st.local ? `<button data-pgo>${st.force ? 'Force push' : 'Push'}</button>` : '') + '</div>';
+  c._st = st;
+}
+$('#push').addEventListener('click', openPush);
+$('#pushcard').addEventListener('click', async e => {
+  const c = $('#pushcard'), go = e.target.closest('[data-pgo]');
+  if (e.target.closest('[data-pclose]')) { c.hidden = true; return; }
+  if (!go || go.disabled) return;
+  go.disabled = true; go.textContent = 'Pushing…';
+  try {
+    const r = await api('/api/push', {method: 'POST', body: JSON.stringify({expect: c._st.github, local: c._st.local})});
+    $('.pout', c).innerHTML = `<pre>${esc(r.output)}</pre>`;
+    loadGitHub();
+  } catch(err){ $('.pout', c).innerHTML = `<div class="warn">${esc(err.message)}</div>`; }
+  go.remove();  // after a failure, Push opens again with fresh state
+  $('[data-pclose]', c).textContent = 'Close';
+});
+
 // GitHub: the PR link and title and the Jira links in the header, the PR's comments in a card, review threads under their lines.
 async function loadGitHub(){
   const v = S.view, seq = S.seq;
@@ -3537,6 +3831,7 @@ function renderGitHub(){
   $('#ghpr').innerHTML = g?.pr ? `<a ${ext(g.pr.url)}>PR #${g.pr.number}</a>` : '';
   $('#prtitle').textContent = $('#prtitle').title = g?.pr?.title || '';
   $('#ghlinks').innerHTML = (g?.jira || []).map(j => `<a ${ext(j.url)}>${esc(j.key)}</a>`).join('');
+  $('#push').hidden = !(S.meta?.push && g?.own && g.pr.state === 'open');
   const prChat = S.view === 'all' && g?.pr;
   $('#askview').textContent = prChat ? 'Chat about this PR' : 'Ask about this view';
   $('#askview').title = prChat ? 'Start a thread about the whole PR; Claude also gets its description'
@@ -3896,8 +4191,11 @@ function rerenderDiff(){
   const files = [...document.querySelectorAll('#main .file')].map(el => ({loaded: !!$('.slot table.diff', el), collapsed: el.classList.contains('collapsed')}));
   const pending = $('#conv > .thread.new');
   const sel = S.sel, lineTh = $('.trow.new .thread.new');
+  const cc = $('#commitcard');
   S.sel = null; S.sel0 = null;
   renderMain();
+  // The old card itself: a commit in flight still writes its error there and holds its button disabled.
+  if (cc) $('#commitcard')?.replaceWith(cc);
   files.forEach((st, i) => {
     if (st.loaded) insertTable(i);
     document.getElementById('f' + i)?.classList.toggle('collapsed', st.collapsed);
