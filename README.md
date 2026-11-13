@@ -4,6 +4,8 @@
 a branch against its base. Select lines and ask Claude about them; Claude reads the whole checkout
 to answer.
 
+![prv on a pull request: commits, files, the AI and Qodo review summary and the GitHub threads](docs/overview.png)
+
 - **Ask about lines.** Click a line number (shift-click for a range), type a question. The answer
   streams in, and the thread is saved in `<git-dir>/prv/threads.json`.
 - **Chat about the PR.** In "All changes", **Chat about this PR** starts a thread about the whole PR;
@@ -23,6 +25,25 @@ to answer.
 - **New review.** `prv new_review <PR>` checks a PR out (or brings an existing checkout up to date),
   with its submodules, and opens it.
 - Split or unified diff, whole-file view, Viewed marks, light and dark themes.
+
+## Screenshots
+
+A finding from the AI review next to the lines it is about, and a GitHub review comment under its line:
+
+![An AI review finding beside the diff](docs/finding.png)
+
+A question about selected lines, with Claude's answer in the thread (light and dark theme):
+
+![A question about lines and Claude's answer](docs/question.png)
+![The same thread in the dark theme](docs/question-dark.png)
+
+Line notes beside one commit's diff (`prv explain --commits`):
+
+![Notes next to the lines they explain](docs/line-notes.png)
+
+The commit card in "Uncommitted changes":
+
+![Commit or amend from the page](docs/commit.png)
 
 ## Requirements
 
