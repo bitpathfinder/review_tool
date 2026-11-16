@@ -776,6 +776,18 @@ class GitHubTest(unittest.TestCase):
     def git_head(self):
         return prv.git(self.root, "rev-parse", "HEAD").strip()
 
+    def test_head_sha_comes_from_this_run(self):
+        # The cache may be an earlier run's, on another branch: its head is not offered as an earlier tip.
+        head = "b" * 40
+        gh = self.fetch({"repos/scylla/db/pulls/55/": [], "repos/scylla/db/issues/55/": [],
+                         "repos/scylla/db/pulls/55": {"number": 55, "title": "T", "state": "open",
+                                                      "user": {"login": "me"}, "head": {"sha": head}}}, pr=55)
+        self.assertIsNone(gh.for_view("all")["error"])
+        self.assertEqual(gh.head_sha(), head)
+        cached = prv.GitHub(self.repo, self.gh, 55)
+        self.assertEqual(cached.for_view("all")["pr"]["head"], head)
+        self.assertIsNone(cached.head_sha())
+
     def test_own_pr_needs_the_login(self):
         pr = {"repos/scylla/db/pulls/4321/": [], "repos/scylla/db/issues/4321/": [],  # before the PR's prefix
               "repos/scylla/db/pulls/4321": {"number": 4321, "title": "x", "state": "open", "user": {"login": "me"}}}
@@ -1260,6 +1272,328 @@ class InstallTest(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("OWNER/NAME", r.stderr)
         self.assertFalse(os.path.lexists(self.link))
+
+
+class SinceTest(unittest.TestCase):
+    """Changes since an earlier tip: the old tip's changes replayed onto the base, against HEAD."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = self.root = os.path.realpath(self.tmp.name)
+        self.git("init", "-q", "-b", "master")
+        self.write("a", "".join(f"{i}\n" for i in range(1, 21)))
+        self.write("b", "".join(f"{i}\n" for i in range(1, 21)))
+        self.git("add", ".")
+        self.git("commit", "-qm", "base")
+        self.git("checkout", "-qb", "pr")
+        self.edit("a", "5", "five")
+        self.git("commit", "-qam", "pr: a")
+        self.edit("b", "5", "FIVE")
+        self.git("commit", "-qam", "pr: b [x] 'q'")
+        self.old = self.sha("HEAD")
+        self.git("checkout", "-q", "master")
+        self.edit("a", "15", "fifteen")
+        self.git("commit", "-qam", "master moves")
+        self.git("checkout", "-q", "pr")
+        self.git("rebase", "-q", "master")
+        self.edit("b", "FIVE", "FIVE!")
+        self.git("commit", "-q", "--amend", "-am", "pr: b [x] 'q'")
+        self.repo = prv.Repo(d, self.sha("master"), "HEAD", "master")
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.root, check=True, capture_output=True, text=True).stdout
+
+    def sha(self, rev):
+        return self.git("rev-parse", rev).strip()
+
+    def write(self, name, text):
+        with open(os.path.join(self.root, name), "w") as fh:
+            fh.write(text)
+
+    def edit(self, name, old, new):
+        with open(os.path.join(self.root, name)) as fh:
+            lines = fh.read().split("\n")
+        self.write(name, "\n".join(new if x == old else x for x in lines))
+
+    @staticmethod
+    def changes(files):
+        return {prv.file_path(f): [(l["t"], l["s"]) for h in f["hunks"] for l in h["lines"] if l["t"] != " "]
+                for f in files}
+
+    def test_since_view_leaves_out_the_base_changes(self):
+        self.assertIn("a", self.git("diff", "--name-only", self.old, "HEAD"))  # what a plain diff would add
+        d = self.repo.diff(prv.SINCE + self.old[:8])
+        self.assertEqual(d["view"], prv.SINCE + self.old)
+        self.assertEqual(self.changes(d["files"]), {"b": [("-", "FIVE"), ("+", "FIVE!")]})
+        whole = self.repo.diff(prv.SINCE + self.old, ["b"])["files"]
+        self.assertEqual(len(whole[0]["hunks"][0]["lines"]), 21)  # 20 lines, one of them changed
+
+    def test_range_diff_pairs_the_commits(self):
+        r = self.repo.range_diff(self.old)
+        self.assertEqual([(e["mark"], e["subject"]) for e in r], [("=", "pr: a"), ("!", "pr: b [x] 'q'")])
+        self.assertEqual((r[1]["old"][0], r[1]["old"][1]), (2, self.old[:len(r[1]["old"][1])]))
+        self.assertIn("-+FIVE\n++FIVE!", r[1]["patch"])
+        self.assertEqual(r[0]["patch"], "")
+        old = prv.MAX_COMMITS
+        try:
+            prv.MAX_COMMITS = 1  # two commits on each side
+            with self.assertRaisesRegex(prv.GitError, "has 2 commits"):
+                self.repo.range_diff(self.old)
+        finally:
+            prv.MAX_COMMITS = old
+
+    def test_parse_range_diff(self):
+        text = ("1:  aaaaaaa = 1:  bbbbbbb one\n"
+                " 2:  ccccccc ! 2:  ddddddd two [x] -: 'q'\n"
+                "    @@ b\n"
+                "    -+FIVE\n"
+                "    ++FIVE!\n"
+                "-:  ------- > 3:  eeeeeee three\n"
+                "3:  fffffff < -:  ------- four\n")
+        r = prv.parse_range_diff(text)
+        self.assertEqual([(e["mark"], e["old"], e["new"], e["subject"]) for e in r], [
+            ("=", [1, "aaaaaaa"], [1, "bbbbbbb"], "one"), ("!", [2, "ccccccc"], [2, "ddddddd"], "two [x] -: 'q'"),
+            (">", None, [3, "eeeeeee"], "three"), ("<", [3, "fffffff"], None, "four")])
+        self.assertEqual(r[1]["patch"], "@@ b\n-+FIVE\n++FIVE!")
+        cut = prv.parse_range_diff(text, cap=12)
+        self.assertEqual((cut[1]["patch"], cut[1]["cut"]), ("@@ b\n-+FIVE", True))
+        self.assertEqual([e["mark"] for e in cut], ["=", "!", ">", "<"])  # pairs past the cap are still listed
+        # A shorter line after the cut, here or in a later pair, must not leave a hole in the patch.
+        holes = prv.parse_range_diff("1:  aaaaaaa ! 1:  bbbbbbb one\n    @@ b\n    -+FIVE\n    x\n"
+                                     "2:  ccccccc ! 2:  ddddddd two\n    y\n", cap=6)
+        self.assertEqual([(e["patch"], e["cut"]) for e in holes], [("@@ b", True), ("", True)])
+        # A commit message that quotes range-diff output stays in the patch.
+        quoted = prv.parse_range_diff("1:  aaaaaaa ! 1:  bbbbbbb one\n    ## Commit message ##\n"
+                                      "    +    2:  ccccccc = 2:  ddddddd two\n     -:  ------- > 3:  eeeeeee x\n")
+        self.assertEqual(len(quoted), 1)
+        self.assertEqual(quoted[0]["patch"].split("\n")[1:], ["+    2:  ccccccc = 2:  ddddddd two", " -:  ------- > 3:  eeeeeee x"])
+
+    def test_old_tip_on_a_newer_base(self):
+        # The author rebased onto a newer master than HEAD's base; that master's changes are not the author's.
+        self.git("checkout", "-q", "master")
+        self.edit("a", "18", "eighteen")
+        self.git("commit", "-qam", "master moves again")
+        self.git("checkout", "-q", "-b", "newer", "pr")
+        self.git("rebase", "-q", "master")
+        self.edit("b", "FIVE!", "FIVE?")
+        self.git("commit", "-q", "--amend", "-am", "pr: b [x] 'q'")
+        newer = self.sha("HEAD")
+        self.git("checkout", "-q", "pr")
+        repo = prv.Repo(self.root, self.git("merge-base", "master", "pr").strip(), "HEAD", "master")
+        self.assertEqual(self.changes(repo.diff(prv.SINCE + newer)["files"]), {"b": [("-", "FIVE?"), ("+", "FIVE!")]})
+        self.assertEqual([(e["mark"], e["subject"]) for e in repo.range_diff(newer)],
+                         [("=", "pr: a"), ("!", "pr: b [x] 'q'")])
+
+    def test_rebase_after_prv_started(self):
+        # self.repo's base is fixed; a rebase onto a newer master must still leave master's changes out.
+        self.git("checkout", "-q", "master")
+        self.edit("a", "18", "eighteen")
+        self.git("commit", "-qam", "master moves again")
+        self.git("checkout", "-q", "pr")
+        tip = self.sha("HEAD")
+        self.git("rebase", "-q", "master")
+        self.edit("b", "FIVE!", "FIVE?")
+        self.git("commit", "-q", "--amend", "-am", "pr: b [x] 'q'")
+        self.assertEqual(self.changes(self.repo.diff(prv.SINCE + tip)["files"]), {"b": [("-", "FIVE!"), ("+", "FIVE?")]})
+        self.assertEqual([(e["mark"], e["subject"]) for e in self.repo.range_diff(tip)],
+                         [("=", "pr: a"), ("!", "pr: b [x] 'q'")])
+
+    def test_relative_base_label(self):
+        # `prv HEAD~1`: the label is read again later, after a new commit moved what HEAD~1 names.
+        repo = prv.Repo(self.root, self.sha("HEAD~1"), "HEAD", "HEAD~1")
+        tip = self.sha("HEAD")
+        self.write("c", "c\n")
+        self.git("add", "c")
+        self.git("commit", "-qm", "c")
+        self.assertEqual(self.changes(repo.diff(prv.SINCE + tip)["files"]), {"c": [("+", "c")]})
+        self.assertEqual([e["mark"] for e in repo.range_diff(tip)], ["=", ">"])
+
+    def test_conflicting_replay_leaves_the_file_out(self):
+        # master rewrites the line the old tip changed in b; the new tip resolved it and changed a again.
+        self.git("checkout", "-q", "master")
+        self.edit("b", "5", "main5")
+        self.git("commit", "-qam", "master conflicts")
+        self.git("checkout", "-q", "-B", "pr", "master")
+        self.edit("a", "5", "five!")
+        self.edit("b", "main5", "FIVE!")
+        self.git("commit", "-qam", "pr: both")
+        repo = prv.Repo(self.root, self.sha("master"), "HEAD", "master")
+        d = repo.diff(prv.SINCE + self.old)
+        self.assertEqual(self.changes(d["files"]), {"a": [("-", "five"), ("+", "five!")]})
+        self.assertIn("conflicts in b;", d["message"])
+        self.assertEqual([e["mark"] for e in repo.range_diff(self.old)], ["<", "<", ">"])
+
+    def test_conflicting_replay_leaves_a_renamed_file_out(self):
+        # The new tip renamed the conflicting file: the replayed file, with conflict markers,
+        # pairs with the new name as a rename. Long lines, so the markers keep it similar enough.
+        self.git("checkout", "-q", "master")
+        self.write("long", "".join(f"line {i} of a file long enough to be found as a rename\n" for i in range(1, 41)))
+        self.git("add", "long")
+        self.git("commit", "-qm", "add long")
+        self.git("checkout", "-qb", "old2")
+        self.edit("long", "line 5 of a file long enough to be found as a rename", "old five")
+        self.git("commit", "-qam", "old2: long")
+        old = self.sha("HEAD")
+        self.git("checkout", "-q", "master")
+        self.edit("long", "line 5 of a file long enough to be found as a rename", "master five")
+        self.git("commit", "-qam", "master conflicts")
+        self.git("checkout", "-q", "-B", "pr", "master")
+        self.git("mv", "long", "renamed")
+        self.edit("renamed", "master five", "new five")
+        self.git("commit", "-qam", "pr: rename")
+        repo = prv.Repo(self.root, self.sha("master"), "HEAD", "master")
+        d = repo.diff(prv.SINCE + old)
+        self.assertEqual(self.changes(d["files"]), {})
+        self.assertIn("conflicts in long;", d["message"])
+
+    def test_old_tip_in_the_base(self):
+        # range-diff refuses an empty range: an old tip with no commits of its own lists the new ones.
+        r = self.repo.range_diff(self.sha("master"))
+        self.assertEqual([(e["mark"], e["old"], e["new"][0], e["subject"]) for e in r],
+                         [(">", None, 1, "pr: a"), (">", None, 2, "pr: b [x] 'q'")])
+        fixed = prv.Repo(self.root, self.sha("HEAD"), "HEAD", "master")  # no commits in BASE..HEAD
+        self.assertEqual([(e["mark"], e["new"]) for e in fixed.range_diff(self.old)], [("<", None)] * 2)
+
+    def test_pruned_tree_is_rebuilt(self):
+        d = self.repo.diff(prv.SINCE + self.old)
+        tree = self.repo.since_tree(self.old)[1]
+        self.git("branch", "keep", self.old)  # gc below would also drop the old tip, kept only by the reflog
+        self.git("reflog", "expire", "--expire=now", "--all")
+        self.git("gc", "-q", "--prune=now")
+        self.assertNotEqual(subprocess.run(["git", "cat-file", "-e", tree], cwd=self.root).returncode, 0)
+        self.assertEqual(self.repo.diff(prv.SINCE + self.old)["files"], d["files"])
+
+    def test_range_diff_timeout(self):
+        with mock.patch.object(prv, "RANGE_DIFF_TIMEOUT", 0):
+            with self.assertRaisesRegex(prv.GitError, "range-diff took over 0 s"):
+                self.repo.range_diff(self.old)
+        self.assertEqual(len(self.repo.range_diff(self.old)), 2)  # a timeout is not cached
+
+    def test_github_threads_survive_a_bad_since_diff(self):
+        orphan = self.git("commit-tree", "HEAD^{tree}", "-m", "unrelated").strip()
+        gh = prv.GitHub(self.repo, "/bin/false")
+        gh.data = {"threads": [{"path": "b", "side": "RIGHT", "line": 5, "original_line": 5,
+                                "hunk": "@@ -4,2 +4,2 @@\n 4\n+FIVE", "comments": []}]}
+        v = gh.for_view(prv.SINCE + orphan)
+        self.assertEqual([t["anchor"] for t in v["threads"]], [None])
+
+    def test_same_tip_is_empty(self):
+        head = self.sha("HEAD")
+        self.assertEqual(self.repo.diff(prv.SINCE + head)["files"], [])
+        self.assertEqual({e["mark"] for e in self.repo.range_diff(head)}, {"="})
+
+    def test_check_view(self):
+        for bad in ("since:", "since:zz12345", "since:" + "0" * 40, "since:-p", "since:HEAD"):
+            with self.assertRaises(prv.GitError, msg=bad):
+                self.repo.check_view(bad)
+        self.assertEqual(self.repo.check_view("since:" + self.old[:9]), "since:" + self.old)
+        with self.assertRaisesRegex(prv.GitError, "no commit '0000000000' in this checkout"):
+            self.repo.check_view("since:" + "0" * 10)
+
+    def test_tips(self):
+        head, master = self.sha("HEAD"), self.sha("master")
+        rebased = self.sha("HEAD@{1}")  # the rebase's result, before the amend
+        self.git("branch", "pr-old-1234567890", self.old)
+        self.git("branch", "other-old-1", self.old)
+        self.git("branch", "pr-old-unrelated", master)  # nothing of the branch in it
+        tips = self.repo.since_tips(github_head=self.old)
+        # "pr: a" alone was a step on the way to the old tip, so the reflog does not offer it.
+        self.assertEqual([(t["sha"], t["source"]) for t in tips], [(self.old, "github"), (rebased, "reflog")])
+        self.assertTrue(all(t["sha"] not in (head, master) for t in tips))
+        self.assertEqual(tips[1]["label"].split(":")[0], "rebase (finish)")
+        tips = self.repo.since_tips()
+        self.assertEqual(tips[0]["label"], "pr-old-1234567890")
+        missing = self.repo.since_tips(github_head="f" * 40)[0]
+        self.assertEqual((missing["label"], missing.get("off")), ("GitHub head", "not fetched"))
+        # The author pushed more and this checkout lags: GitHub's head is listed, not offered.
+        self.git("checkout", "-q", "-b", "ahead")
+        self.git("commit", "-q", "--allow-empty", "-m", "more")
+        ahead = self.sha("HEAD")
+        self.git("checkout", "-q", "pr")
+        self.assertEqual(self.repo.since_tips(github_head=ahead)[0]["off"], "newer than HEAD; update the checkout")
+        # The author force-pushed after this checkout: GitHub's head diverged and is newer.
+        self.git("checkout", "-q", "-b", "pushed", "HEAD~1")
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "rewritten"], cwd=self.root, check=True,
+                       env={**os.environ, "GIT_COMMITTER_DATE": "4000000000 +0000"})
+        pushed = self.sha("HEAD")
+        self.git("checkout", "-q", "pr")
+        self.assertEqual(self.repo.since_tips(github_head=pushed)[0]["off"], "newer than HEAD; update the checkout")
+        # An ancestor of HEAD with a later committer date is still an older tip.
+        self.git("checkout", "-q", "-b", "dated", "HEAD~1")
+        subprocess.run(["git", "commit", "-q", "--allow-empty", "-m", "dated"], cwd=self.root, check=True,
+                       env={**os.environ, "GIT_COMMITTER_DATE": "4000000000 +0000"})
+        dated = self.sha("HEAD")
+        self.git("commit", "-q", "--allow-empty", "-m", "on top")
+        tips = prv.Repo(self.root, master, "HEAD", "master").since_tips(github_head=dated)
+        self.assertEqual((tips[0]["sha"], tips[0].get("off")), (dated, None))
+        self.git("checkout", "-q", "pr")
+        # BASE..HEAD with a fixed head: no branch, so no reflog.
+        fixed = prv.Repo(self.root, master, head, "master")
+        self.assertEqual(fixed.since_tips(), [])
+
+    def test_tip_with_a_unit_separator_in_its_subject(self):
+        # %gs is the last field of a 0x1f-separated reflog row; a 0x1f in it must not drop the row.
+        self.git("commit", "-q", "--allow-empty", "-m", "x\x1fy")
+        tip = self.sha("HEAD")
+        self.git("commit", "-q", "--amend", "--allow-empty", "-m", "x\x1fz")
+        self.assertIn(tip, [t["sha"] for t in self.repo.since_tips()])
+
+    def test_base_branch_commit_is_no_tip(self):
+        # A branch created from a newer master, then reset to the PR: the reflog's first entry is master's tip.
+        self.git("checkout", "-q", "-b", "fresh", "master")
+        self.git("reset", "-q", "--hard", self.old)
+        repo = prv.Repo(self.root, self.git("merge-base", "HEAD", "master").strip(), "HEAD", "master")
+        self.assertNotIn(self.sha("master"), [t["sha"] for t in repo.since_tips()])
+
+    def test_range_diff_is_cached(self):
+        r = self.repo.range_diff(self.old)
+        self.assertIs(self.repo.range_diff(self.old), r)
+        self.git("commit", "-q", "--amend", "-m", "pr: b, reworded")  # new head, new key
+        self.assertEqual([e["mark"] for e in self.repo.range_diff(self.old)], ["=", "!"])
+
+    def test_tip_before_a_fast_forward(self):
+        # new_review fast-forwards a PR branch: the tip before it is still an ancestor of HEAD.
+        self.git("checkout", "-q", "-b", "ff", self.old)
+        self.git("checkout", "-q", "-b", "later")
+        self.write("c", "c\n")
+        self.git("add", "c")
+        self.git("commit", "-qm", "later")
+        self.git("checkout", "-q", "ff")
+        self.git("merge", "-q", "--ff-only", "later")
+        repo = prv.Repo(self.root, self.sha("master"), "HEAD", "master")
+        self.assertIn(self.old, [t["sha"] for t in repo.since_tips()])
+        # A commit whose subject says Fast-forward is still a commit on top: its parent was a step.
+        step = self.sha("HEAD")
+        self.write("c", "c2\n")
+        self.git("commit", "-qam", "Fast-forward")
+        self.assertNotIn(step, [t["sha"] for t in repo.since_tips()])
+        # A reset to a child of the tip replaces the tip as a fast-forward does.
+        tip = self.sha("HEAD")
+        self.git("checkout", "-q", "-b", "child")
+        self.write("c", "c3\n")
+        self.git("commit", "-qam", "child")
+        child = self.sha("HEAD")
+        self.git("checkout", "-q", "ff")
+        self.git("reset", "-q", "--hard", child)
+        self.assertIn(tip, [t["sha"] for t in repo.since_tips()])
+
+    def test_review_thread_on_a_changed_line(self):
+        files = self.repo.diff(prv.SINCE + self.old)["files"]
+        t = {"path": "b", "side": "RIGHT", "line": 5, "original_line": 5, "hunk": "@@ -4,2 +4,2 @@\n 4\n+FIVE"}
+        self.assertEqual(prv.place_on_diff(t, files, since=True), {"path": "b", "side": "old", "line": 5})
+        self.assertIsNone(prv.place_on_diff(t, files))
+        # The same text far from the commented line is another line, not the changed one.
+        far = {**t, "line": 5 + prv.SINCE_NEAR + 1, "original_line": 5 + prv.SINCE_NEAR + 1}
+        self.assertIsNone(prv.place_on_diff(far, files, since=True))
+        # So is a far context or added line: the since view leaves the commented, unchanged line out.
+        ctx = {**t, "line": 3, "original_line": 3, "hunk": "@@ -2,2 +2,2 @@\n 2\n 3"}
+        self.assertEqual(prv.place_on_diff(ctx, files, since=True), {"path": "b", "side": "new", "line": 3})
+        n = 3 + prv.SINCE_NEAR + 1
+        self.assertIsNone(prv.place_on_diff({**ctx, "line": n, "original_line": n}, files, since=True))
+        # A LEFT comment is on a base line, which a since view does not show.
+        left = {**t, "side": "LEFT", "hunk": "@@ -4,2 +4,2 @@\n 4\n-FIVE"}
+        self.assertIsNone(prv.place_on_diff(left, files, since=True))
 
 
 class ChangesTest(unittest.TestCase):
@@ -2364,6 +2698,43 @@ class ServerTest(unittest.TestCase):
         self.assertIn("not at the reviewed head", r.for_view("all")["job"]["error"])
         with open(self.qlog) as fh:
             self.assertEqual(len(fh.readlines()), 3)  # the refused runs never started qodo
+
+    def test_since_view_endpoints(self):
+        old = prv.git(self.root, "rev-parse", "HEAD").strip()
+        with open(os.path.join(self.root, "a.txt"), "w") as fh:
+            fh.write("one\nTWO!\nthree\n")
+        subprocess.run(["git", "commit", "-q", "--amend", "-am", "change two"], cwd=self.root, check=True)
+        tips = json.loads(self.req("/api/since"))["tips"]
+        self.assertEqual([t["sha"] for t in tips], [old])
+        v = prv.SINCE + old
+        d = json.loads(self.req("/api/diff?view=" + urllib.parse.quote(v)))
+        r = json.loads(self.req("/api/range?view=" + urllib.parse.quote(v)))["range"]
+        # One-line patches: range-diff may pair them as changed or list them as dropped and new.
+        self.assertIn(old[:7], [e["old"][1][:7] for e in r if e["old"]])
+        self.assertNotIn("=", [e["mark"] for e in r])
+        for bad in ("all", old):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.req("/api/range?view=" + bad)
+            self.assertEqual(cm.exception.code, 400)
+        self.assertEqual([l["s"] for h in d["files"][0]["hunks"] for l in h["lines"] if l["t"] != " "], ["TWO", "TWO!"])
+        whole = json.loads(self.req("/api/diff?view=" + urllib.parse.quote(v) + "&path=a.txt"))
+        self.assertEqual(len(whole["files"][0]["hunks"][0]["lines"]), 4)
+        for path in ("/api/explain", "/api/review", "/api/github"):
+            self.req(f"{path}?view=" + urllib.parse.quote(v))  # 200: no view code mistakes it for a commit
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.req("/api/explain", {"kind": "commits", "commit": v})
+        self.assertEqual(cm.exception.code, 400)
+        anchor = {"view": v, "path": "a.txt", "start": {"side": "new", "line": 2}, "end": {"side": "new", "line": 2}}
+        out = self.req("/api/ask", {"question": "q?", "model": "haiku", "anchor": anchor})
+        tid = json.loads(out.splitlines()[0])["thread"]["id"]
+        prompt = self.fake_calls()[-1]["prompt"]
+        self.assertIn(f"changed since the earlier tip {old}", prompt)
+        self.assertIn(f"range-diff {self.repo.base}..{old} {self.repo.base}..HEAD", prompt)
+        tree = self.repo.since_tree(old)[1]
+        self.assertIn(f"show {tree}:<path>", prompt)
+        self.assertEqual(prv.git(self.root, "show", f"{tree}:a.txt"), "one\nTWO\nthree\n")
+        self.assertIn("+TWO!", prompt)
+        self.assertEqual(prv.Store(self.repo.git_dir).threads[tid]["anchor"]["view"], v)
 
     def test_whole_pr_thread_gets_the_pr_description(self):
         gh = prv.GitHub(self.repo, "/bin/false")

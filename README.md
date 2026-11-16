@@ -20,6 +20,9 @@ to answer.
 - **GitHub.** Links to the PR and its Jira issues, and the PR's review comments under their lines,
   read with `gh`. prv writes to GitHub only through Push (below). Jira links point to `scylladb.atlassian.net`;
   `prv --jira-url https://<site>.atlassian.net/browse/` points them to another site.
+- **Changes since an earlier version.** After a rebase, an amend or a force-push, **Changes since…**
+  shows what the author changed since a tip you pick, without the changes that came with the new base,
+  and how each commit changed (below).
 - **Commit and push.** The "Uncommitted changes" view commits everything it shows, or amends the
   last commit. With `--allow-push`, **Push** sends HEAD to your own open PR's branch (below).
 - **New review.** `prv new_review <PR>` checks a PR out (or brings an existing checkout up to date),
@@ -104,6 +107,25 @@ Run it again to bring the checkout up to date: a fast-forward is applied, and a 
 keeps the old tip on a branch `pr12345-old-<sha>`. Local changes stop the update instead of being
 lost. Explanations and line notes are written in the background unless you pass `--no-explain`.
 The checkout skips Git LFS downloads (ScyllaDB's LFS files are PGO profiles that review does not need).
+
+## Changes since an earlier version
+
+**Changes since…** in the side panel lists earlier tips of the branch:
+
+- the PR head GitHub reported, when this checkout has it and HEAD is not behind it;
+- `<branch>-old-*` branches, where `prv new_review` keeps the tip of a rewritten PR;
+- reflog entries of the branch that an amend, a rebase, a reset or a fast-forward replaced.
+
+A sha typed into the box works too. The view has two parts:
+
+- The commits of the old tip against the current ones, from `git range-diff`: unchanged, changed,
+  new and dropped. A changed commit opens to show how its patch changed.
+- One diff of what the author changed. The old tip's changes are replayed onto the current base
+  (`git merge-tree`, git 2.40 or newer) and compared with HEAD, so a rebase onto a newer master adds
+  nothing. A file whose replay conflicts is left out; its commits above still compare.
+
+GitHub review threads show beside the lines they were written on, including lines the author has
+since changed, unless the new base moved that line more than 20 lines.
 
 ## Commit and push
 

@@ -41,7 +41,7 @@ GIT_CMD = f"{shlex.quote(os.path.realpath(__file__))} git"
 READ_TOOLS = ["Read", "Grep", "Glob", f"Bash({GIT_CMD}:*)"]
 DENIED_TOOLS = ["Bash(git:*)"]
 GIT_RO_SUBCMDS = {"log", "show", "diff", "blame", "grep", "status", "rev-parse", "ls-files",
-                  "ls-tree", "cat-file", "merge-base", "shortlog", "describe", "name-rev"}
+                  "ls-tree", "cat-file", "merge-base", "shortlog", "describe", "name-rev", "range-diff"}
 GIT_RO_DENY_LONG = ("output", "output-directory", "open-files-in-pager", "ext-diff")
 EDIT_TOOLS = ["Edit", "Write", "MultiEdit", "NotebookEdit"]
 MAX_UNTRACKED = 100
@@ -50,6 +50,10 @@ MAX_COMMITS = 500
 WHOLE_FILE_CONTEXT = 10_000_000  # -U for "Whole file": more lines than any file has
 MAX_BODY = 1 << 20
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
+SINCE = "since:"  # view prefix: the changes since an earlier tip of the branch
+MAX_TIPS = 20
+RANGE_DIFF_TIMEOUT = 120  # seconds; a pair of ranges near MAX_COMMITS each can run far longer
+MAX_RANGE_DIFF = 400_000  # chars of range-diff patches; a rewrite of a large PR can produce megabytes
 VENDOR_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "vendor")
 VENDOR_FILES = {
     "highlight.min.js": "text/javascript", "marked.min.js": "text/javascript",
@@ -233,6 +237,39 @@ def file_path(f):
     return f["old_path"] if f["status"] == "D" else f["new_path"]
 
 
+# Reflog subjects that move a branch forward without a commit: a fast-forward, a reset or checkout -B.
+FORWARD_RE = re.compile(r"^(?:(?:merge \S+|pull(?: .*)?): Fast-forward|reset: moving to .*|branch: Reset to .*)$")
+# Numbers are padded to one width: "  9:  abc = 10:  def subject"; "-:  -------" is the missing side.
+RANGE_LINE_RE = re.compile(r"^ *(\d+|-): +([0-9a-f]+|-+) ([=!<>]) +(\d+|-): +([0-9a-f]+|-+) (.*)$")
+
+
+def parse_range_diff(text, cap=MAX_RANGE_DIFF):
+    """`git range-diff --no-color` output as [{mark, old, new, subject, patch, cut}]; old and new
+    are [number, sha] or None. A '!' pair's patch is its indented diff of the two patches."""
+    out, used = [], 0
+    side = lambda n, sha: None if n == "-" else [int(n), sha]
+    for line in text.split("\n"):
+        # Patch lines first: a quoted range-diff line in a commit message reads like a pair, but pair
+        # lines are indented less than 4 spaces while MAX_COMMITS keeps their numbers under 4 digits.
+        if out and line.startswith("    "):
+            e = out[-1]
+            if used + len(line) - 4 > cap:
+                # Past the cap: the pair is still listed, without the rest of its patch. used stays
+                # past the cap, so no shorter line after it leaves a hole in this or a later patch.
+                e["cut"], used = True, cap + 1
+                continue
+            used += len(line) - 4
+            e["patch"].append(line[4:])
+            continue
+        m = RANGE_LINE_RE.match(line)
+        if m:
+            out.append({"mark": m[3], "old": side(m[1], m[2]), "new": side(m[4], m[5]),
+                        "subject": m[6], "patch": [], "cut": False})
+    for e in out:
+        e["patch"] = "\n".join(e["patch"])
+    return out
+
+
 # ------------------------------------------------------------ claude stream
 
 def _tool_detail(name, inp):
@@ -311,6 +348,8 @@ class Repo:
         self.base = base
         self.head = head
         self.base_label = base_label
+        self._trees = {}  # since_tree() results; all its inputs are commits, so an entry never goes stale
+        self._ranges = {}  # range_diff() results, keyed by their two ranges of full shas
         self.git_dir = os.path.abspath(os.path.join(root, git(root, "rev-parse", "--git-dir").strip()))
 
     def head_is_worktree(self):
@@ -343,9 +382,78 @@ class Repo:
     def check_view(self, view):
         if view in ("all", "wt"):
             return view
-        if not isinstance(view, str) or not SHA_RE.match(view):
+        if isinstance(view, str) and view.startswith(SINCE):
+            rev = view[len(SINCE):]
+            if not SHA_RE.match(rev):
+                raise GitError(f"not a commit sha: {rev[:40]!r}")
+            try:
+                return SINCE + self._commit(rev)
+            except GitError:
+                raise GitError(f"no commit {rev[:12]!r} in this checkout; fetch it, or pick another tip") from None
+        return self._commit(view)
+
+    def _commit(self, rev):
+        if not isinstance(rev, str) or not SHA_RE.match(rev):
             raise GitError("bad view")
-        return git(self.root, "rev-parse", "--verify", "--quiet", f"{view}^{{commit}}").strip()
+        return git(self.root, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}").strip()
+
+    def head_sha(self):
+        return git(self.root, "rev-parse", "--verify", f"{self.head}^{{commit}}").strip()
+
+    def _is_ancestor(self, a, b):
+        return subprocess.run(["git", "merge-base", "--is-ancestor", a, b], cwd=self.root,
+                              capture_output=True).returncode == 0
+
+    def _base_ref(self):
+        """The base branch's full ref name, or "" when the base label names no other branch.
+        Only a ref moves with upstream. A sha or HEAD~3 is a point of the branch itself: read now,
+        after a new commit, it would cut the author's first commit off the range."""
+        sym = lambda r: git(self.root, "rev-parse", "--verify", "--quiet", "--symbolic-full-name",
+                            "--end-of-options", r, check=False).strip()
+        ref = sym(self.base_label)
+        return "" if not ref.startswith("refs/") or ref == sym("HEAD") else ref
+
+    def since_base(self, old):
+        """The fork point of an earlier tip: its range is since_base..old, as base..head is the current one.
+        Taken against the base branch when it can be: an old tip rebased onto a newer upstream than
+        HEAD forked after self.base, and the commits in between are the base's, not the author's."""
+        b = git(self.root, "merge-base", old, self.base, check=False).strip()
+        if not b:
+            raise GitError(f"{old[:10]} shares no history with the base")
+        ref = self._base_ref()
+        nb = git(self.root, "merge-base", old, ref, check=False).strip() if ref else ""
+        # nb == old: old is already in the base branch, so the branch tells nothing about its fork point.
+        if nb and nb not in (b, old) and self._is_ancestor(b, nb):
+            b = nb
+        return b
+
+    def since_onto(self, head=None):
+        """HEAD's fork point now, where an old tip's changes are replayed. Past self.base when
+        HEAD was rebased onto a newer base after prv started."""
+        return self.since_base(head or self.head_sha())
+
+    def since_tree(self, old, b=None, onto=None):
+        """(fork point, tree of old's changes replayed onto `onto`, conflicted paths).
+        b: since_base(old), onto: since_onto(), when the caller has them."""
+        b = b or self.since_base(old)
+        onto = onto or self.since_onto()
+        key = (old, b, onto)
+        # merge-tree's tree is unreachable, so `git gc --prune` may delete it while prv runs.
+        # get(): server threads share the cache, and another may clear it between a check and a read.
+        hit = self._trees.get(key)
+        if hit and subprocess.run(["git", "cat-file", "-e", hit[1]], cwd=self.root,
+                                  capture_output=True).returncode == 0:
+            return hit
+        r = subprocess.run(["git", "merge-tree", "--write-tree", "-z", "--name-only", "--no-messages",
+                            f"--merge-base={b}", onto, old], cwd=self.root, capture_output=True)
+        out = r.stdout.decode("utf-8", "replace").split("\0")
+        if r.returncode not in (0, 1) or not SHA_RE.match(out[0]):
+            err = r.stderr.decode("utf-8", "replace").strip()
+            raise GitError(f"git merge-tree failed ({err}); it needs git 2.40 or newer")
+        if len(self._trees) >= 32:
+            self._trees.clear()
+        res = self._trees[key] = (b, out[0], frozenset(x for x in out[1:] if x))
+        return res
 
     # --full-index: blob ids in file_fp must not change length as the repository grows.
     DIFF_OPTS = ["-M", "--no-color", "--no-ext-diff", "--full-index", "--src-prefix=a/", "--dst-prefix=b/", "-U3"]
@@ -369,11 +477,135 @@ class Repo:
                 text += untracked
                 if total > MAX_UNTRACKED:
                     message += f" Only the first {MAX_UNTRACKED} of {total} untracked files are shown."
+        elif view.startswith(SINCE):
+            return {"view": view, **self._since_diff(view[len(SINCE):], opts, pre, tail)}
         else:
             text = git(self.root, *pre, "show", "--format=", "--diff-merges=first-parent",
                        *opts, view, *tail)
             message = git(self.root, "show", "-s", "--format=%an <%ae>, %ad%n%n%B", view)
         return {"view": view, "message": message, "files": parse_diff(text)}
+
+    def _since_diff(self, old, opts, pre, tail):
+        """The old tip's changes replayed onto the base, against head: what the author changed
+        since old, without the base's own changes. Conflicted files are left out."""
+        message = f"Changes since {old[:10]}: its changes replayed onto the base, compared with the head."
+        b = self.since_base(old)  # "shares no history" is an error for the view, not a merge-tree failure
+        head = self.head_sha()
+        onto = self.since_onto(head)
+        try:
+            _, tree, conflicts = self.since_tree(old, b, onto)
+        except GitError as e:
+            return {"files": [], "message": f"{message} {e}. The commits below still compare."}
+        files = parse_diff(git(self.root, *pre, "diff", *opts, tree, head, *tail))
+        if conflicts:
+            # Both paths: a rename can conflict on its old path.
+            files = [f for f in files if not {f["old_path"], f["new_path"]} & conflicts]
+            names = sorted(conflicts)
+            message += (f" The replay conflicts in {', '.join(names[:10])}{', …' if len(names) > 10 else ''};"
+                        " compare those files in the commits below.")
+        return {"files": files, "message": message}
+
+    def range_diff(self, old):
+        head = self.head_sha()
+        ranges = (f"{self.since_base(old)}..{old}", f"{self.since_onto(head)}..{head}")
+        # range-diff compares every commit with every other: an old tip on a far older base runs for minutes.
+        counts = []
+        for rng in ranges:
+            n = int(git(self.root, "rev-list", "--count", rng).strip())
+            if n > MAX_COMMITS:
+                raise GitError(f"{rng} has {n} commits; range-diff compares at most {MAX_COMMITS}")
+            counts.append(n)
+        if not all(counts):
+            # range-diff refuses an empty range ("need two commit ranges"), e.g. an old tip already in the
+            # base: every commit of the other range is dropped or new. Listed as range-diff lists them.
+            mark, rng = ("<", ranges[0]) if counts[0] else (">", ranges[1])
+            log = git(self.root, "log", "--no-merges", "--topo-order", "--reverse", "--format=%h %s",
+                      rng) if any(counts) else ""
+            out = []
+            for i, row in enumerate(filter(None, log.split("\n")), 1):  # a U+2028 in a subject is no line end
+                sha, _, subject = row.partition(" ")
+                side = [i, sha]
+                out.append({"mark": mark, "old": side if mark == "<" else None,
+                            "new": side if mark == ">" else None, "subject": subject, "patch": "", "cut": False})
+            return out
+        # Ranges of full shas never change their output; Refresh and reopening a tip skip the slow run.
+        hit = self._ranges.get(ranges)
+        if hit is None:
+            p = subprocess.Popen(["git", "range-diff", "--no-color", "--no-notes", *ranges], cwd=self.root,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True)
+            try:
+                so, se = p.communicate(timeout=RANGE_DIFF_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)  # the group: range-diff runs `git log` children
+                p.communicate()
+                raise GitError(f"git range-diff took over {RANGE_DIFF_TIMEOUT} s; pick a tip with fewer commits") from None
+            if p.returncode != 0:
+                raise GitError(se.decode("utf-8", "replace").strip() or "git range-diff failed")
+            hit = parse_range_diff(so.decode("utf-8", "replace"))
+            if len(self._ranges) >= 8:
+                self._ranges.clear()
+            self._ranges[ranges] = hit
+        return hit  # shared between requests: callers only read it
+
+    def since_tips(self, github_head=None):
+        """Earlier tips to compare with: GitHub's head, `<branch>-old-*` branches (new_review keeps
+        a rewritten PR's tip there) and the branch's reflog. Newest first per source; at most MAX_TIPS."""
+        head = self.head_sha()
+        branch = git(self.root, "branch", "--show-current", check=False).strip() if self.head_is_worktree() else ""
+        cands = []  # (sha, label, source, unix time or None)
+        if github_head:
+            cands.append((github_head, "GitHub head", "github", None))
+        if branch:
+            refs = git(self.root, "for-each-ref", "--sort=-committerdate",
+                       "--format=%(objectname)%00%(refname:short)%00%(committerdate:unix)", f"refs/heads/{branch}-old-*")
+            for row in filter(None, refs.split("\n")):
+                sha, name, t = row.split("\0")
+                cands.append((sha, name, "branch", int(t)))
+            log = git(self.root, "log", "-g", "--max-count=200", "--date=unix", "--format=%H%x1f%gd%x1f%gs",
+                      f"refs/heads/{branch}", "--", check=False)
+            # split("\n"), not splitlines(), and maxsplit 2: a \f, U+2028 or 0x1f in a subject must
+            # neither split nor drop a row, which would shift rows[i - 1].
+            rows = [r.split("\x1f", 2) for r in log.split("\n") if r.count("\x1f") >= 2]
+            parents = {}
+            if rows:
+                for line in git(self.root, "rev-list", "--no-walk", "--parents", *{r[0] for r in rows}).splitlines():
+                    sha, *ps = line.split()
+                    parents[sha] = ps
+            for i, (sha, gd, gs) in enumerate(rows[1:], 1):
+                # rows[i - 1] replaced this row. A commit made on top of it means this row was a step,
+                # not a tip; an amend, rebase, reset or fast-forward (new_review's update) replaced a tip.
+                newer = rows[i - 1]
+                if sha in parents.get(newer[0], ()) and not FORWARD_RE.match(newer[2]):
+                    continue
+                t = gd.rsplit("@{", 1)[-1].rstrip("}")
+                cands.append((sha, gs, "reflog", int(t) if t.isdigit() else None))
+        tips, seen, ref = [], {head}, self._base_ref() if cands else ""
+        for sha, label, source, t in cands:
+            if len(tips) >= MAX_TIPS:
+                break
+            if sha in seen:
+                continue
+            seen.add(sha)
+            if source == "github":
+                # Listed but not offered: "changes since" a newer tip would show the author's new work removed.
+                # A force-push that HEAD lacks diverges from it; the committer dates tell which side is newer.
+                when = lambda c: int(git(self.root, "log", "-1", "--format=%ct", c).strip())
+                # An ancestor of HEAD is older whatever its date says (a rebase can keep committer dates).
+                off = ("not fetched" if git(self.root, "cat-file", "-t", sha, check=False).strip() != "commit"
+                       else None if self._is_ancestor(sha, head)
+                       else "newer than HEAD; update the checkout"
+                       if self._is_ancestor(head, sha) or when(sha) > when(head) else None)
+                if off:
+                    tips.append({"sha": sha, "short": sha[:10], "label": label, "source": source, "time": t, "off": off})
+                    continue
+            fork = git(self.root, "merge-base", sha, self.base, check=False).strip()
+            # A base branch commit, such as the reflog's "branch: Created from master" before a reset to
+            # the PR, has nothing of the branch in it even when it is newer than self.base.
+            if fork in ("", sha) or (ref and self._is_ancestor(sha, ref)):
+                continue  # unrelated history, or nothing of the branch in it
+            tips.append({"sha": sha, "short": sha[:10], "label": label, "source": source, "time": t})
+        return tips
 
     def _untracked_diff(self):
         out = []
@@ -495,6 +727,18 @@ def anchor_context(repo, anchor):
         lines.append("Current view: all commits in the range combined.")
     elif view == "wt":
         lines.append("Current view: uncommitted working tree changes (git diff HEAD).")
+    elif view.startswith(SINCE):
+        old = view[len(SINCE):]
+        try:
+            onto = repo.since_onto()
+            b, tree, _ = repo.since_tree(old, onto=onto)
+            cmp = (f" 'old' lines are the lines of `{GIT_CMD} show {tree}:<path>`. Compare commit by commit"
+                   f" with `{GIT_CMD} range-diff {b}..{old} {onto}..{repo.head}`.")
+        except GitError:
+            cmp = ""
+        lines.append(f"Current view: what the author changed since the earlier tip {old}. The diff compares "
+                     f"{old}'s changes replayed onto the base ('old' lines) with {repo.head} ('new' lines), "
+                     f"so changes that came with the base are left out.{cmp}")
     else:
         lines.append(f"Current view: commit {view}. Inspect it with `{GIT_CMD} show {view}`.")
     path = anchor.get("path")
@@ -1193,7 +1437,7 @@ class Explainer:
             raise
 
     def _head(self):
-        return git(self.repo.root, "rev-parse", "--verify", f"{self.repo.head}^{{commit}}").strip()
+        return self.repo.head_sha()
 
     def _range_log(self, head, ncommits, fmt):
         """`git log` of the range, oldest first, capped at MAX_COMMITS."""
@@ -1219,6 +1463,8 @@ class Explainer:
         with self.lock:
             job = json.loads(json.dumps(self.job)) if self.job else None
         out = {"view": view, "job": job, "error": None, "doc": None}
+        if view.startswith(SINCE):
+            return out  # explanations describe the range or a commit, not a comparison of two tips
         errors, doc, entry = [], None, None
         try:
             doc = self.load()
@@ -1947,6 +2193,14 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                     for f in d["files"]:
                         f["fp"] = file_fp(f)  # Viewed marks key on it, so a file that changed shows again
                     return self._json(d)
+                if u.path == "/api/range":
+                    # Its own request: range-diff of a large rewrite takes seconds, and the diff should not wait.
+                    v = repo.check_view(q.get("view", [""])[0])
+                    if not v.startswith(SINCE):
+                        return self._json({"error": "range-diff needs a since view"}, 400)
+                    return self._json({"range": repo.range_diff(v[len(SINCE):])})
+                if u.path == "/api/since":
+                    return self._json({"tips": repo.since_tips(github.head_sha() if github else None)})
                 if u.path == "/api/threads":
                     return self._json(store.snapshot())
                 if u.path == "/api/explain":
@@ -2005,7 +2259,8 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                 if kind not in ("pr", "commits"):
                     return self._json({"error": "unknown kind"}, 400)
                 if commit is not None:
-                    if kind != "commits" or not isinstance(commit, str) or commit in ("all", "wt"):
+                    if (kind != "commits" or not isinstance(commit, str) or commit in ("all", "wt")
+                            or commit.startswith(SINCE)):
                         return self._json({"error": "bad commit"}, 400)
                     try:
                         commit = repo.check_view(commit)
@@ -2196,9 +2451,12 @@ def gh_threads(comments):
     return out
 
 
-def place_on_diff(t, files):
+def place_on_diff(t, files, since=False):
     """The line of a review thread in the local diff, or None. GitHub's line numbers belong to
-    the PR head on GitHub, so the commented line's text (the last line of diff_hunk) decides."""
+    the PR head on GitHub, so the commented line's text (the last line of diff_hunk) decides.
+    since: a since view, where a commented line that the author changed is a removed line."""
+    if since and t["side"] == "LEFT":
+        return None  # a base line; the old side of a since view holds the old tip's lines
     want = t["hunk"].rstrip("\n").rsplit("\n", 1)[-1]
     if not want or want[0] not in "+- ":
         return None
@@ -2212,13 +2470,17 @@ def place_on_diff(t, files):
             for ln in h["lines"]:
                 if ln["s"] != want[1:]:
                     continue
-                if ln["t"] == "-" and old:
+                if ln["t"] == "-" and (old or since):
                     cand, at = {"side": "old", "line": ln["o"]}, ln["o"]
                 elif ln["t"] != "-" and not old:
                     cand, at = {"side": "new", "line": ln["n"]}, ln["n"]
                 elif ln["t"] == " ":  # a left-side comment on a context line
                     cand, at = {"side": "new", "line": ln["n"]}, ln["o"]
                 else:
+                    continue
+                # A since view leaves unchanged lines out, so a far match is another line with the
+                # same text, such as a "return 0;".
+                if since and abs(at - num) > SINCE_NEAR:
                     continue
                 if best is None or abs(at - num) < best[0]:
                     best = (abs(at - num), cand)
@@ -2247,6 +2509,7 @@ def check_gh_data(d):
         raise ValueError("not a valid github.json")
 
 
+SINCE_NEAR = 20  # lines a changed line may move in a since view and still carry its review thread
 PR_BODY_CHARS = 8000  # a long description should not crowd out the question
 
 
@@ -2264,6 +2527,7 @@ class GitHub:
         self.path = os.path.join(repo.git_dir, "prv", "github.json")
         self.lock = threading.Lock()
         self.fetching = False
+        self.fresh = False  # data read by this run, not the cache of an earlier one
         try:
             with open(self.path) as fh:
                 self.data = _load_json(fh, parse_constant=_reject_constant, parse_float=_finite_float)
@@ -2319,7 +2583,7 @@ class GitHub:
             # One step: a poll between two would see fetching=False with the old data and stop polling.
             with self.lock:
                 if out is not None:
-                    self.data = out
+                    self.data, self.fresh = out, True
                 self.fetching = False
 
     def _fetch(self):
@@ -2417,10 +2681,24 @@ class GitHub:
                "own": bool(self.login and pr and pr.get("user") == self.login),
                "jira": [{"key": k, "url": self.jira_url + k} for k in d.get("jira") or [] if isinstance(k, str)],
                "threads": [], "conversation": d.get("conversation") or []}
-        if view == "all" and d.get("threads"):
-            files = self.repo.diff("all")["files"]
-            out["threads"] = [{**t, "anchor": place_on_diff(t, files)} for t in d["threads"]]
+        since = view.startswith(SINCE)
+        if (view == "all" or since) and d.get("threads"):
+            try:
+                files = self.repo.diff(view)["files"]
+            except GitError:
+                if not since:
+                    raise
+                files = []  # a typed sha with no history: the main pane shows why; the threads go to the list
+            out["threads"] = [{**t, "anchor": place_on_diff(t, files, since)} for t in d["threads"]]
         return out
+
+    def head_sha(self):
+        """The PR head GitHub reported to this run, or None. The cache may be an earlier run's,
+        on another branch, and its head would compare two unrelated PRs."""
+        with self.lock:
+            pr = self.data.get("pr") if self.fresh else None
+        sha = pr.get("head") if isinstance(pr, dict) else None
+        return sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) else None
 
 
 class ChangeError(Exception):
@@ -3255,6 +3533,16 @@ tr.trow>td{padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",san
 .pushcard .row,.commitcard .row{display:flex;gap:8px;align-items:center;margin-top:8px}
 .pushcard .sp,.commitcard .sp{flex:1}
 .commitcard{border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-bottom:16px;font-size:13px}
+.item.tip{padding-left:18px;font-size:12px}.item.tip.off{cursor:default;color:var(--muted)}
+.sinceref{display:block;width:calc(100% - 24px);margin:2px 0 4px 18px;font:12px ui-monospace,monospace;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:3px 6px}
+.rdcard{border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-bottom:16px;font-size:13px}
+.rdcard .rd{font-family:ui-monospace,monospace;font-size:12px;padding:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rdcard summary{cursor:pointer}
+.rdcard .mk{display:inline-block;width:1.5em;text-align:center;font-weight:600}
+.rdcard .mk-eq{color:var(--muted)}.rdcard .mk-ne{color:var(--warn)}.rdcard .mk-new{color:var(--addfg)}.rdcard .mk-gone{color:var(--err)}
+.rdcard a{cursor:pointer;color:var(--accent)}
+.rdpatch{margin:4px 0 8px 1.5em;font:12px ui-monospace,monospace;white-space:pre;overflow-x:auto;background:var(--bg2);border-radius:6px;padding:6px 0}
+.rdpatch div{padding:0 8px}.rdpatch .add{background:var(--addbg)}.rdpatch .del{background:var(--delbg)}.rdpatch .hd{color:var(--muted)}
 .commitcard textarea{width:100%;box-sizing:border-box;min-height:70px;font-family:ui-monospace,monospace;font-size:12px;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px}
 .spin::after{content:" ●";animation:bl 1s infinite}@keyframes bl{50%{opacity:.2}}
 .empty{color:var(--muted);padding:40px;text-align:center}
@@ -3311,6 +3599,7 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <script>
 const TOKEN = __PRV_TOKEN__;
 const S = {meta:null, view:null, diff:null, threads:{}, sel:null, live:{}, x:null};
+const SINCE = 'since:';
 const $ = (s, el=document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const ls = {get(k){try{return localStorage.getItem(k)}catch(e){return null}}, set(k,v){try{localStorage.setItem(k,v)}catch(e){}},
@@ -3329,6 +3618,7 @@ function lineNo(l){ return l.t === '-' ? l.o : l.n; }
 function viewLabel(v){
   if (v === 'all') return 'All changes';
   if (v === 'wt') return 'Uncommitted changes';
+  if (v.startsWith(SINCE)) return `Changes since ${v.slice(SINCE.length, SINCE.length + 10)}`;
   const c = (S.meta?.commits || []).find(c => c.sha === v);
   return c ? `${c.short} ${c.subject}` : v.slice(0,10);
 }
@@ -3351,7 +3641,7 @@ async function loadThreads(){
 
 async function setView(v, scrollTo){
   // S.diff stays null until this view's diff renders: rerenderDiff and "Ask about this view" need its tables.
-  S.view = v; S.diff = null; S.sel = null; S.sel0 = null;
+  S.view = v; S.diff = null; S.sel = null; S.sel0 = null; S.range = null; S.rdopen = new Set();
   const seq = S.seq = (S.seq || 0) + 1;
   // The old view's notes column; loadExplain sets it again. A Notes click before then must not restore it.
   document.body.classList.remove('xon'); S.xplaced = false;
@@ -3359,10 +3649,15 @@ async function setView(v, scrollTo){
   $('#main').innerHTML = '<div class="empty">Loading diff…</div>';
   renderSide();
   // Only the latest call renders: an older fetch, even for the same view (Refresh), may finish last.
+  if (v.startsWith(SINCE)) loadRange(v);  // alongside the diff: range-diff of a large rewrite takes seconds
   let d;
   try { d = await api('/api/diff?view=' + encodeURIComponent(v)); }
   catch(e){ if (S.seq === seq) $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
   if (S.seq !== seq) return;
+  if (d.view !== v) {  // a typed short sha comes back full; threads and Viewed marks key on the full one
+    S.view = d.view;
+    history.replaceState(null, '', location.pathname + location.search + '#view=' + encodeURIComponent(d.view));
+  }
   S.diff = d;
   renderMain();
   renderSide();
@@ -3381,6 +3676,19 @@ function renderSide(){
   let h = '<h3>Views</h3>';
   h += `<a class="item ${S.view==='all'?'active':''}" data-view="all">All changes <span class="cnt">${m.commits.length} commit${m.commits.length===1?'':'s'}</span></a>`;
   if (m.dirty || S.view === 'wt') h += `<a class="item ${S.view==='wt'?'active':''}" data-view="wt">Uncommitted changes</a>`;
+  const since = S.view?.startsWith(SINCE);
+  h += `<a class="item ${since?'active':''}" data-since title="What changed since an earlier version of this branch: after a rebase, an amend or a force-push">${since ? esc(viewLabel(S.view)) : 'Changes since…'}</a>`;
+  if (S.tips) {
+    if (S.tips.error) h += `<div class="item tip off" title="${esc(S.tips.error)}">${esc(S.tips.error)}</div>`;
+    else if (!S.tips.list) h += '<div class="item tip off"><span class="spin">Looking for earlier tips</span></div>';
+    else if (!S.tips.list.length) h += '<div class="item tip off">No earlier tips found</div>';
+    for (const t of S.tips.list || []) {
+      const when = t.time ? new Date(t.time * 1000).toLocaleString() : '';
+      if (t.off) { h += `<div class="item tip off" title="${esc(t.sha)}">${esc(t.short)} ${esc(t.label)} (${esc(t.off)})</div>`; continue; }
+      h += `<a class="item tip ${S.view===SINCE+t.sha?'active':''}" data-view="${SINCE}${t.sha}" title="${esc(t.label)}\n${esc(t.sha)}${when ? '\n' + esc(when) : ''}"><span class="sha">${esc(t.short)}</span> ${esc(t.label)}</a>`;
+    }
+    h += '<input class="sinceref" placeholder="or a commit sha, then Enter" spellcheck="false">';
+  }
   h += '<h3>Commits</h3>';
   if (!m.commits.length) h += '<div class="item" style="color:var(--muted)">none</div>';
   for (const c of m.commits)
@@ -3399,12 +3707,31 @@ function renderSide(){
     const where = a.path ? `${a.path.split('/').pop()}:${a.end?.line ?? ''}` : viewLabel(a.view);
     h += `<a class="item" data-thread="${t.id}" title="${esc(viewLabel(a.view))}\n${esc(q)}">${t.running?'<span class="spin"></span> ':''}<span class="sha">${esc(where)}</span> ${esc(q.slice(0,80))}</a>`;
   }
+  const ref = $('#side .sinceref'), typed = ref?.value, focused = ref && document.activeElement === ref;
+  const caret = focused && [ref.selectionStart, ref.selectionEnd];  // a poll rerenders the side panel mid-typing
   $('#side').innerHTML = h;
+  const nref = $('#side .sinceref');
+  if (nref && typed) nref.value = typed;
+  if (nref && focused) { nref.focus(); nref.setSelectionRange(...caret); }
 }
+async function toggleTips(){
+  if (S.tips) { S.tips = null; renderSide(); return; }
+  const tips = S.tips = {};
+  renderSide();
+  try { tips.list = (await api('/api/since')).tips; } catch(e){ tips.error = e.message; }
+  if (S.tips === tips) renderSide();
+}
+$('#side').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || !e.target.matches('.sinceref')) return;
+  const v = e.target.value.trim().toLowerCase();
+  if (/^[0-9a-f]{7,40}$/.test(v)) setView(SINCE + v);
+  else e.target.title = 'A commit sha: 7 to 40 hex digits';
+});
 
 $('#side').addEventListener('click', e => {
   const it = e.target.closest('.item'); if (!it) return;
-  if (it.dataset.view) setView(it.dataset.view);
+  if ('since' in it.dataset) toggleTips();
+  else if (it.dataset.view) setView(it.dataset.view);
   else if (it.dataset.file) document.getElementById('f' + it.dataset.file)?.scrollIntoView();
   else if (it.dataset.thread) {
     const t = S.threads[it.dataset.thread];
@@ -3483,6 +3810,7 @@ function renderMain(){
   if (v === 'wt' && d.files.length && S.meta.head === 'HEAD')
     h += `<div class="commitcard" id="commitcard"><textarea placeholder="Commit message (empty with Amend: keep the old one)"></textarea>
 <div class="row"><label title="Fold these changes into the last commit"><input type="checkbox" class="amend"> Amend the last commit</label><span class="sp"></span><button class="cgo">Commit all changes</button></div><div class="err"></div></div>`;
+  if (v.startsWith(SINCE)) h += rangeCard();
   if (v === 'all') {
     const cs = S.meta.commits;
     h += `<div class="msg">${cs.length ? cs.map(c => `${c.short}  ${esc(c.subject)}`).join('\n') : 'No commits in range.'}</div>`;
@@ -3520,6 +3848,47 @@ $('#main').addEventListener('change', e => {
   const file = e.target.closest('.file');
   file.classList.toggle('collapsed', e.target.checked);
   if (!e.target.checked) ensureTable(+file.dataset.f);
+});
+
+// The commits of an earlier tip against the current ones, from git range-diff.
+const RD_MARK = {'=': ['eq', '=', 'unchanged'], '!': ['ne', '≠', 'changed'], '>': ['new', '+', 'new'], '<': ['gone', '−', 'dropped']};
+function rangeCard(){
+  const x = S.range;
+  if (!x) return '<div class="rdcard" id="rdcard"><span class="spin">Comparing the commits</span></div>';
+  if (x.error) return `<div class="rdcard" id="rdcard"><div class="err">git range-diff failed: ${esc(x.error)}</div></div>`;
+  const r = x.list;
+  const counts = Object.entries(RD_MARK).map(([k, m]) => [r.filter(e => e.mark === k).length, m[2]])
+    .filter(([n]) => n).map(([n, w]) => `${n} ${w}`).join(', ');
+  const sha = (x, link) => !x ? '-------'
+    : link && S.meta.commits.some(c => c.sha.startsWith(x[1])) ? `<a data-rdview="${esc(x[1])}" title="Open this commit">${esc(x[1])}</a>` : esc(x[1]);
+  const row = e => { const m = RD_MARK[e.mark]; return `<span class="mk mk-${m[0]}" title="${m[2]}">${m[1]}</span>${sha(e.old)} ${sha(e.new, true)} ${esc(e.subject)}`; };
+  let h = `<div class="rdcard" id="rdcard"><div class="muted">Commits, old against new: ${counts || 'none'}${r.some(e => e.mark === '!') ? '. Open a changed commit to see how its patch changed.' : ''}</div>`;
+  for (const [i, e] of r.entries()) {
+    if (e.mark !== '!') { h += `<div class="rd">${row(e)}</div>`; continue; }
+    const patch = e.patch.split('\n').map(l => `<div class="${l[0] === '+' ? 'add' : l[0] === '-' ? 'del' : l[0] === '@' || l.startsWith(' ##') ? 'hd' : ''}">${esc(l) || ' '}</div>`).join('');
+    h += `<details data-rd="${i}" ${S.rdopen.has(i) ? 'open' : ''}><summary class="rd">${row(e)}</summary>${e.patch ? `<div class="rdpatch">${patch}</div>` : ''}${e.cut ? '<div class="muted">The rest of this comparison is too large to show; run git range-diff.</div>' : ''}</details>`;
+  }
+  return h + '</div>';
+}
+// Kept across renderMain (Whole file, Split), which rebuilds the card. toggle does not bubble.
+$('#main').addEventListener('toggle', e => {
+  const i = e.target.dataset?.rd; if (i == null) return;
+  if (e.target.open) S.rdopen.add(+i); else S.rdopen.delete(+i);
+}, true);
+async function loadRange(v){
+  const seq = S.seq;
+  let x;
+  try { x = {list: (await api('/api/range?view=' + encodeURIComponent(v))).range}; } catch(e){ x = {error: e.message}; }
+  if (S.seq !== seq) return;
+  S.range = x;
+  const el = $('#rdcard');
+  if (el) el.outerHTML = rangeCard();
+}
+$('#main').addEventListener('click', e => {
+  const a = e.target.closest('[data-rdview]'); if (!a) return;
+  e.preventDefault();  // inside a <summary>, the click would also fold the patch
+  const c = S.meta.commits.find(c => c.sha.startsWith(a.dataset.rdview));
+  if (c) setView(c.sha);
 });
 
 function insertTable(i){
@@ -3784,7 +4153,8 @@ async function openPush(){
   if (st.add.length) h += `<div>Commits to push:</div>${list(st.add, st.add_n)}`;
   if (st.force) h += `<div class="warn">Rewrites the branch. These commits leave the PR:</div>${list(st.drop, st.drop_n)}`;
   if (st.dirty) h += '<div class="warn">Uncommitted changes are not pushed.</div>';
-  c.innerHTML = h + `<div class="pout"></div><div class="row"><span class="sp"></span><button data-pclose>Cancel</button>`
+  // No "Changes since" when HEAD is behind GitHub (add_n 0): it would show GitHub's newer commits as removed.
+  c.innerHTML = h + `<div class="pout"></div><div class="row">${st.github !== st.local && st.add_n ? '<button data-psince title="What HEAD changes against the commit GitHub has">Changes since GitHub\'s head</button>' : ''}<span class="sp"></span><button data-pclose>Cancel</button>`
     + (st.github !== st.local ? `<button data-pgo>${st.force ? 'Force push' : 'Push'}</button>` : '') + '</div>';
   c._st = st;
 }
@@ -3792,6 +4162,7 @@ $('#push').addEventListener('click', openPush);
 $('#pushcard').addEventListener('click', async e => {
   const c = $('#pushcard'), go = e.target.closest('[data-pgo]');
   if (e.target.closest('[data-pclose]')) { c.hidden = true; return; }
+  if (e.target.closest('[data-psince]')) { c.hidden = true; setView(SINCE + c._st.github); return; }
   if (!go || go.disabled) return;
   go.disabled = true; go.textContent = 'Pushing…';
   try {
@@ -3840,7 +4211,7 @@ function renderGitHub(){
   document.querySelectorAll('.ghrow').forEach(e => e.remove());
   const el = $('#ghcard');
   if (!el || !S.diff) return;
-  if (!g || g.disabled || S.view !== 'all') { el.hidden = true; return; }
+  if (!g || g.disabled || (S.view !== 'all' && !S.view.startsWith(SINCE))) { el.hidden = true; return; }
   const threads = g.threads || [], conv = g.conversation || [], loose = [];
   threads.forEach((t, ti) => {
     const at = t.anchor && lineK(t.anchor);
@@ -3857,7 +4228,7 @@ function renderGitHub(){
   if (g.fetching) parts.push('<span class="spin">Reading GitHub</span>');
   else if (g.fetched) parts.push('read ' + esc(new Date(g.fetched * 1000).toLocaleString()));
   h += `<div class="xmeta"><span>${parts.join(' · ')}</span><span class="sp"></span>${g.fetching ? '' : '<button data-ghrefresh>Refresh</button>'}</div>`;
-  if (loose.length) h += `<details open><summary>Review threads not beside the diff (${loose.length}): outdated, or on lines this diff does not show</summary>${loose.map(ti => {
+  if (loose.length) h += `<details ${S.view === 'all' ? 'open' : ''}><summary>Review threads not beside the diff (${loose.length}): outdated, or on lines this diff does not show</summary>${loose.map(ti => {
     const t = threads[ti];
     return `<div class="thread gh"><div class="thead"><span>${esc(t.path)}:${t.line ?? t.original_line ?? ''}${t.line == null ? ' · outdated' : ''}</span><span class="sp"></span><a data-ghask="${ti}">Discuss with Claude</a></div><pre class="ghhunk">${esc(t.hunk.split('\n').slice(-6).join('\n'))}</pre>${ghComments(t.comments)}</div>`;
   }).join('')}</details>`;
@@ -3915,6 +4286,7 @@ function locate(a){
 function renderExplain(notes = true){
   const el = $('#xsum'), x = S.x;
   if (!el || !x) return;
+  if (S.view.startsWith(SINCE)) { el.hidden = true; if (notes) fillNotes(); else notesColumn(); return; }
   const d = x.doc, job = x.job;
   const shown = d && (d.notes.length || Object.keys(d.files).length);
   let h = '';
@@ -4300,7 +4672,10 @@ async function submit(th){
   }
 }
 
-$('#refresh').addEventListener('click', async () => { await loadMeta(); await loadThreads(); setView(S.view); });
+$('#refresh').addEventListener('click', async () => {
+  await loadMeta(); await loadThreads(); setView(S.view);
+  if (S.tips) { S.tips = null; toggleTips(); }  // an amend or a rebase since the list was read adds a tip
+});
 
 // Pick up answers that are still running after a page reload.
 setInterval(async () => {
@@ -4323,7 +4698,7 @@ setInterval(async () => {
   try { await loadMeta(); await loadThreads(); }
   catch(e){ $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
   const hv = new URLSearchParams(location.hash.slice(1)).get('view');
-  const ok = v => v === 'all' || (v === 'wt' && S.meta.dirty) || S.meta.commits.some(c => c.sha === v);
+  const ok = v => v === 'all' || (v === 'wt' && S.meta.dirty) || (v.startsWith(SINCE) && /^[0-9a-f]{7,40}$/.test(v.slice(SINCE.length))) || S.meta.commits.some(c => c.sha === v);
   setView(hv && ok(hv) ? hv : (!S.meta.commits.length && S.meta.dirty ? 'wt' : 'all'));
 })();
 </script>
