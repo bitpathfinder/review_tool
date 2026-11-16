@@ -894,10 +894,11 @@ class NewReviewTest(unittest.TestCase):
         self.git(repo, "commit", "-qm", msg)
         return self.git(repo, "rev-parse", "HEAD")
 
-    def set_pr(self, sha):
+    def set_pr(self, sha, base_sha=None):
         self.git(self.up, "update-ref", "refs/pull/7/head", sha)
+        base = {"ref": "master", **({"sha": base_sha} if base_sha else {})}
         os.environ["FAKE_GH"] = json.dumps({"repos/o/r/pulls/7": {
-            "title": "T", "state": "open", "base": {"ref": "master"}, "head": {"sha": sha}}})
+            "title": "T", "state": "open", "base": base, "head": {"sha": sha}}})
 
     def prepare(self, url=None):
         with contextlib.redirect_stderr(io.StringIO()) as err:
@@ -909,7 +910,7 @@ class NewReviewTest(unittest.TestCase):
 
     def test_fresh_checkout(self):
         d, base, out = self.prepare()
-        self.assertEqual((d, base), (self.d, "master"))
+        self.assertEqual((d, base), (self.d, "upstream/master"))
         self.assertEqual(self.head(), (self.p1, "pr7"))
         self.assertIn("checked out pr7", out)
         self.assertEqual(self.git(d, "config", "filter.lfs.smudge"), "git-lfs smudge --skip -- %f")
@@ -934,6 +935,62 @@ class NewReviewTest(unittest.TestCase):
         self.assertIn("was rewritten", out)
         self.assertEqual(self.head(), (p3, "pr7"))
         self.assertEqual(self.git(self.d, "rev-parse", f"pr7-old-{p2[:10]}"), p2)
+
+    def test_merged_pr_is_reviewed_against_its_base(self):
+        # Once master has the PR, merge-base(upstream/master, HEAD) is HEAD and the range is empty.
+        self.git(self.up, "merge", "-q", "--no-ff", "-m", "Merge PR 7", "feat")
+        self.set_pr(self.p1, base_sha=self.c1)
+        d, base, out = self.prepare()
+        self.assertEqual(base, self.c1)
+        self.assertIn(f"reviewing it against its base commit {self.c1[:10]} from GitHub", out)
+        self.assertEqual(self.git(d, "rev-list", f"{base}..HEAD"), self.p1)
+        # A base commit the checkout lacks is fetched by sha.
+        self.git(self.up, "checkout", "-q", "-b", "side", self.c1)
+        side = self.write(self.up, "side\n", "side")
+        self.git(self.up, "checkout", "-q", "master")
+        self.set_pr(self.p1, base_sha=side)
+        d, base, out = self.prepare()
+        self.assertEqual(base, side)
+        self.assertEqual(self.git(d, "rev-list", f"{base}..HEAD"), self.p1)
+        # A base commit GitHub names but the fetch cannot get: the empty range, with the reason.
+        self.set_pr(self.p1, base_sha="f" * 40)
+        d, base, out = self.prepare()
+        self.assertEqual(base, "upstream/master")
+        self.assertIn(f"fetching its base commit {'f' * 10} failed", out)
+        # A base commit that already holds the PR gives the empty range too.
+        merge = self.git(self.up, "rev-parse", "master")
+        self.set_pr(self.p1, base_sha=merge)
+        d, base, out = self.prepare()
+        self.assertEqual(base, "upstream/master")
+        self.assertIn(f"in its base commit {merge[:10]} from GitHub: the range is empty", out)
+        # An open PR keeps upstream/<base>.
+        self.git(self.up, "reset", "-q", "--hard", self.c1)
+        self.set_pr(self.p1, base_sha=self.c1)
+        self.assertEqual(self.prepare()[1], "upstream/master")
+
+    def test_empty_range_writes_no_explanations(self):
+        self.git(self.up, "merge", "-q", "--no-ff", "-m", "Merge PR 7", "feat")
+        self.set_pr(self.p1)  # merged, and no base commit from GitHub: an empty range
+        env = dict(os.environ, PATH=os.path.dirname(self.gh) + os.pathsep + os.environ["PATH"])
+        p = subprocess.Popen([sys.executable, prv.__file__, "new_review", "7", "--repo", "o/r", "--reference",
+                              self.reference, "--upstream-url", self.up, "--claude", "/bin/false",
+                              "--host", "127.0.0.1", "--port", "0"], cwd=self.parent, env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # readline has no timeout: a prv stuck before its third line would hang the suite.
+        watchdog = threading.Timer(60, p.kill)
+        watchdog.start()
+        try:
+            lines = [p.stdout.readline() for _ in range(3)]
+        finally:
+            watchdog.cancel()
+            p.terminate()
+            try:
+                err = p.communicate(timeout=10)[1]
+            except subprocess.TimeoutExpired:
+                p.kill()
+                err = p.communicate()[1]
+        self.assertIn("open http://127.0.0.1:", lines[1], err)
+        self.assertIn("no commits in the range, so no explanations are written", lines[2])
 
     def test_local_work_stops_the_update(self):
         self.prepare()

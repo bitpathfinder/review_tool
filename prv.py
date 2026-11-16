@@ -98,6 +98,11 @@ def git(cwd, *args, check=True):
     return r.stdout.decode("utf-8", "replace")
 
 
+def is_ancestor(cwd, a, b):
+    return subprocess.run(["git", "merge-base", "--is-ancestor", a, b], cwd=cwd,
+                          capture_output=True).returncode == 0
+
+
 # ---------------------------------------------------------------- diff parser
 
 HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)$")
@@ -401,8 +406,7 @@ class Repo:
         return git(self.root, "rev-parse", "--verify", f"{self.head}^{{commit}}").strip()
 
     def _is_ancestor(self, a, b):
-        return subprocess.run(["git", "merge-base", "--is-ancestor", a, b], cwd=self.root,
-                              capture_output=True).returncode == 0
+        return is_ancestor(self.root, a, b)
 
     def _base_ref(self):
         """The base branch's full ref name, or "" when the base label names no other branch.
@@ -3152,9 +3156,9 @@ def say(msg):
 def prepare_review(n, slug, parent, reference, gh, upstream_url=None):
     """Check out PR n in <parent>/PR_<n>/<repo> on branch pr<n>, or bring that checkout up
     to date, submodules included. Local work is never dropped: a moved PR leaves the old tip
-    on a backup branch. Returns (checkout dir, base branch). Raises GitError or OSError."""
+    on a backup branch. Returns (checkout dir, base to serve against). Raises GitError or OSError."""
     url = upstream_url or f"https://github.com/{slug}.git"
-    d, base = checkout_pr(n, slug, parent, reference, gh, url)
+    d, base, pr_base = checkout_pr(n, slug, parent, reference, gh, url)
     # An earlier run's upstream stays; relative submodule URLs must resolve against what was fetched.
     # The raw value: `remote get-url` applies url.*.insteadOf and would never match `url`.
     # The first one: fetch uses it, while `config --get` returns the last.
@@ -3162,7 +3166,30 @@ def prepare_review(n, slug, parent, reference, gh, upstream_url=None):
     if used != url:
         say(f"fetched from upstream {used}, not {url}: the checkout keeps its upstream remote")
     update_submodules(d, reference, used)
-    return d, base
+    return d, review_base(d, base, pr_base)
+
+
+def review_base(d, base, pr_base):
+    """upstream/<base>, or GitHub's base commit of the PR once the PR is merged into the base branch:
+    then HEAD is in upstream/<base>, merge-base(upstream/<base>, HEAD) is HEAD, and the range would be empty."""
+    ref = f"upstream/{base}"
+    in_ = lambda c: is_ancestor(d, "HEAD", c)
+    if not in_(ref):
+        return ref
+    if not re.fullmatch(r"[0-9a-f]{40}", pr_base):
+        say(f"the PR is already in {ref} and GitHub gave no base commit: the range is empty")
+        return ref
+    if git(d, "cat-file", "-t", pr_base, check=False).strip() != "commit":
+        try:
+            git(d, "fetch", "--quiet", "--no-recurse-submodules", "upstream", pr_base)
+        except GitError as e:
+            say(f"the PR is already in {ref}, and fetching its base commit {pr_base[:10]} failed: {e}")
+            return ref
+    if in_(pr_base):
+        say(f"the PR is already in {ref} and in its base commit {pr_base[:10]} from GitHub: the range is empty")
+        return ref
+    say(f"the PR is already in {ref}: reviewing it against its base commit {pr_base[:10]} from GitHub")
+    return pr_base
 
 
 def update_submodules(d, reference, url):
@@ -3186,6 +3213,7 @@ def update_submodules(d, reference, url):
 def checkout_pr(n, slug, parent, reference, gh, url):
     pr = gh_api(gh, f"repos/{slug}/pulls/{n}", parent)
     base = pr["base"]["ref"]
+    pr_base = _str(pr["base"].get("sha"))
     # GitHub text: control characters would reach the terminal as escape sequences.
     title = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", _str(pr.get("title")))
     say(f"PR #{n} {title} ({_str(pr.get('state'))}), base {base}, head {pr['head']['sha'][:10]}")
@@ -3219,18 +3247,18 @@ def checkout_pr(n, slug, parent, reference, gh, url):
     if first:
         git(d, "checkout", "--quiet", "-B", branch, new)
         say(f"checked out {branch} at {new[:10]}")
-        return d, base
+        return d, base, pr_base
     tip = git(d, "rev-parse", "HEAD").strip()
     if tip == new:
         say(f"{branch} is up to date at {new[:10]}")
-        return d, base
+        return d, base, pr_base
     if git(d, "status", "--porcelain", "--untracked-files=no").strip():
         raise GitError(f"{d} has uncommitted changes and PR #{n} moved to {new[:10]}; "
                        "commit or stash them and run again")
-    if subprocess.run(["git", "merge-base", "--is-ancestor", tip, new], cwd=d).returncode == 0:
+    if is_ancestor(d, tip, new):
         git(d, "merge", "--quiet", "--ff-only", new)
         say(f"fast-forwarded {branch} {tip[:10]}..{new[:10]}")
-        return d, base
+        return d, base, pr_base
     # Force-pushed, or local commits on top: keep the old tip, then move the branch.
     backup = f"{branch}-old-{tip[:10]}"
     git(d, "branch", "-f", backup, tip)
@@ -3238,7 +3266,7 @@ def checkout_pr(n, slug, parent, reference, gh, url):
     # submodule.recurse=true, checkout would need the new pins, which the fetch did not bring.
     git(d, "-c", "submodule.recurse=false", "checkout", "--quiet", "-B", branch, new)
     say(f"PR #{n} was rewritten: {branch} now at {new[:10]}, the old tip is kept as branch {backup}")
-    return d, base
+    return d, base, pr_base
 
 
 def review_parent(cwd):
@@ -3310,7 +3338,7 @@ def new_review_main(argv):
     except KeyboardInterrupt:
         return 130
     os.chdir(d)
-    serve = [f"upstream/{base}", "--pr", str(args.pr), "--host", args.host, "--claude", args.claude]
+    serve = [base, "--pr", str(args.pr), "--host", args.host, "--claude", args.claude]
     serve += ["--port", str(args.port)] if args.port is not None else []
     serve += ["--open"] if args.open else []
     auto = None if args.no_explain else (args.model, args.max_budget_usd)
@@ -3381,11 +3409,16 @@ def main(argv=None, auto_explain=None):
     url = f"http://{host}:{httpd.server_address[1]}/?t={token}"
     print(f"prv: {root}  {label} ({base[:10]})..{head}")
     print(f"prv: open {url}")
+    # With no commits in the range, the "pr" and "commits" explain jobs would only fail
+    # with "no changes" and "no commits" banners.
+    explain = auto_explain and git(root, "rev-list", "--max-count=1", f"{base}..{head}", check=False).strip()
+    if auto_explain and not explain:
+        print("prv: no commits in the range, so no explanations are written")
     print("prv: Ctrl-C to stop")
     sys.stdout.flush()
     if github:
         github.start()
-    if auto_explain:
+    if explain:
         explainer.start(*auto_explain, kind="prepare")
     if args.open:
         threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()

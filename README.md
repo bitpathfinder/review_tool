@@ -105,7 +105,9 @@ prv new_review 12345   # checks out PR_12345/<repo> on branch pr12345 and serves
 
 Run it again to bring the checkout up to date: a fast-forward is applied, and a force-pushed PR
 keeps the old tip on a branch `pr12345-old-<sha>`. Local changes stop the update instead of being
-lost. Explanations and line notes are written in the background unless you pass `--no-explain`.
+lost. A PR already merged into its base branch is reviewed against the base commit GitHub reports
+for it, so its own commits show. Explanations and line notes are written in the background unless
+you pass `--no-explain`.
 The checkout skips Git LFS downloads (ScyllaDB's LFS files are PGO profiles that review does not need).
 
 ## Changes since an earlier version
