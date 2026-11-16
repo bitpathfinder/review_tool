@@ -3468,6 +3468,13 @@ function applyTheme(t){
 let savedTheme = null;
 try { savedTheme = localStorage.getItem('prv:theme'); } catch(e){}
 applyTheme(savedTheme);
+// Panel widths dragged earlier; set before first paint, as the theme is.
+const PANELS = {'--side-w': 'prv:sidew', '--notes-w': 'prv:notesw'};
+for (const [v, k] of Object.entries(PANELS)) {
+  let w = null;
+  try { w = localStorage.getItem(k); } catch(e){}
+  if (/^[0-9]{2,4}px$/.test(w || '')) document.documentElement.style.setProperty(v, w);
+}
 </script>
 <script src="/vendor/highlight.min.js"></script>
 <script src="/vendor/marked.min.js"></script>
@@ -3509,7 +3516,10 @@ button:hover{background:var(--bg2)}
 button.primary{background:#1f883d;border-color:#1f883d;color:#fff}
 button:disabled{opacity:.5;cursor:default}
 select,textarea{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--border);border-radius:6px}
-.layout{display:grid;grid-template-columns:320px 1fr;min-height:calc(100vh - 45px)}
+.layout{display:grid;grid-template-columns:min(var(--side-w,320px),60vw) 5px minmax(0,1fr);min-height:calc(100vh - 45px)}
+.vgrip{position:sticky;top:45px;height:calc(100vh - 45px);cursor:col-resize;touch-action:none}
+.vgrip:hover,.vgrip.drag{background:var(--accent);opacity:.35}
+body.resizing,body.resizing *{cursor:col-resize!important;user-select:none}
 aside{border-right:1px solid var(--border);padding:8px;overflow:auto;position:sticky;top:45px;height:calc(100vh - 45px);font-size:13px}
 aside h3{font-size:12px;text-transform:uppercase;color:var(--muted);margin:14px 6px 4px}
 .item{display:block;padding:4px 6px;border-radius:6px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -3580,11 +3590,15 @@ tr.trow>td{padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",san
 .spin::after{content:" ●";animation:bl 1s infinite}@keyframes bl{50%{opacity:.2}}
 .empty{color:var(--muted);padding:40px;text-align:center}
 .hunk{display:grid;grid-template-columns:minmax(0,1fr);position:relative}
-body.xon .hunk{grid-template-columns:minmax(0,1fr) 380px}
+body.xon .hunk{grid-template-columns:minmax(0,1fr) min(var(--notes-w,380px),70%)}
 .hunk>table{align-self:start}
 .xcell{display:none;border-left:1px solid var(--border);background:var(--bg2);font-size:13px}
 body.xon .xcell{display:block}
 .xcell{position:relative}
+/* The notes column's left edge resizes it; layoutCell() keeps the notes level with their lines.
+   A touch drag pans instead: Chrome ignores touch-action on a ::before box (tested). */
+@media (min-width:801px){body.xon .xcell::before{content:"";position:absolute;left:-3px;top:0;bottom:0;width:6px;cursor:col-resize;z-index:1}
+body.xon .xcell.drag::before{background:var(--accent);opacity:.35}}
 /* Wide screens: layoutCell() puts each note level with its line. */
 @media (min-width:801px){body.xon .xstack>*{position:absolute;left:0;right:0;background:var(--bg2);border-top:1px solid var(--border)}}
 .xnote{padding:8px 12px;border-bottom:1px solid var(--border)}
@@ -3615,7 +3629,7 @@ td.xhl{background:var(--sel)!important}
 .xsum .xmeta .sp{flex:1}
 .xsum .warn{color:var(--warn);font-size:13px;margin:4px 0}
 .xsum .err{color:var(--err);white-space:pre-wrap;font-size:12px;margin:4px 0}
-@media (max-width:800px){.layout{grid-template-columns:1fr}aside{position:static;height:auto;border-right:0}.thread{margin-left:10px}
+@media (max-width:800px){.layout{grid-template-columns:1fr}.vgrip{display:none}aside{position:static;height:auto;border-right:0}.thread{margin-left:10px}
 body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-top:1px solid var(--border)}.xstack{position:static}}
 </style>
 </head>
@@ -3628,7 +3642,7 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <button id="push" hidden title="Push HEAD to the pull request's branch on GitHub">Push</button>
 <button id="refresh" title="Reload commits and diff">Refresh</button></header>
 <div class="pushcard" id="pushcard" hidden></div>
-<div class="layout"><aside id="side"></aside><main id="main"><div class="empty">Loading…</div></main></div>
+<div class="layout"><aside id="side"></aside><div class="vgrip" id="sidegrip" title="Drag to resize the side panel; double-click for its default width"></div><main id="main"><div class="empty">Loading…</div></main></div>
 <script>
 const TOKEN = __PRV_TOKEN__;
 const S = {meta:null, view:null, diff:null, threads:{}, sel:null, live:{}, x:null};
@@ -4625,6 +4639,49 @@ function splitLabel(){
 }
 $('#split').addEventListener('click', () => { ls.set('prv:split', ls.get('prv:split') === '1' ? '0' : '1'); splitLabel(); rerenderDiff(); });
 splitLabel();
+// Dragging the side panel's edge or the notes column's left edge sets its width; double-click resets it.
+function dragPanel(e, v, w0, dir, min, max){
+  if (e.button !== 0) return;  // a right-click menu would swallow the pointerup and leave the drag running
+  e.preventDefault();
+  const grip = e.target;
+  grip.classList.add('drag');
+  document.body.classList.add('resizing');
+  let moved = false;
+  // Width follows the pointer's travel since pointerdown, so grabbing the grip off-centre does not jump it.
+  // Other pointers are ignored; a press with no travel saves nothing, so a click does not pin a clamped width.
+  const move = ev => {
+    if (ev.pointerId !== e.pointerId) return;
+    if (!(ev.buttons & 1)) return up(ev);  // the pointerup was lost, e.g. to an Alt+Tab during the drag
+    if (!moved && ev.clientX === e.clientX) return;
+    moved = true;
+    document.documentElement.style.setProperty(v, Math.round(Math.min(max, Math.max(min, w0 + dir * (ev.clientX - e.clientX)))) + 'px');
+  };
+  const up = ev => {
+    if (ev.pointerId !== e.pointerId) return;
+    window.removeEventListener('pointermove', move);
+    window.removeEventListener('pointerup', up);
+    window.removeEventListener('pointercancel', up);
+    grip.classList.remove('drag');
+    document.body.classList.remove('resizing');
+    if (moved) ls.set(PANELS[v], document.documentElement.style.getPropertyValue(v));
+  };
+  window.addEventListener('pointermove', move);
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
+}
+function resetPanel(v){ document.documentElement.style.removeProperty(v); ls.del(PANELS[v]); }
+// On the cell's 6px ::before strip, which is part of the cell for events. The strip starts 3px left of
+// the padding edge, behind the 1px border, so it spans -2..4px from the cell's left edge.
+const onNotesEdge = e => window.innerWidth > 800 && e.target.classList.contains('xcell') && e.clientX - e.target.getBoundingClientRect().left < 4;
+$('#sidegrip').addEventListener('pointerdown', e => dragPanel(e, '--side-w', $('#side').getBoundingClientRect().width, 1, 160, window.innerWidth * 0.6));
+$('#sidegrip').addEventListener('dblclick', () => resetPanel('--side-w'));
+$('#main').addEventListener('pointerdown', e => {
+  if (!onNotesEdge(e)) return;
+  // The CSS caps the column at 70% of its .hunk; a larger max would leave a dead zone at the end of the drag.
+  dragPanel(e, '--notes-w', e.target.getBoundingClientRect().width, -1, 200, e.target.parentElement.clientWidth * 0.7);
+});
+$('#main').addEventListener('dblclick', e => { if (onNotesEdge(e)) resetPanel('--notes-w'); });
+
 function layoutChanged(){ splitLabel(); if (isSplit() !== wasSplit) rerenderDiff(); }
 window.addEventListener('resize', layoutChanged);
 // Another tab toggling Split changes isSplit() here too; "Load diff" would then add a table in the other layout.
