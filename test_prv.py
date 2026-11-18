@@ -1447,13 +1447,24 @@ class HighlightTest(unittest.TestCase):
                           '<span class="hljs-type">int</span> x = <span class="hljs-number">1</span>;', r["new"][4 if lang == "python" else 3])
 
 
+def node_call(name, *args):
+    """Runs the page's top-level function name in node on JSON args; returns its integer result."""
+    fn = re.search(rf"function {name}\(.*?\n}}\n", prv.PAGE, re.S).group(0)
+    js = fn + f"process.stdout.write(String({name}(...{json.dumps(list(args))})));"
+    return int(subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout)
+
+
+class PageScriptTest(unittest.TestCase):
+    def test_no_function_is_declared_twice(self):
+        # A second declaration of a name silently replaces the first for every caller on the page.
+        names = re.findall(r"^(?:async )?function (\w+)\(", prv.PAGE, re.M)
+        self.assertEqual([n for n in set(names) if names.count(n) > 1], [])
+
+
 @unittest.skipUnless(shutil.which("node"), "needs node")
 class ChangeNavTest(unittest.TestCase):
     def target(self, tops, dir, cur=-1, y0=300, edge=False):
-        page = prv.PAGE
-        fn = re.search(r"function changeTarget\(.*?\n}\n", page, re.S).group(0)
-        js = fn + f"process.stdout.write(String(changeTarget({json.dumps(tops)}, {y0}, {dir}, {cur}, {json.dumps(edge)})));"
-        return int(subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout)
+        return node_call("changeTarget", tops, y0, dir, cur, edge)
 
     def test_next_and_previous_are_the_nearest_changes_past_the_landing_line(self):
         tops = [-500, 100, 300, 301, 900]
@@ -1477,6 +1488,23 @@ class ChangeNavTest(unittest.TestCase):
         self.assertEqual(self.target([-400, 500, 600], -1, edge=True), 2)
         self.assertEqual(self.target([], 1, edge=True), -1)
         self.assertEqual(self.target([150, 800], 1, cur=0, edge=True), 1)  # stepping from the last jump wins
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class WholeFileAnchorTest(unittest.TestCase):
+    def nearest(self, flat, side, line):
+        return node_call("nearestLine", flat, side, line)
+
+    def test_the_same_line_or_the_nearest_one_on_its_side(self):
+        # "Changes only" view of lines 8-12: line 9 replaced, then a line added.
+        flat = [{"t": " ", "o": 8, "n": 8}, {"t": "-", "o": 9}, {"t": "+", "n": 9}, {"t": "+", "n": 10},
+                {"t": " ", "o": 10, "n": 11}, {"t": " ", "o": 11, "n": 12}]
+        self.assertEqual(self.nearest(flat, "old", 9), 1)  # the removed line
+        self.assertEqual(self.nearest(flat, "new", 9), 2)
+        self.assertEqual(self.nearest(flat, "new", 11), 4)
+        self.assertEqual(self.nearest(flat, "new", 500), 5)  # a line far below the hunk
+        self.assertEqual(self.nearest(flat, "new", 1), 0)
+        self.assertEqual(self.nearest([], "new", 3), -1)
 
 
 class InstallTest(unittest.TestCase):

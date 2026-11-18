@@ -4493,18 +4493,66 @@ async function toggleWhole(i, btn){
   const f = S.diff.files[i], seq = S.seq;
   if (f.whole) { f.hunks = f.changes; f.whole = false; }
   else {
-    btn.disabled = true;
+    // A layout change re-renders the button enabled while the fetch runs; a second click must not start another.
+    if (f.loading) return;
+    btn.disabled = f.loading = true;
     const ps = [...new Set([f.old_path, f.new_path].filter(Boolean))];
     let d;
     try { d = await api('/api/diff?view=' + encodeURIComponent(S.view) + ps.map(p => '&path=' + encodeURIComponent(p)).join('')); }
     catch(e){ btn.disabled = false; return alert(e.message); }
+    finally { f.loading = false; }
     if (S.seq !== seq || S.diff?.files[i] !== f) return;  // the view changed meanwhile
     const w = d.files.find(x => filePath(x) === filePath(f) && x.status === f.status);
     if (!w) { btn.disabled = false; return alert('The file is not in this view any more; Refresh.'); }
     f.changes = f.hunks; f.hunks = w.hunks; f.whole = true;
   }
-  rerenderDiff();
-  if (f.whole) document.getElementById('f' + i)?.scrollIntoView({block:'start'});
+  // The file's first visible line stays where it was. "Changes only" may drop that line; the nearest shown line stays instead.
+  // A collapsed file has no anchor and keeps its place on "Changes only".
+  const a = rowAnchor(i);  // after the fetch: the page may have scrolled meanwhile
+  if (!rerenderDiff(a) && (a || f.whole)) document.getElementById('f' + i)?.scrollIntoView({block:'start'});
+}
+function rowAnchor(i){
+  // The first line of file i below its sticky header, and where it shows in the window.
+  const el = document.getElementById('f' + i), f = S.diff.files[i];
+  // Rows of a collapsed file measure 0 and would all be skipped one by one.
+  if (!el || !f.flat || el.classList.contains('collapsed')) return null;
+  const top = $('.fhead', el).getBoundingClientRect().bottom;
+  for (const td of el.querySelectorAll('tr.ln td.code[data-k]')) {
+    const r = td.getBoundingClientRect();
+    if (r.bottom <= top) continue;
+    if (r.top >= innerHeight) return null;  // a row below the window is not a line on screen
+    const l = f.flat[+td.dataset.k];
+    return {i, side:lineSide(l), line:lineNo(l), top:r.top};
+  }
+  return null;  // no rows loaded, or all rows are above the header
+}
+function pageAnchor(){
+  // The first file in the window: its first visible line, or the file's box when none shows.
+  const hb = $('header').getBoundingClientRect().bottom;
+  for (const el of document.querySelectorAll('#main .file')) {
+    const r = el.getBoundingClientRect();
+    if (r.bottom <= hb) continue;
+    if (r.top >= innerHeight) return null;
+    const a = rowAnchor(+el.dataset.f);
+    if (a) return a;
+    // A file starting above the window with no line in view changes height with the layout, so the next file anchors instead.
+    if (r.top >= hb) return {i:+el.dataset.f, top:r.top};
+  }
+  return null;
+}
+function anchorLine(a){
+  // The anchor's line on the page now, or the nearest line shown.
+  const k = a.line == null ? -1 : nearestLine(S.diff.files[a.i]?.flat, a.side, a.line);
+  return k >= 0 ? $(`#f${a.i} td.code[data-k="${k}"]`) : null;
+}
+function nearestLine(flat, side, line){
+  // Index of the line numbered closest to line on that side, -1 for none.
+  let k = -1, best = Infinity;
+  (flat || []).forEach((l, j) => {
+    const n = side === 'old' ? l.o : l.n;
+    if (n != null && Math.abs(n - line) < best) { best = Math.abs(n - line); k = j; }
+  });
+  return k;
 }
 function hunkRange(loc, a){
   // Flat indexes of the changed hunk holding a; in "Whole file" the file is one hunk, so use the original one.
@@ -5138,11 +5186,13 @@ function askNote(ni){
 $('#xtoggle').addEventListener('click', () => { ls.set('prv:xhide', ls.get('prv:xhide') === '1' ? '0' : '1'); renderExplain(false); });
 
 let wasSplit = isSplit();
-function rerenderDiff(){
+function rerenderDiff(a){
   // Rebuilds the tables in the other layout. Keeps drafts, open composers, loaded large diffs and collapsed files.
+  // a: the place that stays where it was, by default the first line in the window. Returns true when it stayed.
   wasSplit = isSplit();
   // setView clears S.diff while it loads and keeps it null when its fetch fails.
-  if (!S.diff) return;
+  if (!S.diff) return false;
+  if (a === undefined) a = pageAnchor();
   const y = window.scrollY;
   const drafts = saveDrafts();
   const files = [...document.querySelectorAll('#main .file')].map(el => ({loaded: !!$('.slot table.diff', el), collapsed: el.classList.contains('collapsed')}));
@@ -5169,6 +5219,10 @@ function rerenderDiff(){
     $('.trow.new .thread.new').replaceWith(lineTh);
   }
   window.scrollTo(0, y);
+  // A line anchor gone from the page keeps y: its top is not where the file box was.
+  const el = a && (a.line == null ? document.getElementById('f' + a.i) : anchorLine(a));
+  if (el) scrollBy(0, el.getBoundingClientRect().top - a.top);
+  return !!el;
 }
 function splitLabel(){
   // Narrow windows always show the unified layout.
