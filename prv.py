@@ -4305,26 +4305,56 @@ function hl(s, lang){
   if (!lang) return esc(s);
   try { return hljs.highlight(s, {language:lang, ignoreIllegals:true}).value; } catch(e){ return esc(s); }
 }
+function hlLines(lines, lang){
+  // One highlight call for the whole text, so a comment or a string that spans lines keeps its color.
+  if (!lang) return lines.map(esc);
+  let html;
+  const each = () => lines.map(s => hl(s, lang));
+  try { html = hljs.highlight(lines.join('\n'), {language:lang, ignoreIllegals:true}).value; } catch(e){ return each(); }
+  // hljs output is escaped text and <span> tags; a span open at a line end is closed there and reopened on the next line.
+  const out = [], open = [];
+  let cur = '';
+  for (const [t] of html.matchAll(/<span[^>]*>|<\/span>|\n|[^<\n]+/g)) {
+    if (t === '\n') { out.push(cur + '</span>'.repeat(open.length)); cur = open.join(''); continue; }
+    if (t === '</span>') open.pop(); else if (t[0] === '<') open.push(t);
+    cur += t;
+  }
+  out.push(cur + '</span>'.repeat(open.length));
+  return out.length === lines.length ? out : each();
+}
+function sideHl(h, own, lang, ownOnly){
+  // One side of the hunk (context lines plus the `own` '+' or '-' lines), indexed like h.lines. A side that starts at
+  // the file's first line ("Whole file", a new file) is highlighted as one text. Elsewhere the hunk may begin inside
+  // a string or comment it cannot see, so each line is highlighted alone. ownOnly: skip context lines then.
+  const js = h.lines.map((l, j) => l.t === own || l.t === ' ' ? j : -1).filter(j => j >= 0), out = [];
+  if (js.length && h.lines[js[0]][own === '-' ? 'o' : 'n'] === 1)
+    hlLines(js.map(j => h.lines[j].s), lang).forEach((x, n) => { out[js[n]] = x; });
+  else for (const j of js) if (!ownOnly || h.lines[j].t === own) out[j] = hl(h.lines[j].s, lang);
+  return out;
+}
 
 const BIG = 3000;
 function isSplit(){ return ls.get('prv:split') === '1' && window.innerWidth > 800; }
-function codeHtml(l, lang){
-  return `<span class="mk">${l.t === ' ' ? '' : l.t}</span>${hl(l.s, lang)}${l.nonl ? ' <span style="color:var(--err)">⊘</span>' : ''}`;
+function codeHtml(l, html){
+  return `<span class="mk">${l.t === ' ' ? '' : l.t}</span>${html}${l.nonl ? ' <span style="color:var(--err)">⊘</span>' : ''}`;
 }
 function lineCls(l){ return l.t === '+' ? 'add' : l.t === '-' ? 'del' : 'ctx'; }
 function unifiedRows(h, i, k0, lang){
+  // Context lines take the new side's colors.
+  const nw = sideHl(h, '+', lang), od = h.lines.some(l => l.t === '-') ? sideHl(h, '-', lang, true) : [];
   return h.lines.map((l, j) => {
     const k = k0 + j, c = lineCls(l);
-    return `<tr class="ln" data-f="${i}" data-ks="${k}"><td class="no ${c}" data-k="${k}">${l.o ?? ''}</td><td class="no ${c}" data-k="${k}">${l.n ?? ''}</td><td class="code ${c}" data-k="${k}">${codeHtml(l, lang)}</td></tr>`;
+    return `<tr class="ln" data-f="${i}" data-ks="${k}"><td class="no ${c}" data-k="${k}">${l.o ?? ''}</td><td class="no ${c}" data-k="${k}">${l.n ?? ''}</td><td class="code ${c}" data-k="${k}">${codeHtml(l, l.t === '-' ? od[j] : nw[j])}</td></tr>`;
   }).join('');
 }
 function splitRows(h, i, k0, lang){
   // Each run of removed lines pairs up with the added lines after it; context shows on both sides.
-  const L = h.lines;
+  // Mid-file, a context line reads the same on both sides, so the old side reuses the new side's html.
+  const L = h.lines, hx = {old: sideHl(h, '-', lang, true), new: sideHl(h, '+', lang)};
   const half = (j, side) => {
     if (j === undefined) return '<td class="no empty"></td><td class="code empty"></td>';
     const l = L[j], c = lineCls(l);
-    return `<td class="no ${c}" data-k="${k0 + j}">${side === 'old' ? l.o : l.n}</td><td class="code ${c}" data-k="${k0 + j}">${codeHtml(l, lang)}</td>`;
+    return `<td class="no ${c}" data-k="${k0 + j}">${side === 'old' ? l.o : l.n}</td><td class="code ${c}" data-k="${k0 + j}">${codeHtml(l, hx[side][j] ?? hx.new[j])}</td>`;
   };
   const row = (a, b) => `<tr class="ln" data-f="${i}" data-ks="${[...new Set([a, b])].filter(x => x !== undefined).map(x => k0 + x).join(' ')}">${half(a, 'old')}${half(b, 'new')}</tr>`;
   let rows = '', j = 0;

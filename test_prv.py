@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import time
 import signal
@@ -1372,6 +1373,77 @@ class NewReviewTest(unittest.TestCase):
         self.assertEqual(req("/api/explain", {}), moving)
         self.assertEqual((store.threads["t"]["running"], len(store.threads), explainer.job), (False, 1, None))
         changes.pulling.clear()
+
+
+HL_JS = r"""
+const fs = require('fs');
+eval(fs.readFileSync(process.argv[2], 'utf8') + ';globalThis.hljs = hljs;');
+const page = fs.readFileSync(process.argv[3], 'utf8');
+const pick = name => page.match(new RegExp(`function ${name}\\(.*?\\n}\\n`, 's'))[0];
+eval(page.match(/^const esc = .*$/m)[0] + pick('hl') + pick('hlLines') + pick('sideHl') + ';globalThis.sideHl = sideHl; globalThis.hl = hl;');
+const h = JSON.parse(fs.readFileSync(0, 'utf8'));
+process.stdout.write(JSON.stringify({old: sideHl(h, '-', h.lang), new: sideHl(h, '+', h.lang),
+                                     line: h.lines.map(l => hl(l.s, h.lang))}));
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class HighlightTest(unittest.TestCase):
+    def hunk_html(self, lines, lang="cpp", start=10):
+        o = n = start
+        hunk = []
+        for t, s in lines:  # old and new line numbers, as parse_diff gives them
+            hunk.append({"t": t, "s": s, **({"o": o} if t != "+" else {}), **({"n": n} if t != "-" else {})})
+            o, n = o + (t != "+"), n + (t != "-")
+        with tempfile.TemporaryDirectory() as d:
+            page, script = os.path.join(d, "page.js"), os.path.join(d, "hl.js")
+            with open(page, "w") as fh:
+                fh.write(prv.PAGE)
+            with open(script, "w") as fh:
+                fh.write(HL_JS)
+            r = subprocess.run(["node", script, os.path.join(prv.VENDOR_DIR, "highlight.min.js"), page],
+                               input=json.dumps({"lang": lang, "lines": hunk}),
+                               capture_output=True, text=True, check=True)
+        return json.loads(r.stdout)
+
+    def test_from_the_first_line_a_comment_spanning_lines_keeps_its_color_on_each_side(self):
+        r = self.hunk_html([(" ", "int a; /* start"), ("-", "old */ int b;"), ("+", "new line"),
+                            ("+", "end */ int c;"), (" ", 'auto s = R"(raw <b>'), (" ", ')";')], start=1)
+        old, new = r["old"], r["new"]
+        self.assertEqual(new[0], '<span class="hljs-type">int</span> a; <span class="hljs-comment">/* start</span>')
+        self.assertEqual(old[1], '<span class="hljs-comment">old */</span> <span class="hljs-type">int</span> b;')
+        self.assertEqual(new[2], '<span class="hljs-comment">new line</span>')  # inside the comment on the new side
+        self.assertEqual(new[3], '<span class="hljs-comment">end */</span> <span class="hljs-type">int</span> c;')
+        self.assertEqual(new[5], '<span class="hljs-string">)&quot;</span>;')  # the raw string's second line
+        self.assertIn("&lt;b&gt;", new[4])
+        self.assertEqual((old[2], old[3], new[1]), (None, None, None))
+        for x in old + new:
+            if x is not None:
+                self.assertEqual(x.count("<span"), x.count("</span>"), x)
+
+    def test_from_the_first_line_a_context_line_takes_each_sides_own_colors(self):
+        # A removed line opens a comment that the context line after it closes on the old side only.
+        r = self.hunk_html([("-", "/* old"), (" ", "middle */ int y;")], start=1)
+        self.assertEqual(r["old"][1], '<span class="hljs-comment">middle */</span> <span class="hljs-type">int</span> y;')
+        self.assertEqual(r["new"][1], 'middle */ <span class="hljs-type">int</span> y;')
+
+    def test_python_from_the_first_line_is_highlighted_as_one_text(self):
+        r = self.hunk_html([("+", '"""Module doc,'), ("+", 'second line."""'), ("+", "x = 1")], lang="python", start=1)
+        self.assertEqual(r["new"][1], '<span class="hljs-string">second line.&quot;&quot;&quot;</span>')
+        self.assertEqual(r["new"][2], 'x = <span class="hljs-number">1</span>')
+
+    def test_mid_file_hunks_are_highlighted_line_by_line(self):
+        # Hunks that begin inside a docstring or a raw string: one text would read them inside out.
+        for lang, lines in [
+                ("python", [(" ", "    Returns x."), (" ", '    """'), (" ", "    return x"), (" ", ""),
+                            ("+", "def g():"), ("+", '    """Compute g.')]),
+                ("cpp", [(" ", "  select * /* all"), (" ", ')";'), ("-", "int x = 0;"), ("+", "int x = 1;"),
+                         ("+", 'auto y = R"(abc')])]:
+            r = self.hunk_html(lines, lang=lang)
+            for j, (t, _) in enumerate(lines):
+                self.assertEqual(r["old" if t == "-" else "new"][j], r["line"][j], (lang, j))
+            self.assertIn('<span class="hljs-keyword">def</span>' if lang == "python" else
+                          '<span class="hljs-type">int</span> x = <span class="hljs-number">1</span>;', r["new"][4 if lang == "python" else 3])
 
 
 class InstallTest(unittest.TestCase):
