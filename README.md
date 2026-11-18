@@ -29,8 +29,10 @@ to answer.
   last commit. With `--allow-push`, **Push** sends HEAD to your own open PR's branch (below).
 - **New review.** `prv new_review <PR>` checks a PR out (or brings an existing checkout up to date),
   with its submodules, and opens it. **Pull** in the header brings it up to date later.
-- Split or unified diff, whole-file view, Viewed marks, light and dark themes. Drag the edge of the
-  side panel or of the notes column to change that panel's width; a double-click on the edge restores the default.
+- Split or unified diff, whole-file view, Viewed marks, light and dark themes. **↑** and **↓** in the
+  header (keys `p` and `n`) jump to the previous or next change shown, across files and inside a whole file.
+  Drag the edge of the side panel or of the notes column to change that panel's width; a double-click
+  on the edge restores the default.
 
 ## Screenshots
 

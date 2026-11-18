@@ -3989,6 +3989,7 @@ td.del.code{background:var(--delbg)} td.del.no{background:var(--delno)}
 td.empty{background:var(--bg2)}
 tr.hh td{background:var(--hunk);color:var(--muted);padding:3px 8px}
 td.sel{background:var(--sel)!important}
+tr.ln.flash>td{background:var(--sel)}
 .note{padding:10px;color:var(--muted);font-size:13px}
 tr.trow>td{padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px}
 .thread{margin:8px 10px 8px 108px;border:1px solid var(--border);border-radius:6px;background:var(--thread);max-width:980px}
@@ -4081,6 +4082,7 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <body>
 <header><span class="title" id="title">prv</span><span class="range" id="range"></span><span class="ghlinks" id="ghpr"></span><span class="prtitle" id="prtitle"></span><span class="ghlinks" id="ghlinks"></span><span class="sp"></span>
 <button id="xtoggle" hidden title="Show or hide the explanations next to the diff">Notes</button>
+<button id="chprev" title="Previous change (p)" aria-label="Previous change">↑</button><button id="chnext" title="Next change (n)" aria-label="Next change">↓</button>
 <button id="split" title="Switch between unified and side-by-side diff">Split</button>
 <select id="theme" title="Color theme"></select>
 <button id="askview" title="Start a thread about the whole view">Ask about this view</button>
@@ -5175,6 +5177,45 @@ function splitLabel(){
 }
 $('#split').addEventListener('click', () => { ls.set('prv:split', ls.get('prv:split') === '1' ? '0' : '1'); splitLabel(); rerenderDiff(); });
 splitLabel();
+// Previous and next change: the first row of each run of added or removed lines, in every expanded file with its diff loaded.
+const CHG = {row:null, top:0, timer:0};  // the change jumped to last, and where it landed
+function changeTarget(tops, y0, dir, cur, atEdge){
+  // tops: each change's top in the viewport. cur: the change jumped to last, if the page has not scrolled since;
+  // stepping past cur reaches the changes that the top or bottom of the page keeps from scrolling to y0.
+  // atEdge: Next at the page top or Previous at its bottom. Every change is then ahead.
+  const ref = cur >= 0 ? tops[cur] : atEdge ? -dir * Infinity : y0;
+  return dir > 0 ? tops.findIndex(t => t > ref + 2) : tops.findLastIndex(t => t < ref - 2);
+}
+function jumpChange(dir){
+  const y0 = innerHeight / 3, starts = [];
+  for (const tb of document.querySelectorAll('#main table.diff > tbody')) {
+    if (!tb.getClientRects().length) continue;  // a collapsed file
+    let prev = false;
+    for (const tr of tb.rows) {
+      if (!tr.classList.contains('ln')) continue;  // a thread under a line does not end the run
+      const ch = !!tr.querySelector('td.add, td.del');
+      if (ch && !prev) starts.push(tr);
+      prev = ch;
+    }
+  }
+  const tops = starts.map(tr => tr.getBoundingClientRect().top), c = starts.indexOf(CHG.row);
+  const atEdge = dir > 0 ? scrollY < 1 : scrollY + innerHeight >= document.documentElement.scrollHeight - 1;
+  const j = changeTarget(tops, y0, dir, c >= 0 && Math.abs(tops[c] - CHG.top) < 2 ? c : -1, atEdge);
+  if (j < 0) return;
+  scrollBy(0, tops[j] - y0);
+  clearTimeout(CHG.timer);
+  CHG.row?.classList.remove('flash');
+  const tr = CHG.row = starts[j];
+  CHG.top = tr.getBoundingClientRect().top;
+  tr.classList.add('flash');
+  CHG.timer = setTimeout(() => tr.classList.remove('flash'), 800);
+}
+$('#chprev').addEventListener('click', () => jumpChange(-1));
+$('#chnext').addEventListener('click', () => jumpChange(1));
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey || e.metaKey || e.altKey || e.target.closest?.('input:not([type=checkbox]), textarea, select, [contenteditable]')) return;
+  if (e.key === 'n' || e.key === 'p') { e.preventDefault(); jumpChange(e.key === 'n' ? 1 : -1); }
+});
 // Dragging the side panel's edge or the notes column's left edge sets its width; double-click resets it.
 function dragPanel(e, v, w0, dir, min, max){
   if (e.button !== 0) return;  // a right-click menu would swallow the pointerup and leave the drag running

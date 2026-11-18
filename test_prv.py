@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -1444,6 +1445,38 @@ class HighlightTest(unittest.TestCase):
                 self.assertEqual(r["old" if t == "-" else "new"][j], r["line"][j], (lang, j))
             self.assertIn('<span class="hljs-keyword">def</span>' if lang == "python" else
                           '<span class="hljs-type">int</span> x = <span class="hljs-number">1</span>;', r["new"][4 if lang == "python" else 3])
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class ChangeNavTest(unittest.TestCase):
+    def target(self, tops, dir, cur=-1, y0=300, edge=False):
+        page = prv.PAGE
+        fn = re.search(r"function changeTarget\(.*?\n}\n", page, re.S).group(0)
+        js = fn + f"process.stdout.write(String(changeTarget({json.dumps(tops)}, {y0}, {dir}, {cur}, {json.dumps(edge)})));"
+        return int(subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout)
+
+    def test_next_and_previous_are_the_nearest_changes_past_the_landing_line(self):
+        tops = [-500, 100, 300, 301, 900]
+        self.assertEqual(self.target(tops, 1), 4)  # 300 sits on the line, 301 is within the 2px slack
+        self.assertEqual(self.target(tops, -1), 1)
+        self.assertEqual(self.target([-50, 10], 1), -1)
+        self.assertEqual(self.target([400, 900], -1), -1)
+
+    def test_steps_from_the_last_change_when_the_page_cannot_scroll_to_it(self):
+        # At the bottom of the page the last changes stay below the landing line.
+        tops = [100, 500, 600]
+        self.assertEqual(self.target(tops, 1, cur=1), 2)
+        self.assertEqual(self.target(tops, 1, cur=2), -1)
+        self.assertEqual(self.target(tops, -1, cur=1), 0)
+        self.assertEqual(self.target(tops, -1, cur=0), -1)
+
+    def test_next_at_the_top_and_previous_at_the_bottom_reach_the_end_changes(self):
+        # At the top of the page a change above the landing line cannot scroll down to it.
+        self.assertEqual(self.target([150, 800], 1), 1)
+        self.assertEqual(self.target([150, 800], 1, edge=True), 0)
+        self.assertEqual(self.target([-400, 500, 600], -1, edge=True), 2)
+        self.assertEqual(self.target([], 1, edge=True), -1)
+        self.assertEqual(self.target([150, 800], 1, cur=0, edge=True), 1)  # stepping from the last jump wins
 
 
 class InstallTest(unittest.TestCase):
