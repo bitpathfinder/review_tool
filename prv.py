@@ -629,6 +629,16 @@ class Repo:
         return "".join(out), len(names)
 
 
+def set_aside(path, why):
+    """Keep a copy of a bad file as <path>.bad before it is overwritten, and say so on stderr."""
+    try:
+        shutil.copyfile(path, path + ".bad")
+        kept = f"copy kept as {os.path.basename(path)}.bad"
+    except OSError as e:
+        kept = f"cannot keep a copy: {e}"
+    print(f"prv: {path}: {why}; {kept}", file=sys.stderr)
+
+
 class Store:
     """Threads persisted as JSON under <git-dir>/prv/threads.json."""
 
@@ -641,8 +651,7 @@ class Store:
         self.save_warned = False
         try:
             with open(self.path) as fh:
-                # NaN and Infinity become null: served as is, /api/threads would be JSON the browser rejects.
-                saved = _load_json(fh, parse_constant=lambda _: None, parse_float=lambda s: finite_cost(float(s)))
+                saved = _load_finite_json(fh)
             if not isinstance(saved, list):
                 raise ValueError("not a JSON list")
         except FileNotFoundError:
@@ -681,13 +690,7 @@ class Store:
             raise ValueError("missing or mistyped fields")
 
     def _set_aside(self, why):
-        # Keep a copy: the next save overwrites threads.json with what was loaded.
-        try:
-            shutil.copyfile(self.path, self.path + ".bad")
-            kept = "copy kept as threads.json.bad"
-        except OSError as e:
-            kept = f"cannot keep a copy: {e}"
-        print(f"prv: {self.path}: {why}; {kept}", file=sys.stderr)
+        set_aside(self.path, why)  # the next save overwrites threads.json with what was loaded
 
     def save_locked(self):
         # Best effort: an unwritable git dir must not block asking questions.
@@ -705,6 +708,241 @@ class Store:
     def snapshot(self):
         with self.lock:
             return json.loads(json.dumps(list(self.threads.values())))
+
+
+# ---------------------------------------------------------- claude sessions
+
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z")  # $ takes a trailing \n
+MAX_SESSION_LOG = 500
+SESSION_HEAD, SESSION_TAIL = 256 << 10, 1 << 20
+
+
+def session_log_path(git_dir):
+    return os.path.join(git_dir, "prv", "sessions.json")
+
+
+def _read_session_log(git_dir):
+    """(good entries, number of bad entries skipped). Raises OSError or ValueError on a bad file."""
+    try:
+        with open(session_log_path(git_dir)) as fh:
+            log = _load_finite_json(fh)
+    except FileNotFoundError:
+        return [], 0
+    if not isinstance(log, list):
+        raise ValueError("not a JSON list")
+    good = [e for e in log if isinstance(e, dict) and isinstance(e.get("id"), str) and SESSION_ID_RE.match(e["id"])
+            and isinstance(e.get("kind"), str) and isinstance(e.get("label"), str)
+            and finite_cost(e.get("created")) is not None]  # not a bool, and finite as a JS number
+    return good, len(log) - len(good)
+
+
+def load_session_log(git_dir):
+    """prv's claude runs other than threads, oldest first: [{id, kind, label, created}]. Raises OSError or
+    ValueError on a bad file."""
+    return _read_session_log(git_dir)[0]
+
+
+def thread_label(t):
+    """A thread's first question, as sessions.json and /api/sessions list it. Call with the store lock held."""
+    return next((m.get("text") or "" for m in t["messages"] if m.get("role") == "user"), "").strip()[:300]
+
+
+def record_session(git_dir, sid, kind, label):
+    """Add a run to sessions.json. Best effort, as threads.json: a failed write must not fail the run."""
+    if not (isinstance(sid, str) and SESSION_ID_RE.match(sid)):
+        return
+    path = session_log_path(git_dir)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # flock serializes `prv explain` beside the server, and threads too: each open() owns its lock.
+        with open(path + ".lock", "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                log, bad = _read_session_log(git_dir)
+                if bad:  # the write below drops them
+                    set_aside(path, f"skipped {bad} bad entries")
+            except ValueError as e:
+                set_aside(path, f"{e}; starting a new one")
+                log = []
+            log = [e for e in log if e["id"] != sid] + [{"id": sid, "kind": kind, "label": label,
+                                                          "created": time.time()}]
+            with open(path + ".tmp", "w") as fh:
+                json.dump(log[-MAX_SESSION_LOG:], fh)
+            os.replace(path + ".tmp", path)
+    except OSError as e:
+        print(f"prv: cannot record claude session {sid}: {e}", file=sys.stderr)
+
+
+def claude_env():
+    """The variables that pick where Claude Code keeps transcripts, if set: {name: value}. A resume command
+    needs them too, or `claude --resume` looks in ~/.claude and finds no such session."""
+    config = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not config:
+        return {}
+    # With CLAUDE_CONFIG_DIR set, Claude Code takes a valid CLAUDE_CODE_PROJECT_DIR_NAME as the folder name.
+    override = os.environ.get("CLAUDE_CODE_PROJECT_DIR_NAME") or ""
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", override) and \
+            not re.fullmatch(r"con|prn|aux|nul|com[0-9]|lpt[0-9]", override, re.I):
+        return {"CLAUDE_CONFIG_DIR": config, "CLAUDE_CODE_PROJECT_DIR_NAME": override}
+    return {"CLAUDE_CONFIG_DIR": config}
+
+
+def claude_projects_dirs(root):
+    """Transcript folders of sessions started in root: root with each non-alphanumeric as '-'. Past 200
+    characters Claude Code adds '-<hash>', so a long root gets every folder with that prefix. Raises OSError
+    when that listing fails, other than on a missing projects folder."""
+    env = claude_env()
+    # A relative CLAUDE_CONFIG_DIR is relative to claude's cwd, which is root for prv's runs.
+    projects = os.path.join(root, env.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "projects")
+    if "CLAUDE_CODE_PROJECT_DIR_NAME" in env:
+        return [os.path.join(projects, env["CLAUDE_CODE_PROJECT_DIR_NAME"])]
+    # Claude Code's regex works on UTF-16 units: a character past U+FFFF becomes "--" and counts as 2.
+    name = re.sub(r"[^A-Za-z0-9]", lambda m: "--" if ord(m.group()) > 0xFFFF else "-", root)
+    if len(name) <= 200:
+        return [os.path.join(projects, name)]
+    try:  # the full name never exists, and past 255 characters listdir() fails on it
+        return [os.path.join(projects, n) for n in sorted(os.listdir(projects)) if n.startswith(name[:200] + "-")]
+    except FileNotFoundError:
+        return []
+
+
+def _prompt_text(msg):
+    # Skips <command-name>, <task-notification> and the like. An IDE session puts <ide_selection> or
+    # <ide_opened_file> in a text block before the prompt's.
+    c = msg.get("content") if isinstance(msg, dict) else None
+    texts = [c] if isinstance(c, str) else [b.get("text") for b in c if isinstance(b, dict) and
+                                            b.get("type") == "text"] if isinstance(c, list) else []
+    return next((t.strip() for t in texts if isinstance(t, str) and t.strip() and not t.lstrip().startswith("<")),
+                "")
+
+
+def read_transcript(path, size):
+    """Start, first prompt and title of a session from its transcript's head and tail. Claude Code
+    appends its title records again every few turns, so the tail holds the latest ones."""
+    with open(path, "rb") as fh:
+        if size <= SESSION_HEAD + SESSION_TAIL:
+            lines = fh.read(SESSION_HEAD + SESSION_TAIL).split(b"\n")  # one read: no line cut in two
+        else:
+            head = fh.read(SESSION_HEAD)
+            # One byte early: a tail that starts on a line start keeps that line, the [1:] drops b"".
+            fh.seek(size - SESSION_TAIL - 1)
+            lines = head.split(b"\n")[:-1] + fh.read(SESSION_TAIL + 1).split(b"\n")[1:]  # both cuts split a line
+    info = {"cwd": None, "started": None, "prompt": "", "headless": False, "continued_in": None}
+    titles = {}
+    for raw in lines:
+        try:
+            ev = _loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        typ = ev.get("type")
+        if info["started"] is None and isinstance(ev.get("timestamp"), str):
+            info["started"] = ev["timestamp"]
+        if info["cwd"] is None and isinstance(ev.get("cwd"), str):
+            info["cwd"] = ev["cwd"]
+            info["headless"] = str(ev.get("entrypoint", "")).startswith("sdk")
+        if typ == "user" and not info["prompt"] and not ev.get("isMeta"):
+            text = _prompt_text(ev.get("message"))
+            if text:
+                info["prompt"] = text[:300]
+        elif typ in ("custom-title", "agent-name", "ai-title"):
+            t = ev.get({"custom-title": "customTitle", "agent-name": "agentName", "ai-title": "aiTitle"}[typ])
+            if isinstance(t, str) and t.strip():
+                titles[typ] = t.strip()[:200]
+        elif typ == "continued-in" and isinstance(ev.get("continuedInSessionId"), str):
+            info["continued_in"] = ev["continuedInSessionId"]
+    info["title"] = titles.get("custom-title") or titles.get("agent-name") or titles.get("ai-title") or ""
+    return info
+
+
+class Sessions:
+    """Claude Code sessions to resume: prv's own runs, and the other sessions started in the checkout."""
+
+    def __init__(self, repo, store):
+        self.repo, self.store = repo, store
+        self.lock = threading.Lock()
+        self._cache = {}  # transcript path -> ((mtime, size), info)
+
+    def _transcripts(self, folder, seen, errors):
+        """{session id: transcript info} of folder; adds the transcripts' paths to seen, unreadable ones to
+        errors."""
+        found = {}
+        try:
+            names = os.listdir(folder)
+        except FileNotFoundError:
+            names = []
+        for n in names:
+            sid = n[:-len(".jsonl")] if n.endswith(".jsonl") else ""
+            if not SESSION_ID_RE.match(sid):
+                continue  # subagent transcripts live in <session>/subagents/
+            p = os.path.join(folder, n)
+            try:
+                st = os.stat(p)
+                if not st.st_size:
+                    continue  # an empty transcript has no conversation to resume
+                key = (st.st_mtime_ns, st.st_size)
+                with self.lock:
+                    hit = self._cache.get(p)
+                info = hit[1] if hit and hit[0] == key else read_transcript(p, st.st_size)
+            except FileNotFoundError:
+                continue  # removed while listing
+            except OSError as e:
+                errors.append(f"{p}: {e.strerror or e}")
+                continue
+            with self.lock:
+                self._cache[p] = (key, info)
+            seen.add(p)
+            found[sid] = {**info, "modified": st.st_mtime}
+        return found
+
+    def snapshot(self):
+        root = self.repo.root
+        errors, found, seen = [], {}, set()
+        try:
+            folders = claude_projects_dirs(root)
+        except OSError as e:  # the projects folder of a long root is unreadable
+            folders = []
+            errors.append(f"{e.filename}: {e.strerror or e}")
+        for folder in folders:
+            try:
+                found.update(self._transcripts(folder, seen, errors))
+            except OSError as e:  # an unreadable folder; a missing one is no sessions yet
+                errors.append(f"{folder}: {e.strerror or e}")
+        with self.lock:
+            for p in [p for p in self._cache if p not in seen]:
+                del self._cache[p]
+        out = {"prv": [], "other": [], "error": None}
+        own = {}
+        with self.store.lock:  # two fields per thread: Store.snapshot() would deep-copy every answer
+            for t in self.store.threads.values():
+                sid = t.get("session_id")
+                if isinstance(sid, str) and SESSION_ID_RE.match(sid):
+                    own[sid] = {"kind": "thread", "label": thread_label(t), "created": t["created"]}
+        try:
+            for e in load_session_log(self.repo.git_dir):
+                own[e["id"]] = {"kind": e["kind"], "label": e["label"], "created": e["created"]}
+        except (OSError, ValueError) as e:
+            errors.append(f"{session_log_path(self.repo.git_dir)}: {e}")
+        out["error"] = "; ".join(errors) or None
+
+        env = "".join(f"{k}={shlex.quote(v)} " for k, v in claude_env().items())
+
+        def row(sid, info, extra):
+            cwd = info.get("cwd") or root
+            return {"id": sid, "cwd": cwd, "resume": f"cd {shlex.quote(cwd)} && {env}claude --resume {sid}",
+                    "title": info.get("title") or "", "prompt": info.get("prompt") or "",
+                    "headless": bool(info.get("headless")), "continued_in": info.get("continued_in"),
+                    "started": info.get("started"), "modified": info.get("modified"), **extra}
+        for sid, o in own.items():
+            out["prv"].append(row(sid, found.get(sid, {}), {**o, "gone": sid not in found}))
+        # A transcript's first cwd is where it started; another one shares this folder because its path
+        # differs only in characters the folder name turns into '-' (PR-1 and PR_1).
+        out["other"] = [row(sid, info, {}) for sid, info in found.items()
+                        if sid not in own and info["cwd"] in (None, root)]
+        out["prv"].sort(key=lambda r: r["modified"] or r["created"], reverse=True)
+        out["other"].sort(key=lambda r: r["modified"], reverse=True)
+        return out
 
 
 # ----------------------------------------------------------------- prompting
@@ -919,13 +1157,19 @@ class Runner:
                 if not isinstance(ev, dict):
                     continue
                 for out in tr.feed(ev):
+                    new_sid = None
                     with st.lock:
                         if out["type"] == "session" and out["session_id"]:
+                            if t["session_id"] != out["session_id"]:
+                                new_sid, label = out["session_id"], thread_label(t)
                             t["session_id"] = out["session_id"]
                         elif out["type"] == "text":
                             msg["text"] += out["text"]
                         elif out["type"] == "tool":
                             msg["tools"].append({"name": out["name"], "detail": out["detail"]})
+                    if new_sid:
+                        # Kept past a thread delete, and past a prv crash before threads.json saves the id.
+                        record_session(self.repo.git_dir, new_sid, "thread", label)
                     if out["type"] == "done":
                         done_ev = out
                     else:
@@ -952,7 +1196,10 @@ class Runner:
             done_ev = {"type": "done", "is_error": True, "error": err}
         if done_ev.get("session_id"):
             with st.lock:
-                t["session_id"] = done_ev["session_id"]
+                new_sid = t["session_id"] != done_ev["session_id"]
+                t["session_id"], label = done_ev["session_id"], thread_label(t)
+            if new_sid:  # no init event carried the id, as in Explainer._claude
+                record_session(self.repo.git_dir, done_ev["session_id"], "thread", label)
         self._finish(t, msg, cost=done_ev.get("cost"),
                      error=done_ev.get("error") if done_ev.get("is_error") else None)
         emit(done_ev)
@@ -1340,6 +1587,11 @@ def _load_json(fh, **kw):
     return _loads(fh.read(), **kw)
 
 
+def _load_finite_json(fh):
+    # NaN and Infinity become null: served as is, they would be JSON the browser rejects.
+    return _load_json(fh, parse_constant=lambda _: None, parse_float=lambda s: finite_cost(float(s)))
+
+
 def check_explain_doc(doc):
     """Validate the fields the server and page read without a guard."""
     def anchor_ok(a):
@@ -1547,7 +1799,8 @@ class Explainer:
         head, files, commits = self._range()
         log = self._range_log(head, len(commits), "commit %H%n%B")
         prompt, hunks = explain_prompt(repo.base, head, files, log)
-        out, cost = self._claude(prompt, model, budget, on_tool)
+        out, cost = self._claude(prompt, model, budget, on_tool,
+                                 run=("explanation", f"{repo.base[:10]}..{head[:10]}"))
 
         def anchors(n):
             got = []
@@ -1600,8 +1853,9 @@ class Explainer:
             d = repo.diff(sha)
             prompt, labels = commit_prompt(sha, d["message"], d["files"], series, pr["summary"] if pr else "")
             try:
+                subject = next((x.partition(" ")[2] for x in subjects if x.startswith(sha)), "")
                 out, cost = self._claude(prompt, model, budget_left(budget, spent), on_tool, COMMIT_SYSTEM,
-                                         COMMIT_SCHEMA)
+                                         COMMIT_SCHEMA, run=("line notes", f"{sha[:10]} {subject}"[:300]))
             except ExplainError as e:
                 spent += e.cost or 0
                 if str(e) == "stopped" or (budget is not None and spent >= budget):
@@ -1664,14 +1918,16 @@ class Explainer:
                 stopped = self.stopping
         return proc.returncode, stopped
 
-    def _claude(self, prompt, model, budget, on_tool, system=EXPLAIN_SYSTEM, schema=EXPLAIN_SCHEMA):
-        """One claude run. Returns (structured output, cost); raises ExplainError."""
+    def _claude(self, prompt, model, budget, on_tool, system=EXPLAIN_SYSTEM, schema=EXPLAIN_SCHEMA, *, run):
+        """One claude run. Returns (structured output, cost); raises ExplainError.
+        run: (kind, label) to list the session in sessions.json, stopped and failed runs too."""
         stderr_buf = []
         tr = StreamTranslator()
         result = None
+        recorded = None
 
         def read(stdout):
-            nonlocal result
+            nonlocal result, recorded
             for raw in stdout:
                 try:
                     ev = _loads(raw)
@@ -1680,12 +1936,21 @@ class Explainer:
                 if not isinstance(ev, dict):
                     continue
                 for ue in tr.feed(ev):
-                    if ue["type"] == "tool" and ue["name"] != "StructuredOutput":
+                    if ue["type"] == "session" and ue["session_id"] != recorded:
+                        # At start, as Runner does for threads: else a run in progress or cut short by a
+                        # prv crash shows among the other sessions.
+                        record_session(self.repo.git_dir, ue["session_id"], *run)
+                        recorded = ue["session_id"]
+                    elif ue["type"] == "tool" and ue["name"] != "StructuredOutput":
                         on_tool(ue["name"], ue["detail"])
                 if ev.get("type") == "result" and not ev.get("parent_tool_use_id"):
                     result = ev
-        code, stopped = self._supervise(self.command(model, budget, system, schema), "claude", prompt, read,
-                                        lambda f: stderr_buf.append(f.read()))
+        try:
+            code, stopped = self._supervise(self.command(model, budget, system, schema), "claude", prompt, read,
+                                            lambda f: stderr_buf.append(f.read()))
+        finally:  # no init event seen, or read() raised after claude started the session
+            if tr.session_id != recorded:
+                record_session(self.repo.git_dir, tr.session_id, *run)
         if result is None:
             raise ExplainError("stopped" if stopped else
                                f"claude exited with code {code}: {''.join(stderr_buf).strip()[-2000:]}")
@@ -2028,7 +2293,8 @@ class Reviewer(Explainer):
         except (OSError, ValueError):
             pr = None  # the PR summary is optional context
         prompt, labels = review_prompt(repo.base, head, log, files, pr["summary"] if pr else "")
-        out, cost = self._claude(prompt, model, None, on_tool, REVIEW_SYSTEM, REVIEW_SCHEMA)
+        out, cost = self._claude(prompt, model, None, on_tool, REVIEW_SYSTEM, REVIEW_SCHEMA,
+                                 run=("AI review", f"{repo.base[:10]}..{head[:10]}"))
         doc = self._doc(head, files, _str(out.get("summary")), claude_findings(out, files, labels),
                         model=model, cost=cost)
         self.save(doc)
@@ -2127,7 +2393,8 @@ class Reviewer(Explainer):
 FORBIDDEN = "wrong token: prv was restarted or the URL is incomplete; open the URL prv printed"
 
 
-def make_handler(repo, store, runner, explainer, token, page, github=None, reviewers=None, changes=None):
+def make_handler(repo, store, runner, explainer, token, page, github=None, reviewers=None, changes=None,
+                 sessions=None):
     def _token_ok(given):
         # Bytes: compare_digest raises TypeError on non-ASCII str input.
         return secrets.compare_digest(given.encode(), token.encode())
@@ -2207,6 +2474,8 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                     return self._json({"tips": repo.since_tips(github.head_sha() if github else None)})
                 if u.path == "/api/threads":
                     return self._json(store.snapshot())
+                if u.path == "/api/sessions":
+                    return self._json(sessions.snapshot() if sessions else {"disabled": True})
                 if u.path == "/api/explain":
                     return self._json(explainer.for_view(q.get("view", ["all"])[0]))
                 if u.path == "/api/review":
@@ -3397,7 +3666,8 @@ def main(argv=None, auto_explain=None):
     if qodo:
         reviewers["qodo"] = Reviewer(repo, args.claude, "qodo", qodo=qodo)
     changes = Changes(repo, runner, github, args.allow_push)
-    handler = make_handler(repo, store, runner, explainer, token, page, github, reviewers, changes)
+    handler = make_handler(repo, store, runner, explainer, token, page, github, reviewers, changes,
+                           Sessions(repo, store))
     try:
         httpd = listen(args.host, args.port, root, handler)
     except (OSError, OverflowError) as e:  # OverflowError: --port outside 0-65535
@@ -3578,6 +3848,10 @@ tr.trow>td{padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",san
 .commitcard{border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-bottom:16px;font-size:13px}
 .item.tip{padding-left:18px;font-size:12px}.item.tip.off{cursor:default;color:var(--muted)}
 .sinceref{display:block;width:calc(100% - 24px);margin:2px 0 4px 18px;font:12px ui-monospace,monospace;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:3px 6px}
+.item.sgroup{padding-left:18px;font-size:11px;text-transform:uppercase;color:var(--muted);cursor:default}
+.resume{display:flex;gap:4px;margin:2px 6px 4px 18px}
+.resume input{flex:1;min-width:0;font:12px ui-monospace,monospace;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:3px 6px}
+.resume button{font-size:12px;padding:2px 8px}
 .rdcard{border:1px solid var(--border);border-radius:6px;padding:8px 12px;margin-bottom:16px;font-size:13px}
 .rdcard .rd{font-family:ui-monospace,monospace;font-size:12px;padding:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .rdcard summary{cursor:pointer}
@@ -3754,12 +4028,62 @@ function renderSide(){
     const where = a.path ? `${a.path.split('/').pop()}:${a.end?.line ?? ''}` : viewLabel(a.view);
     h += `<a class="item" data-thread="${t.id}" title="${esc(viewLabel(a.view))}\n${esc(q)}">${t.running?'<span class="spin"></span> ':''}<span class="sha">${esc(where)}</span> ${esc(q.slice(0,80))}</a>`;
   }
+  h += '<h3>Claude sessions</h3>';
+  h += `<a class="item" data-sessions title="Claude Code sessions to resume: prv's own runs, and the other sessions started in this checkout">${S.sess ? 'Hide sessions' : 'Show sessions…'}</a>`;
+  if (S.sess) h += sessionsHtml(S.sess);
   const ref = $('#side .sinceref'), typed = ref?.value, focused = ref && document.activeElement === ref;
   const caret = focused && [ref.selectionStart, ref.selectionEnd];  // a poll rerenders the side panel mid-typing
+  const resumeSel = document.activeElement?.matches('#side .resume input');  // selected for Ctrl+C
   $('#side').innerHTML = h;
+  // preventScroll: a 2 s poll must not scroll back to the input the reader moved away from.
+  if (resumeSel) { const i = $('#side .resume input'); i?.focus({preventScroll: true}); i?.select(); }
   const nref = $('#side .sinceref');
   if (nref && typed) nref.value = typed;
   if (nref && focused) { nref.focus(); nref.setSelectionRange(...caret); }
+}
+const SESS_SHOWN = 20;
+function sessionRow(r, kind){
+  const at = r.modified ?? r.created, when = at ? new Date(at * 1000).toLocaleString() : '';
+  const tip = [r.title, r.label, r.prompt !== r.label && r.prompt, when, r.id,
+    r.continued_in && 'Continued in session ' + r.continued_in,
+    r.gone && 'Its transcript is gone, so Claude Code cannot resume it'].filter(Boolean).join('\n');
+  let h = `<a class="item tip ${r.gone ? 'off' : ''} ${S.sessOpen === r.id ? 'active' : ''}" data-sess="${esc(r.id)}" title="${esc(tip)}"><span class="sha">${esc(kind)}</span> ${esc(r.title || r.label || r.prompt || r.id)}</a>`;
+  if (S.sessOpen === r.id && !r.gone)
+    h += `<div class="resume"><input readonly spellcheck="false" value="${esc(r.resume)}" title="Run in a terminal to resume the session"><button data-copy>Copy</button></div>`;
+  return h;
+}
+function sessionsHtml(x){
+  if (x.failed) return `<div class="item tip off" title="${esc(x.error)}">${esc(x.error)}</div>`;
+  if (x.disabled) return '<div class="item tip off">Not available</div>';
+  if (!x.prv) return '<div class="item tip off"><span class="spin">Reading sessions</span></div>';
+  let h = x.error ? `<div class="item tip off" title="${esc(x.error)}">${esc(x.error)}</div>` : '';
+  const group = (label, rows, kind, all) => {
+    h += `<div class="item sgroup">${esc(label)} (${rows.length})</div>`;
+    if (!rows.length) h += '<div class="item tip off">none</div>';
+    for (const r of all ? rows : rows.slice(0, SESS_SHOWN)) h += sessionRow(r, kind(r));
+    if (!all && rows.length > SESS_SHOWN) h += `<a class="item tip" data-sessall>${rows.length - SESS_SHOWN} more…</a>`;
+  };
+  group("prv's runs", x.prv, r => r.kind, S.sessAll);
+  group('Other sessions in this checkout', x.other, r => r.headless ? 'claude -p' : 'session', S.sessAll);
+  return h;
+}
+async function toggleSessions(){
+  if (S.sess) { S.sess = S.sessAll = S.sessOpen = null; renderSide(); return; }
+  const x = S.sess = {};
+  renderSide();
+  try { Object.assign(x, await api('/api/sessions')); } catch(e){ x.failed = true; x.error = e.message; }
+  if (S.sess === x) renderSide();
+}
+async function copyResume(btn){
+  const inp = btn.previousElementSibling;
+  inp.select();
+  let ok = false;
+  // navigator.clipboard needs a secure context: http from another machine has none.
+  try { await navigator.clipboard.writeText(inp.value); ok = true; }
+  catch(e){ try { ok = document.execCommand('copy'); } catch(e2){} }
+  // A poll can rerender the side panel meanwhile and detach btn.
+  const b = btn.isConnected ? btn : $('#side .resume [data-copy]');
+  if (b) b.textContent = ok ? 'Copied' : 'Press Ctrl+C';
 }
 async function toggleTips(){
   if (S.tips) { S.tips = null; renderSide(); return; }
@@ -3776,8 +4100,16 @@ $('#side').addEventListener('keydown', e => {
 });
 
 $('#side').addEventListener('click', e => {
+  if (e.target.matches('[data-copy]')) return copyResume(e.target);
   const it = e.target.closest('.item'); if (!it) return;
   if ('since' in it.dataset) toggleTips();
+  else if ('sessions' in it.dataset) toggleSessions();
+  else if ('sessall' in it.dataset) { S.sessAll = true; renderSide(); }
+  else if (it.dataset.sess && !it.classList.contains('off')) {  // off: its transcript is gone
+    S.sessOpen = S.sessOpen === it.dataset.sess ? null : it.dataset.sess;
+    renderSide();
+    const i = $('#side .resume input'); i?.focus(); i?.select();
+  }
   else if (it.dataset.view) setView(it.dataset.view);
   else if (it.dataset.file) document.getElementById('f' + it.dataset.file)?.scrollIntoView();
   else if (it.dataset.thread) {
@@ -4765,6 +5097,7 @@ async function submit(th){
 $('#refresh').addEventListener('click', async () => {
   await loadMeta(); await loadThreads(); setView(S.view);
   if (S.tips) { S.tips = null; toggleTips(); }  // an amend or a rebase since the list was read adds a tip
+  if (S.sess) { S.sess = null; toggleSessions(); }
 });
 
 // Pick up answers that are still running after a page reload.

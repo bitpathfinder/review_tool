@@ -23,6 +23,8 @@ to answer.
 - **Changes since an earlier version.** After a rebase, an amend or a force-push, **Changes since…**
   shows what the author changed since a tip you pick, without the changes that came with the new base,
   and how each commit changed (below).
+- **Claude sessions.** The side panel lists the Claude Code sessions behind the review, with the
+  command that resumes each one (below).
 - **Commit and push.** The "Uncommitted changes" view commits everything it shows, or amends the
   last commit. With `--allow-push`, **Push** sends HEAD to your own open PR's branch (below).
 - **New review.** `prv new_review <PR>` checks a PR out (or brings an existing checkout up to date),
@@ -130,6 +132,21 @@ A sha typed into the box works too. The view has two parts:
 GitHub review threads show beside the lines they were written on, including lines the author has
 since changed, unless the new base moved that line more than 20 lines.
 
+## Claude sessions
+
+**Show sessions…** at the bottom of the side panel lists two groups:
+
+- prv's runs: threads, explanations, line notes and AI reviews. prv keeps their session ids in
+  `threads.json` and `sessions.json`.
+- Other sessions in this checkout: every session Claude Code keeps for this folder in
+  `~/.claude/projects/` (`$CLAUDE_CONFIG_DIR/projects/` when set), such as the session that wrote the
+  change. A session started in another folder is not listed, even when it worked in this checkout.
+
+Click a session for its `cd <folder> && claude --resume <id>` command, which also sets
+`CLAUDE_CONFIG_DIR` (and `CLAUDE_CODE_PROJECT_DIR_NAME`) when prv runs with them. A resumed session
+runs with your usual Claude Code settings and permissions, not with the read-only tools prv gives its
+runs.
+
 ## Commit and push
 
 In "Uncommitted changes", **Commit all changes** runs `git add -A` and `git commit`. **Amend the last
@@ -157,7 +174,7 @@ There is no cost cap by default. Pass `--max-budget-usd` to `prv explain` or `pr
 ## Files
 
 Everything prv writes for a checkout lives in `<git-dir>/prv/`: threads, explanations, review
-findings and the cached GitHub data.
+findings, the ids of its Claude sessions and the cached GitHub data.
 
 ## Tests
 

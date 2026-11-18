@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from unittest import mock
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,7 +25,9 @@ import prv
 # config or `git -c` (GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT) would change what git does in them.
 _git_home = tempfile.TemporaryDirectory()
 _git_vars = {"GIT_CONFIG_GLOBAL": os.path.join(_git_home.name, "gitconfig"), "GIT_CONFIG_NOSYSTEM": "1",
-             "GIT_CONFIG_PARAMETERS": "", "GIT_CONFIG_COUNT": "0"}
+             "GIT_CONFIG_PARAMETERS": "", "GIT_CONFIG_COUNT": "0",
+             "CLAUDE_CONFIG_DIR": os.path.join(_git_home.name, "claude"),  # never the user's transcripts
+             "CLAUDE_CODE_PROJECT_DIR_NAME": ""}
 _git_env = mock.patch.dict(os.environ, _git_vars)
 
 
@@ -410,7 +413,7 @@ prompt = sys.stdin.read()
 log = os.environ["FAKE_LOG"]
 with open(log, "a") as fh:
     fh.write(json.dumps({"argv": sys.argv[1:], "prompt": prompt, "cwd": os.getcwd()}) + "\n")
-sid = "SESS"
+sid = os.environ.get("FAKE_SID") or "SESS"
 def out(o): print(json.dumps(o), flush=True)
 if "--json-schema" in sys.argv:
     out({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "a.txt"}}]}})
@@ -2018,10 +2021,18 @@ class ListenTest(unittest.TestCase):
                 prv.listen("127.0.0.1", stable, self.ROOT, BaseHTTPRequestHandler)
 
 
+def claude_projects_dir(root):
+    return prv.claude_projects_dirs(root)[0]
+
+
 class ServerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         d = self.root = os.path.realpath(self.tmp.name)
+        # Per test: transcripts under a fixed root such as /w/ddd... would leak into the next test.
+        env = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": os.path.join(d, ".git", "claude")})
+        env.start()
+        self.addCleanup(env.stop)
         run = lambda *a: subprocess.run(["git", *a], cwd=d, check=True, capture_output=True)
         run("init", "-q", "-b", "master")
         run("config", "user.email", "t@t"); run("config", "user.name", "t")
@@ -2056,13 +2067,13 @@ class ServerTest(unittest.TestCase):
                           "qodo": prv.Reviewer(self.repo, self.fake, "qodo", qodo=self.qodo)}
         self.token = "tok"
         h = prv.make_handler(self.repo, self.store, self.runner, self.explainer, self.token, prv.PAGE,
-                             reviewers=self.reviewers)
+                             reviewers=self.reviewers, sessions=prv.Sessions(self.repo, self.store))
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), h)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
 
     def tearDown(self):
-        for k in ("FAKE_EXPLAIN", "FAKE_LOG", "FAKE_QODO", "FAKE_QODO_LOG", "FAKE_QODO_RC"):
+        for k in ("FAKE_EXPLAIN", "FAKE_LOG", "FAKE_QODO", "FAKE_QODO_LOG", "FAKE_QODO_RC", "FAKE_SID"):
             os.environ.pop(k, None)
         self.httpd.shutdown()
         self.httpd.server_close()
@@ -2512,6 +2523,283 @@ class ServerTest(unittest.TestCase):
             return []
         with open(self.log) as fh:
             return [json.loads(l) for l in fh]
+
+    def transcript(self, sid, *events, cwd=None):
+        folder = claude_projects_dir(cwd or self.root)
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, sid + ".jsonl"), "w") as fh:
+            fh.write("".join(json.dumps(e) + "\n" for e in events))
+
+    def test_claude_sessions_split_prv_runs_from_the_others(self):
+        ids = [str(uuid.UUID(int=i)) for i in range(1, 7)]
+        runs = (lambda: self.explainer.generate("haiku", None), lambda: self.explainer.generate_commits("haiku", None),
+                lambda: self.reviewers["claude"]._claude_review("haiku", lambda name, detail: None))
+        for sid, run in zip(ids, runs):
+            os.environ["FAKE_SID"] = sid
+            run()
+        self.store.threads["t1"] = {"id": "t1", "created": 5, "anchor": {"view": "all", "path": None},
+                                    "session_id": ids[3], "running": False,
+                                    "messages": [{"role": "user", "text": "why?"}, {"role": "assistant", "text": "a"}]}
+        self.transcript(ids[0], {"type": "queue-operation", "timestamp": "T0"},
+                        {"type": "user", "cwd": self.root, "entrypoint": "sdk-cli", "message": {"content": "Explain"}})
+        self.transcript(ids[4], {"type": "user", "cwd": self.root, "entrypoint": "cli", "timestamp": "T1",
+                                 "isMeta": True, "message": {"content": "Caveat"}},
+                        {"type": "user", "message": {"content": "<command-name>/model</command-name>"}},
+                        {"type": "user", "message": {"content": [{"type": "text", "text": " fix the race "}]}},
+                        {"type": "custom-title", "customTitle": "race fix"}, {"type": "ai-title", "aiTitle": "AI name"},
+                        {"type": "continued-in", "continuedInSessionId": ids[5]})
+        # Started in a sibling folder with the same projects folder name: not this checkout's.
+        i = self.root.rindex("/")
+        sibling = self.root[:i] + "_" + self.root[i + 1:]
+        self.assertEqual(claude_projects_dir(sibling), claude_projects_dir(self.root))
+        self.transcript(ids[5], {"type": "user", "cwd": sibling, "message": {"content": "go"}}, cwd=sibling)
+        folder = claude_projects_dir(self.root)
+        os.makedirs(os.path.join(folder, ids[4], "subagents"))  # subagent transcripts: not sessions
+        with open(os.path.join(folder, ids[4], "subagents", "agent-1.jsonl"), "w") as fh:
+            fh.write("{}\n")
+        with open(os.path.join(folder, "notes.jsonl"), "w") as fh:
+            fh.write("{}\n")
+        open(os.path.join(folder, str(uuid.UUID(int=99)) + ".jsonl"), "w").close()  # empty: nothing to resume
+
+        got = json.loads(self.req("/api/sessions"))
+        self.assertIsNone(got["error"])
+        head = self.git("rev-parse", "HEAD")
+        by_id = {r["id"]: r for r in got["prv"]}
+        self.assertEqual({sid: (r["kind"], r["label"], r["gone"]) for sid, r in by_id.items()}, {
+            ids[0]: ("explanation", f"{self.repo.base[:10]}..{head[:10]}", False),
+            ids[1]: ("line notes", f"{head[:10]} change two", True),
+            ids[2]: ("AI review", f"{self.repo.base[:10]}..{head[:10]}", True),
+            ids[3]: ("thread", "why?", True)})
+        self.assertEqual((by_id[ids[0]]["prompt"], by_id[ids[0]]["headless"]), ("Explain", True))
+        env = f"CLAUDE_CONFIG_DIR={os.environ['CLAUDE_CONFIG_DIR']}"
+        self.assertEqual(by_id[ids[2]]["resume"], f"cd {self.root} && {env} claude --resume {ids[2]}")
+        other = {r["id"]: r for r in got["other"]}
+        self.assertEqual(set(other), {ids[4]})
+        r = other[ids[4]]
+        self.assertEqual((r["title"], r["prompt"], r["headless"], r["started"], r["continued_in"]),
+                         ("race fix", "fix the race", False, "T1", ids[5]))
+        self.assertEqual(r["resume"], f"cd {self.root} && {env} claude --resume {ids[4]}")
+
+    def test_claude_session_resume_quotes_the_folder(self):
+        sid = str(uuid.UUID(int=8))
+        repo = mock.Mock(root="/w/a b'c", git_dir=self.repo.git_dir)
+        self.transcript(sid, {"type": "user", "cwd": "/w/a b'c", "message": {"content": "go"}}, cwd="/w/a b'c")
+        [r] = prv.Sessions(repo, self.store).snapshot()["other"]
+        cfg = os.environ["CLAUDE_CONFIG_DIR"]
+        self.assertEqual(r["resume"], f"cd '/w/a b'\"'\"'c' && CLAUDE_CONFIG_DIR={cfg} claude --resume {sid}")
+        # The resumed claude must look in the same folder: the config dir and folder name go with the command.
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": cfg + " x", "CLAUDE_CODE_PROJECT_DIR_NAME": "p"}):
+            self.transcript(sid, {"type": "user", "cwd": "/w/a b'c", "message": {"content": "go"}}, cwd="/w/a b'c")
+            [r] = prv.Sessions(repo, self.store).snapshot()["other"]
+        self.assertEqual(r["resume"], f"cd '/w/a b'\"'\"'c' && CLAUDE_CONFIG_DIR='{cfg} x' "
+                                      f"CLAUDE_CODE_PROJECT_DIR_NAME=p claude --resume {sid}")
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": ""}):
+            self.assertEqual(prv.claude_env(), {})
+
+    def test_claude_session_title_from_the_tail(self):
+        sid = str(uuid.UUID(int=9))
+        pad = [{"type": "assistant", "message": {"content": "x" * 50}}] * 40
+        self.transcript(sid, {"type": "user", "cwd": self.root, "message": {"content": "first"}},
+                        {"type": "custom-title", "customTitle": "early"}, *pad,
+                        {"type": "custom-title", "customTitle": "late"})
+        with mock.patch.object(prv, "SESSION_HEAD", 300), mock.patch.object(prv, "SESSION_TAIL", 400):
+            [r] = prv.Sessions(self.repo, self.store).snapshot()["other"]
+        self.assertEqual((r["prompt"], r["title"]), ("first", "late"))
+
+    def test_bad_session_log(self):
+        path = prv.session_log_path(self.repo.git_dir)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write("{")
+        self.assertIn("sessions.json", prv.Sessions(self.repo, self.store).snapshot()["error"])
+        sid = str(uuid.UUID(int=3))
+        with mock.patch("sys.stderr", io.StringIO()) as err:
+            prv.record_session(self.repo.git_dir, sid, "explanation", "x")
+        self.assertIn("starting a new one", err.getvalue())
+        with open(path + ".bad") as fh:
+            self.assertEqual(fh.read(), "{")
+        prv.record_session(self.repo.git_dir, "SESS", "explanation", "not a session id")
+        self.assertEqual([e["id"] for e in prv.load_session_log(self.repo.git_dir)], [sid])
+
+    def test_claude_session_prompt_on_the_head_cut(self):
+        # Shorter than head + tail, with the first prompt across the head's end: read whole, not cut in two.
+        sid = str(uuid.UUID(int=10))
+        meta = {"type": "user", "cwd": self.root, "isMeta": True, "message": {"content": "p" * 250}}
+        self.transcript(sid, meta, {"type": "user", "message": {"content": "first"}})
+        cut = len(json.dumps(meta)) + 10  # inside the second line
+        with mock.patch.object(prv, "SESSION_HEAD", cut), mock.patch.object(prv, "SESSION_TAIL", 400):
+            [r] = prv.Sessions(self.repo, self.store).snapshot()["other"]
+        self.assertEqual(r["prompt"], "first")
+
+    def test_bad_session_log_entries_are_set_aside(self):
+        path = prv.session_log_path(self.repo.git_dir)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ok, new = str(uuid.UUID(int=20)), str(uuid.UUID(int=21))
+        text = f'[{{"id": "{ok}", "kind": "k", "label": "l", "created": 1}}, {{"id": "{ok}", "kind": 5}}]'
+        with open(path, "w") as fh:
+            fh.write(text)
+        with mock.patch("sys.stderr", io.StringIO()) as err:
+            prv.record_session(self.repo.git_dir, new, "explanation", "x")
+        self.assertIn("skipped 1 bad entries", err.getvalue())
+        with open(path + ".bad") as fh:
+            self.assertEqual(fh.read(), text)
+        self.assertEqual([e["id"] for e in prv.load_session_log(self.repo.git_dir)], [ok, new])
+
+    def test_unreadable_claude_transcript_is_reported(self):
+        sid = str(uuid.UUID(int=22))
+        self.transcript(sid, {"type": "user", "cwd": self.root, "message": {"content": "go"}})
+        with mock.patch.object(prv, "read_transcript", side_effect=PermissionError(13, "Permission denied")):
+            got = prv.Sessions(self.repo, self.store).snapshot()
+        self.assertIn(sid + ".jsonl: Permission denied", got["error"])
+        self.assertEqual(got["other"], [])
+
+    def test_session_log_infinity_is_dropped(self):
+        path = prv.session_log_path(self.repo.git_dir)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ok, inf = str(uuid.UUID(int=11)), str(uuid.UUID(int=12))
+        with open(path, "w") as fh:
+            fh.write(f'[{{"id": "{ok}", "kind": "k", "label": "l", "created": 1.5}},'
+                     f' {{"id": "{inf}", "kind": "k", "label": "l", "created": 1e999}}]')
+        self.assertEqual([e["id"] for e in prv.load_session_log(self.repo.git_dir)], [ok])
+        json.loads(self.req("/api/sessions"), parse_constant=self.fail)  # the browser rejects Infinity
+
+    def test_claude_projects_dir_counts_utf16_units(self):
+        projects = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "projects")
+        self.assertEqual(prv.claude_projects_dirs("/w/\U0001F600é"), [os.path.join(projects, "-w----")])
+
+    def test_claude_projects_dir_name_override(self):
+        projects = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "projects")
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_PROJECT_DIR_NAME": "my_proj-1"}):
+            self.assertEqual(prv.claude_projects_dirs(self.root), [os.path.join(projects, "my_proj-1")])
+        for bad in ("a/b", "nul", "x" * 65):  # Claude Code ignores these
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_PROJECT_DIR_NAME": bad}):
+                self.assertNotEqual(os.path.basename(prv.claude_projects_dirs(self.root)[0]), bad)
+        with mock.patch.dict(os.environ, {"CLAUDE_CODE_PROJECT_DIR_NAME": "p", "CLAUDE_CONFIG_DIR": ""}):
+            self.assertNotEqual(os.path.basename(prv.claude_projects_dirs(self.root)[0]), "p")  # needs the config dir
+
+    def test_relative_claude_config_dir_is_under_the_root(self):
+        # claude runs in the root, so a relative config dir is there, whatever prv's own cwd.
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "cfg", "CLAUDE_CODE_PROJECT_DIR_NAME": "p"}):
+            self.assertEqual(prv.claude_projects_dirs(self.root), [os.path.join(self.root, "cfg", "projects", "p")])
+
+    def test_session_log_entry_checks(self):
+        path = prv.session_log_path(self.repo.git_dir)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        ok = str(uuid.UUID(int=23))
+        bad = [{"id": ok + "\n", "kind": "k", "label": "l", "created": 1},
+               {"id": ok, "kind": "k", "label": "l", "created": True},
+               {"id": ok, "kind": "k", "label": "l", "created": 10 ** 400}]
+        good = {"id": ok, "kind": "k", "label": "l", "created": 2}
+        with open(path, "w") as fh:
+            json.dump(bad + [good], fh)
+        self.assertEqual(prv._read_session_log(self.repo.git_dir), ([good], 3))
+
+    def test_claude_projects_dir_of_a_long_root(self):
+        root = "/w/" + "d" * 250
+        name = "-w-" + "d" * 250
+        projects = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "projects")
+        self.assertEqual(prv.claude_projects_dirs(root), [])  # no folder yet
+        os.makedirs(os.path.join(projects, name[:200] + "-1x2y3z"))
+        self.assertEqual(claude_projects_dir(root), os.path.join(projects, name[:200] + "-1x2y3z"))
+
+    def test_claude_sessions_of_a_root_past_255_characters(self):
+        repo = mock.Mock(root="/w/" + "d" * 300, git_dir=self.repo.git_dir)
+        os.makedirs(os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "projects"))
+        got = prv.Sessions(repo, self.store).snapshot()
+        self.assertEqual((got["error"], got["other"]), (None, []))  # not ENAMETOOLONG on the full name
+
+    def test_claude_session_is_recorded_when_the_run_starts(self):
+        sid = str(uuid.UUID(int=13))
+        with open(self.fake, "w") as fh:
+            fh.write("#!/usr/bin/env python3\nimport json, sys, time\nsys.stdin.read()\n"
+                     f"print(json.dumps({{'type': 'system', 'subtype': 'init', 'session_id': {sid!r}}}),"
+                     " flush=True)\ntime.sleep(60)\n")
+        self.req("/api/explain", {"model": "haiku"})
+        for _ in range(200):
+            if prv.load_session_log(self.repo.git_dir):
+                break
+            time.sleep(0.05)
+        try:
+            got = json.loads(self.req("/api/sessions"))
+            self.assertEqual([r["id"] for r in got["prv"]], [sid])  # listed while it runs
+            self.assertEqual(got["other"], [])
+        finally:
+            self.req("/api/explain/stop", {})
+            self.assertEqual(self.wait_job()["job"]["error"], "stopped")
+
+    def test_deleted_thread_stays_among_prv_runs(self):
+        sid = str(uuid.UUID(int=14))
+        os.environ["FAKE_SID"] = sid
+        self.req("/api/ask", {"question": " why? ", "model": "haiku", "anchor": {"view": "all"}})
+        [tid] = self.store.threads
+        self.transcript(sid, {"type": "user", "cwd": self.root, "entrypoint": "sdk-cli", "message": {"content": "q"}})
+        self.req("/api/delete", {"id": tid})
+        got = json.loads(self.req("/api/sessions"))
+        self.assertEqual([(r["id"], r["kind"], r["label"]) for r in got["prv"]], [(sid, "thread", "why?")])
+        self.assertEqual(got["other"], [])
+
+    def test_thread_session_id_only_on_the_result_is_recorded(self):
+        sid = str(uuid.UUID(int=19))
+        with open(self.fake, "w") as fh:
+            fh.write("#!/usr/bin/env python3\nimport json, sys\nsys.stdin.read()\n"
+                     f"print(json.dumps({{'type': 'result', 'session_id': {sid!r}, 'result': 'a'}}), flush=True)\n")
+        self.req("/api/ask", {"question": "why?", "model": "haiku", "anchor": {"view": "all"}})
+        [tid] = self.store.threads
+        self.req("/api/delete", {"id": tid})
+        got = json.loads(self.req("/api/sessions"))
+        self.assertEqual([(r["id"], r["kind"], r["label"]) for r in got["prv"]], [(sid, "thread", "why?")])
+
+    def test_claude_session_prompt_after_ide_blocks(self):
+        sid = str(uuid.UUID(int=15))
+        self.transcript(sid, {"type": "user", "cwd": self.root, "message": {"content": [
+            {"type": "text", "text": "<ide_selection>x</ide_selection>"}, {"type": "text", "text": "explain x"}]}})
+        [r] = prv.Sessions(self.repo, self.store).snapshot()["other"]
+        self.assertEqual(r["prompt"], "explain x")
+
+    def test_claude_session_tail_on_a_line_start(self):
+        sid = str(uuid.UUID(int=16))
+        last = json.dumps({"type": "custom-title", "customTitle": "late"}) + "\n"
+        self.transcript(sid, {"type": "user", "cwd": self.root, "message": {"content": "first"}},
+                        *[{"type": "assistant", "message": {"content": "x" * 50}}] * 40,
+                        {"type": "custom-title", "customTitle": "late"})
+        with mock.patch.object(prv, "SESSION_HEAD", 300), mock.patch.object(prv, "SESSION_TAIL", len(last)):
+            [r] = prv.Sessions(self.repo, self.store).snapshot()["other"]
+        self.assertEqual(r["title"], "late")
+
+    def test_claude_sessions_of_a_long_root_in_every_prefix_folder(self):
+        root = "/w/" + "d" * 250
+        repo = mock.Mock(root=root, git_dir=self.repo.git_dir)
+        projects = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "projects")
+        prefix = os.path.join(projects, ("-w-" + "d" * 250)[:200])
+        ids = [str(uuid.UUID(int=i)) for i in (17, 18)]
+        for sid, suffix, cwd in ((ids[0], "-1aaa", root + "x"), (ids[1], "-2bbb", root)):
+            os.makedirs(prefix + suffix)
+            with open(os.path.join(prefix + suffix, sid + ".jsonl"), "w") as fh:
+                fh.write(json.dumps({"type": "user", "cwd": cwd, "message": {"content": "go"}}) + "\n")
+        [r] = prv.Sessions(repo, self.store).snapshot()["other"]
+        self.assertEqual(r["id"], ids[1])
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode 000 folder")
+    def test_unreadable_projects_folder_of_a_long_root(self):
+        repo = mock.Mock(root="/w/" + "d" * 250, git_dir=self.repo.git_dir)
+        projects = os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "projects")
+        os.makedirs(projects)
+        os.chmod(projects, 0)
+        try:
+            got = prv.Sessions(repo, self.store).snapshot()
+        finally:  # before tearDown removes the folder
+            os.chmod(projects, 0o755)
+        self.assertIn(projects + ": Permission denied", got["error"])
+        self.assertEqual(got["other"], [])
+
+    def test_unreadable_claude_projects_dir(self):
+        folder = claude_projects_dir(self.root)
+        os.makedirs(os.path.dirname(folder), exist_ok=True)
+        with open(folder, "w") as fh:  # listdir raises NotADirectoryError
+            fh.write("")
+        got = json.loads(self.req("/api/sessions"))
+        self.assertIn(folder, got["error"])
+        self.assertEqual((got["prv"], got["other"]), ([], []))
 
     def test_prepare_writes_line_notes_when_the_range_notes_fail(self):
         self.write_commit("a.txt", "one\ntwo\nthree\n", "revert")  # the range has no net diff
