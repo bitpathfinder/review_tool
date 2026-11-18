@@ -11,6 +11,7 @@ Stdlib only; JS/CSS libraries are served from vendor/.
 `prv explain` writes review notes that the UI shows next to each hunk.
 """
 import argparse
+import contextlib
 import errno
 import fcntl
 import functools
@@ -404,6 +405,12 @@ class Repo:
 
     def head_sha(self):
         return git(self.root, "rev-parse", "--verify", f"{self.head}^{{commit}}").strip()
+
+    def set_base(self, label):
+        """Serve against `label` again after HEAD moved: the range starts at the new fork point, as in open_repo()."""
+        base = resolve(self.root, label)
+        self.base = git(self.root, "merge-base", base, self.head, check=False).strip() or base
+        self.base_label = label
 
     def _is_ancestor(self, a, b):
         return is_ancestor(self.root, a, b)
@@ -1967,13 +1974,20 @@ class Explainer:
             raise ExplainError("claude failed: no structured output", cost)
         return out, cost
 
-    def start(self, model, budget=None, kind="pr", commit=None):
+    def running(self):
+        with self.lock:
+            return bool(self.job and self.job["running"])
+
+    def start(self, model, budget=None, kind="pr", commit=None, blocked=None):
         """kind "pr": notes for the whole range. "commits": line notes for `commit`, or for
         every commit without them. "prepare": "pr" unless current, then "commits".
-        budget: USD cap, or None for no cap."""
+        budget: USD cap, or None for no cap. Returns False when a job runs, None when blocked() is true."""
         with self.lock:
             if self.job and self.job["running"]:
                 return False
+            # Under the lock that running() takes: a pull sets its flag, then checks running().
+            if blocked and blocked():
+                return None
             self.job = {"running": True, "kind": "pr" if kind == "prepare" else kind, "commit": commit,
                         "model": model, "tools": [],
                         "tool_count": 0, "progress": None, "error": None, "cost": None, "dropped": 0,
@@ -2253,11 +2267,13 @@ class Reviewer(Explainer):
     def load(self):
         return self._read(self.path, check_review_doc)
 
-    def start(self, model=REVIEW_MODEL, context=None):
-        """context: {"tickets": [url], "notes": str} for qodo."""
+    def start(self, model=REVIEW_MODEL, context=None, blocked=None):
+        """context: {"tickets": [url], "notes": str} for qodo. Returns as Explainer.start()."""
         with self.lock:
             if self.job and self.job["running"]:
                 return False
+            if blocked and blocked():
+                return None
             self.job = {"running": True, "kind": self.source, "model": model if self.source == "claude" else "qodo",
                         "tools": [], "tool_count": 0, "error": None, "cost": None, "created": None}
             self.stopping = False
@@ -2395,6 +2411,23 @@ FORBIDDEN = "wrong token: prv was restarted or the URL is incomplete; open the U
 
 def make_handler(repo, store, runner, explainer, token, page, github=None, reviewers=None, changes=None,
                  sessions=None):
+    def busy():
+        """The running job a pull would move the tree under, or None."""
+        with store.lock:
+            if any(t["running"] for t in store.threads.values()):
+                return "a Claude thread"
+        if explainer.running():
+            return "an explanation job"
+        for r in (reviewers or {}).values():
+            if r.running():
+                return "the Qodo review" if r.source == "qodo" else "the AI review"
+        return None
+
+    PULLING = "a pull is moving the working tree; try again when it ends"
+
+    def pulling():
+        return bool(changes and changes.pulling.is_set())
+
     def _token_ok(given):
         # Bytes: compare_digest raises TypeError on non-ASCII str input.
         return secrets.compare_digest(given.encode(), token.encode())
@@ -2455,7 +2488,8 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                 return self._json({"error": FORBIDDEN}, 403)
             try:
                 if u.path == "/api/meta":
-                    return self._json({**repo.meta(), "push": bool(changes and changes.allow_push)})
+                    return self._json({**repo.meta(), "push": bool(changes and changes.allow_push),
+                                       "pull": bool(changes and changes.pull_target())})
                 if u.path == "/api/diff":
                     paths = q.get("path")  # "Whole file": a file's old and new path
                     if paths is not None and len(paths) > 2:
@@ -2539,7 +2573,10 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                         commit = repo.check_view(commit)
                     except GitError:
                         return self._json({"error": "bad commit"}, 400)
-                if not explainer.start(model, None, kind, commit):
+                started = explainer.start(model, None, kind, commit, blocked=pulling)
+                if started is None:
+                    return self._json({"error": PULLING}, 409)
+                if not started:
                     return self._json({"error": "explanations are already being generated"}, 409)
                 return self._json({"started": True})
             if u.path == "/api/github/refresh":
@@ -2560,13 +2597,18 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                 if model not in MODELS:
                     return self._json({"error": "unknown model"}, 400)
                 ctx = github.review_context() if github and r.source == "qodo" else None
-                if not r.start(model, ctx):
+                started = r.start(model, ctx, blocked=pulling)
+                if started is None:
+                    return self._json({"error": PULLING}, 409)
+                if not started:
                     return self._json({"error": "this review is already running"}, 409)
                 return self._json({"started": True})
-            if u.path in ("/api/commit", "/api/push"):
+            if u.path in ("/api/commit", "/api/push", "/api/pull"):
                 if changes is None:
                     return self._json({"error": "commit and push are off"}, 403)
                 try:
+                    if u.path == "/api/pull":
+                        return self._json(changes.pull(busy))
                     if u.path == "/api/commit":
                         return self._json(changes.commit(str(body.get("message") or "").strip(),
                                                          bool(body.get("amend"))))
@@ -2628,7 +2670,10 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                         return self._json({"error": "no such thread"}, 404)
                     if t["running"]:
                         return self._json({"error": "thread is busy"}, 409)
-                else:
+                # Under store.lock: either pull's busy() sees the thread running, or the request sees the pull.
+                if pulling():
+                    return self._json({"error": PULLING}, 409)
+                if not tid:
                     t = {"id": uuid.uuid4().hex[:12], "created": time.time(), "anchor": anchor,
                          "session_id": None, "messages": [], "running": False}
                     store.threads[t["id"]] = t
@@ -2985,8 +3030,9 @@ def hide_token(text):
     return re.sub(r"\b(https?://)[^@/\s]+@", r"\1", text)
 
 
-def git_net(root, *args, timeout=300):
-    """git fetch, push or commit with no terminal: ssh, https, signing and hooks fail instead of waiting for input."""
+def git_net(root, *args, timeout=300, hint=None):
+    """git fetch, push or commit with no terminal: ssh, https, signing and hooks fail instead of waiting for input.
+    hint: added to the timeout error."""
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
     p = subprocess.Popen(["git", *args], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
                          stdin=subprocess.DEVNULL, start_new_session=True)
@@ -2996,7 +3042,8 @@ def git_net(root, *args, timeout=300):
         # The whole group: a surviving ssh or git-remote-https could still complete the push.
         os.killpg(p.pid, signal.SIGKILL)
         p.communicate()
-        hint = "; open Push again to see what GitHub has" if args[0] in ("push", "fetch") else ""
+        if hint is None:
+            hint = "; open Push again to see what GitHub has" if args[0] in ("push", "fetch") else ""
         raise ChangeError(f"git {args[0]} timed out after {timeout} s{hint}")
     out = hide_token((so + se).decode("utf-8", "replace").strip())
     if p.returncode != 0:
@@ -3005,12 +3052,16 @@ def git_net(root, *args, timeout=300):
 
 
 class Changes:
-    """Commit the working tree, and push HEAD to the PR's own branch. Push needs --allow-push
-    and a PR opened by the gh user; it never pushes anywhere else."""
+    """Commit the working tree, push HEAD to the PR's own branch, and pull the PR's head into a
+    `prv new_review` checkout. Push needs --allow-push and a PR opened by the gh user; it never
+    pushes anywhere else."""
 
-    def __init__(self, repo, runner, github=None, allow_push=False):
+    def __init__(self, repo, runner, github=None, allow_push=False, reference=None):
         self.repo, self.runner, self.github, self.allow_push = repo, runner, github, allow_push
-        self.lock = threading.Lock()  # one commit or push at a time
+        self.reference = reference  # new_review's reference clone; None: the one in the config
+        self.lock = threading.Lock()  # one commit, push or pull at a time
+        # Set while a pull moves the tree: threads, explanations and reviews refuse to start.
+        self.pulling = threading.Event()
 
     def commit(self, message, amend):
         if not self.repo.head_is_worktree():
@@ -3021,11 +3072,11 @@ class Changes:
             raise ChangeError("the commit message holds a NUL character")
         # Claude must not edit files between `git add` and `git commit`.
         if not self.runner.edit_lock.acquire(blocking=False):
-            raise ChangeError("a Claude thread is editing the working tree; wait for it to finish", 409)
+            raise ChangeError("a Claude thread or a pull is using the working tree; wait for it to finish", 409)
         try:
             # Not blocking: a push holds the lock over network calls, and edit threads wait on edit_lock.
             if not self.lock.acquire(blocking=False):
-                raise ChangeError("a push or its check is running; try again when it ends", 409)
+                raise ChangeError("a push, a pull or a push check is running; try again when it ends", 409)
             try:
                 return self._commit_locked(message, amend)
             finally:
@@ -3143,13 +3194,89 @@ class Changes:
               "dirty": bool(git(root, "status", "--porcelain", "--untracked-files=normal").strip())}
         return st, remote
 
+    @contextlib.contextmanager
+    def _locked(self):
+        """Changes.lock, or 409: a pull holds it over minutes of fetching, and a request must not hang on it."""
+        if not self.lock.acquire(blocking=False):
+            raise ChangeError("a commit, a push or a pull is running; try again when it ends", 409)
+        try:
+            yield
+        finally:
+            self.lock.release()
+
     def push_state(self):
-        with self.lock:
+        with self._locked():
             return self._state()[0]
+
+    def pull_target(self):
+        """(PR number, GitHub owner/name) for a `prv new_review` checkout, else None."""
+        root = self.repo.root
+        if self.github is None or not self.repo.head_is_worktree():
+            return None
+        m = re.fullmatch(r"pr([0-9]+)", git(root, "branch", "--show-current", check=False).strip())
+        try:
+            g = GH_REMOTE_RE.search(upstream_fetch_url(root))
+        except GitError:  # no upstream remote
+            return None
+        return (int(m[1]), f"{g[1]}/{g[2]}") if m and g else None
+
+    def pull(self, busy):
+        """Bring the checkout to the PR's head as `prv new_review` does, and serve it against the new
+        fork point. busy(): the name of a running Claude job, or None."""
+        target = self.pull_target()
+        if target is None:
+            raise ChangeError("Pull needs a `prv new_review` checkout: branch pr<N> and an upstream remote on GitHub")
+        # Claude must not read or edit a tree that is moving, and its notes would belong to the old HEAD.
+        if not self.runner.edit_lock.acquire(blocking=False):
+            raise ChangeError("a Claude thread, a commit or another pull is using the working tree; "
+                              "wait for it to finish", 409)
+        try:
+            with self._locked():
+                # Set before busy(): a thread marks itself running under store.lock, then checks pulling.
+                self.pulling.set()
+                try:
+                    job = busy()
+                    if job:
+                        raise ChangeError(f"{job} is running; wait for it or stop it, then pull", 409)
+                    return self._pull_locked(*target)
+                finally:
+                    self.pulling.clear()
+        finally:
+            self.runner.edit_lock.release()
+
+    def _pull_locked(self, n, slug):
+        root, msgs = self.repo.root, []
+        try:
+            pr = self.github._api(f"repos/{slug}/pulls/{n}")
+            base, pr_base = pr["base"]["ref"], _str(pr["base"].get("sha"))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+            raise ChangeError(f"GitHub: {e}")
+        if not usable_branch(root, base):
+            raise ChangeError(f"PR #{n}: GitHub reports no usable base branch")
+        before = git(root, "rev-parse", "HEAD").strip()
+        # A server thread holding both locks: network git runs with no terminal and a timeout.
+        net = lambda *a, timeout=300: git_net(root, *a, timeout=timeout, hint="")
+        fetch = lambda *a: net("fetch", *a)
+        new = fetch_pr(root, n, base, fetch=fetch, say=msgs.append)
+        backup = move_pr_branch(root, n, new, say=msgs.append)
+        try:
+            # Before the submodules: a failed submodule update must not leave the old fork point under the new HEAD.
+            self.repo.set_base(review_base(root, base, pr_base, say=msgs.append, fetch=fetch))
+        except GitError as e:
+            raise ChangeError(f"{'; '.join(msgs)}; finding the new base failed, so the range still starts at "
+                              f"{self.repo.base[:10]}: {e}")
+        self.github.start()
+        ref = self.reference if self.reference is not None else config_reference(msgs.append)
+        try:
+            update_submodules(root, ref, upstream_fetch_url(root), say=msgs.append,
+                              update=lambda *a: net("submodule", "update", *a, timeout=1800))
+        except (GitError, ChangeError) as e:
+            raise ChangeError(f"{'; '.join(msgs)}; the submodule update failed: {e}")
+        return {"before": before, "after": new, "backup": backup, "base": self.repo.base_label, "messages": msgs}
 
     def push(self, expect, local):
         root = self.repo.root
-        with self.lock:
+        with self._locked():
             st, remote = self._state()
             if st["github"] != expect or st["local"] != local:
                 raise ChangeError("the PR or HEAD moved since Push was opened; open it again", 409)
@@ -3422,23 +3549,40 @@ def say(msg):
     print(f"prv: {msg}", file=sys.stderr, flush=True)
 
 
+def config_reference(say=say):
+    """The reference clone named in the config, or "" without a usable one."""
+    try:
+        ref = load_config().get("reference", "")
+    except ValueError as e:
+        say(str(e))
+        return ""
+    ref = os.path.abspath(os.path.expanduser(ref)) if ref else ""
+    if ref and not os.path.isdir(os.path.join(ref, ".git")):
+        say(f"reference {ref} in {config_path()} is not a git clone; submodules come from their remotes")
+        return ""
+    return ref
+
+
 def prepare_review(n, slug, parent, reference, gh, upstream_url=None):
     """Check out PR n in <parent>/PR_<n>/<repo> on branch pr<n>, or bring that checkout up
     to date, submodules included. Local work is never dropped: a moved PR leaves the old tip
     on a backup branch. Returns (checkout dir, base to serve against). Raises GitError or OSError."""
     url = upstream_url or f"https://github.com/{slug}.git"
     d, base, pr_base = checkout_pr(n, slug, parent, reference, gh, url)
-    # An earlier run's upstream stays; relative submodule URLs must resolve against what was fetched.
-    # The raw value: `remote get-url` applies url.*.insteadOf and would never match `url`.
-    # The first one: fetch uses it, while `config --get` returns the last.
-    used = git(d, "config", "--get-all", "remote.upstream.url").split("\n", 1)[0].strip()
+    used = upstream_fetch_url(d)
     if used != url:
         say(f"fetched from upstream {used}, not {url}: the checkout keeps its upstream remote")
     update_submodules(d, reference, used)
     return d, review_base(d, base, pr_base)
 
 
-def review_base(d, base, pr_base):
+def upstream_fetch_url(d):
+    """An earlier run's upstream stays; relative submodule URLs must resolve against what was fetched.
+    The raw value: `remote get-url` applies url.*.insteadOf. The first one: fetch uses it, `config --get` the last."""
+    return git(d, "config", "--get-all", "remote.upstream.url").split("\n", 1)[0].strip()
+
+
+def review_base(d, base, pr_base, say=say, fetch=None):
     """upstream/<base>, or GitHub's base commit of the PR once the PR is merged into the base branch:
     then HEAD is in upstream/<base>, merge-base(upstream/<base>, HEAD) is HEAD, and the range would be empty."""
     ref = f"upstream/{base}"
@@ -3450,8 +3594,8 @@ def review_base(d, base, pr_base):
         return ref
     if git(d, "cat-file", "-t", pr_base, check=False).strip() != "commit":
         try:
-            git(d, "fetch", "--quiet", "--no-recurse-submodules", "upstream", pr_base)
-        except GitError as e:
+            (fetch or (lambda *a: git(d, "fetch", *a)))("--quiet", "--no-recurse-submodules", "upstream", pr_base)
+        except (GitError, ChangeError) as e:
             say(f"the PR is already in {ref}, and fetching its base commit {pr_base[:10]} failed: {e}")
             return ref
     if in_(pr_base):
@@ -3461,9 +3605,10 @@ def review_base(d, base, pr_base):
     return pr_base
 
 
-def update_submodules(d, reference, url):
+def update_submodules(d, reference, url, say=say, update=None):
     """Check out every submodule at the commit head pins, so a review sees their code.
-    Relative URLs resolve against `url`; objects come from the reference clone where it has them."""
+    Relative URLs resolve against `url`; objects come from the reference clone where it has them.
+    update: runs `git submodule update ARGS` in d."""
     out = git(d, "config", "-z", "-f", ".gitmodules", "--get-regexp", r"^submodule\..*\.path$", check=False)
     mods = [e.split("\n", 1) for e in out.split("\0") if "\n" in e]
     if not mods:
@@ -3475,19 +3620,22 @@ def update_submodules(d, reference, url):
     for key, path in mods:
         ref = os.path.join(reference, ".git", "modules", key[len("submodule."):-len(".path")])
         use = reference and os.path.isdir(ref)
-        git(d, "submodule", "update", "--init", *(["--reference", ref] if use else []), "--", path)
+        (update or (lambda *a: git(d, "submodule", "update", *a)))(
+            "--init", *(["--reference", ref] if use else []), "--", path)
     say(f"submodules at the pinned commits: {', '.join(p for _, p in mods)}")
 
 
 def checkout_pr(n, slug, parent, reference, gh, url):
     pr = gh_api(gh, f"repos/{slug}/pulls/{n}", parent)
     base = pr["base"]["ref"]
+    if not usable_branch(parent, base):  # before the clone: nothing is left on disk
+        raise GitError(f"PR #{n}: GitHub reports no usable base branch")
     pr_base = _str(pr["base"].get("sha"))
     # GitHub text: control characters would reach the terminal as escape sequences.
     title = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", _str(pr.get("title")))
     say(f"PR #{n} {title} ({_str(pr.get('state'))}), base {base}, head {pr['head']['sha'][:10]}")
     d = os.path.join(parent, f"PR_{n}", slug.split("/")[1])
-    branch, ref = f"pr{n}", f"refs/prv/pr{n}"
+    branch = f"pr{n}"
     fresh = not os.path.isdir(os.path.join(d, ".git"))
     if fresh:
         if os.path.exists(d) and os.listdir(d):
@@ -3509,33 +3657,55 @@ def checkout_pr(n, slug, parent, reference, gh, url):
             raise GitError(f"{d} is on branch {cur or '(detached)'}, not {branch}; switch to {branch} and run again")
     if not git(d, "remote", "get-url", "upstream", check=False).strip():
         git(d, "remote", "add", "upstream", url)
-    say(f"fetching PR #{n} and {base} from upstream")
-    # Submodules are fetched by update_submodules(), after their URLs are synced from the new .gitmodules.
-    git(d, "fetch", "--quiet", "--no-recurse-submodules", "upstream", f"+refs/pull/{n}/head:{ref}", base)
-    new = git(d, "rev-parse", ref).strip()
+    new = fetch_pr(d, n, base)
     if first:
         git(d, "checkout", "--quiet", "-B", branch, new)
         say(f"checked out {branch} at {new[:10]}")
-        return d, base, pr_base
+    else:
+        move_pr_branch(d, n, new)
+    return d, base, pr_base
+
+
+def usable_branch(d, name):
+    """A branch name from GitHub that git fetch takes as a ref, never as an option."""
+    return (isinstance(name, str) and not name.startswith("-")
+            and git(d, "check-ref-format", "--branch", name, check=False).strip() == name)
+
+
+def fetch_pr(d, n, base, fetch=None, say=say):
+    """Fetch PR n's head and the base branch from upstream; returns the head. fetch: runs `git fetch ARGS` in d."""
+    say(f"fetching PR #{n} and {base} from upstream")
+    # Submodules are fetched by update_submodules(), after their URLs are synced from the new .gitmodules.
+    (fetch or (lambda *a: git(d, "fetch", *a)))(
+        "--quiet", "--no-recurse-submodules", "upstream", f"+refs/pull/{n}/head:refs/prv/pr{n}", base)
+    return git(d, "rev-parse", f"refs/prv/pr{n}").strip()
+
+
+def move_pr_branch(d, n, new, say=say):
+    """Move branch pr<n>, checked out in d, to `new`. Local work is never dropped: uncommitted changes
+    stop the move, and a rewritten PR leaves the old tip on a backup branch, which is returned."""
+    branch = f"pr{n}"
     tip = git(d, "rev-parse", "HEAD").strip()
     if tip == new:
         say(f"{branch} is up to date at {new[:10]}")
-        return d, base, pr_base
+        return None
     if git(d, "status", "--porcelain", "--untracked-files=no").strip():
         raise GitError(f"{d} has uncommitted changes and PR #{n} moved to {new[:10]}; "
-                       "commit or stash them and run again")
+                       "commit or stash them and try again")
     if is_ancestor(d, tip, new):
-        git(d, "merge", "--quiet", "--ff-only", new)
+        git(d, "-c", "submodule.recurse=false", "merge", "--quiet", "--ff-only", new)
         say(f"fast-forwarded {branch} {tip[:10]}..{new[:10]}")
-        return d, base, pr_base
+        return None
     # Force-pushed, or local commits on top: keep the old tip, then move the branch.
+    # new below tip: local commits, or the author dropped commits; the old tip alone cannot tell which.
+    why = f"{branch} had commits that PR #{n} does not" if is_ancestor(d, new, tip) else f"PR #{n} was rewritten"
     backup = f"{branch}-old-{tip[:10]}"
     git(d, "branch", "-f", backup, tip)
     # Refuses to overwrite untracked files. Submodules move in update_submodules(): with a user's
     # submodule.recurse=true, checkout would need the new pins, which the fetch did not bring.
     git(d, "-c", "submodule.recurse=false", "checkout", "--quiet", "-B", branch, new)
-    say(f"PR #{n} was rewritten: {branch} now at {new[:10]}, the old tip is kept as branch {backup}")
-    return d, base, pr_base
+    say(f"{why}: {branch} now at {new[:10]}, the old tip is kept as branch {backup}")
+    return backup
 
 
 def review_parent(cwd):
@@ -3611,11 +3781,12 @@ def new_review_main(argv):
     serve += ["--port", str(args.port)] if args.port is not None else []
     serve += ["--open"] if args.open else []
     auto = None if args.no_explain else (args.model, args.max_budget_usd)
-    return main(serve, auto_explain=auto)
+    return main(serve, auto_explain=auto, reference=args.reference)
 
 
-def main(argv=None, auto_explain=None):
-    """auto_explain: (model, budget) to start a "prepare" explain job once serving (prv new_review)."""
+def main(argv=None, auto_explain=None, reference=None):
+    """auto_explain: (model, budget) to start a "prepare" explain job once serving (prv new_review).
+    reference: new_review's reference clone, for Pull."""
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["git"]:
         return git_ro(argv[1:])
@@ -3665,7 +3836,7 @@ def main(argv=None, auto_explain=None):
     qodo = shutil.which("qodo") or shutil.which("qodo", path=os.path.expanduser("~/.qodo/bin"))
     if qodo:
         reviewers["qodo"] = Reviewer(repo, args.claude, "qodo", qodo=qodo)
-    changes = Changes(repo, runner, github, args.allow_push)
+    changes = Changes(repo, runner, github, args.allow_push, reference)
     handler = make_handler(repo, store, runner, explainer, token, page, github, reviewers, changes,
                            Sessions(repo, store))
     try:
@@ -3914,8 +4085,10 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <select id="theme" title="Color theme"></select>
 <button id="askview" title="Start a thread about the whole view">Ask about this view</button>
 <button id="push" hidden title="Push HEAD to the pull request's branch on GitHub">Push</button>
+<button id="pull" hidden title="Bring this checkout to the PR's latest head on GitHub, as prv new_review does">Pull</button>
 <button id="refresh" title="Reload commits and diff">Refresh</button></header>
 <div class="pushcard" id="pushcard" hidden></div>
+<div class="pushcard" id="pullcard" hidden></div>
 <div class="layout"><aside id="side"></aside><div class="vgrip" id="sidegrip" title="Drag to resize the side panel; double-click for its default width"></div><main id="main"><div class="empty">Loading…</div></main></div>
 <script>
 const TOKEN = __PRV_TOKEN__;
@@ -3948,6 +4121,7 @@ async function loadMeta(){
   S.meta = await api('/api/meta');
   $('#title').textContent = `${S.meta.repo} · ${S.meta.branch}`;
   $('#range').textContent = `${S.meta.base_label} (${S.meta.base_short})..${S.meta.head}`;
+  $('#pull').hidden = !S.meta.pull;
   setTitle();
 }
 function setTitle(){
@@ -4518,7 +4692,7 @@ document.addEventListener('click', async e => {
 // Push: HEAD to the PR's own branch. The server checks GitHub again before it pushes.
 async function openPush(){
   const c = $('#pushcard');
-  c.hidden = false;
+  c.hidden = false; $('#pullcard').hidden = true;  // both cards sit at the same fixed place
   c.innerHTML = '<span class="spin">Checking GitHub</span>';
   const close = '<div class="row"><span class="sp"></span><button data-pclose>Close</button></div>';
   let st;
@@ -5094,10 +5268,50 @@ async function submit(th){
   }
 }
 
-$('#refresh').addEventListener('click', async () => {
-  await loadMeta(); await loadThreads(); setView(S.view);
+// A view the range still has. A truncated range does not list all of its commits.
+function viewOk(v){
+  if (v === 'all') return true;
+  if (v === 'wt') return S.meta.dirty;
+  const since = v.startsWith(SINCE), sha = since ? v.slice(SINCE.length) : v;
+  return /^[0-9a-f]{7,40}$/.test(sha) && (since || S.meta.truncated || S.meta.commits.some(c => c.sha === v));
+}
+
+async function reloadAll(pulled){
+  await loadMeta(); await loadThreads();
+  // A pull can take the viewed commit out of the range, or clean the tree.
+  const v = S.view;
+  setView(pulled && !viewOk(v) ? 'all' : v);
   if (S.tips) { S.tips = null; toggleTips(); }  // an amend or a rebase since the list was read adds a tip
   if (S.sess) { S.sess = null; toggleSessions(); }
+}
+$('#refresh').addEventListener('click', () => reloadAll(false));
+
+// Pull: the PR's head from GitHub. The server refuses while Claude, a review or a commit runs.
+$('#pull').addEventListener('click', async () => {
+  const b = $('#pull'), c = $('#pullcard');
+  if (b.disabled) return;
+  b.disabled = true; c.hidden = false; $('#pushcard').hidden = true;
+  c.innerHTML = '<span class="spin">Pulling the PR from GitHub</span>';
+  const row = extra => `<div class="row">${extra}<span class="sp"></span><button data-lclose>Close</button></div>`;
+  try {
+    const r = await api('/api/pull', {method: 'POST', body: '{}'});
+    const moved = r.before !== r.after;
+    c.innerHTML = `<div>${moved ? `HEAD moved from ${esc(r.before.slice(0, 10))} to ${esc(r.after.slice(0, 10))}.` : 'Already up to date.'}`
+      + ` Base: ${esc(r.base)}.</div><pre>${esc(r.messages.join('\n'))}</pre>`
+      + (moved ? '<div class="muted">AI and Qodo reviews and explanations ran on the old HEAD; run them again for the new one.</div>' : '')
+      + row(moved ? `<button data-lsince="${esc(r.before)}" title="What the author changed since the old head">Changes since ${esc(r.before.slice(0, 10))}</button>` : '');
+  } catch(err){ c.innerHTML = `<div class="warn">${esc(err.message)}</div>` + row(''); }
+  // Push opened meanwhile hides this card; the outcome of a minutes-long pull must still show.
+  c.hidden = false; $('#pushcard').hidden = true;
+  b.disabled = false;
+  // After a failure too: a failed submodule update comes after HEAD moved.
+  try { await reloadAll(true); }
+  catch(e){ c.insertAdjacentHTML('afterbegin', `<div class="warn">Reloading the page data failed: ${esc(e.message)}</div>`); }
+});
+$('#pullcard').addEventListener('click', e => {
+  const c = $('#pullcard'), since = e.target.closest('[data-lsince]');
+  if (e.target.closest('[data-lclose]')) c.hidden = true;
+  if (since) { c.hidden = true; setView(SINCE + since.dataset.lsince); }
 });
 
 // Pick up answers that are still running after a page reload.
@@ -5121,8 +5335,7 @@ setInterval(async () => {
   try { await loadMeta(); await loadThreads(); }
   catch(e){ $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
   const hv = new URLSearchParams(location.hash.slice(1)).get('view');
-  const ok = v => v === 'all' || (v === 'wt' && S.meta.dirty) || (v.startsWith(SINCE) && /^[0-9a-f]{7,40}$/.test(v.slice(SINCE.length))) || S.meta.commits.some(c => c.sha === v);
-  setView(hv && ok(hv) ? hv : (!S.meta.commits.length && S.meta.dirty ? 'wt' : 'all'));
+  setView(hv && viewOk(hv) ? hv : (!S.meta.commits.length && S.meta.dirty ? 'wt' : 'all'));
 })();
 </script>
 </body>

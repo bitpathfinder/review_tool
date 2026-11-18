@@ -28,7 +28,7 @@ to answer.
 - **Commit and push.** The "Uncommitted changes" view commits everything it shows, or amends the
   last commit. With `--allow-push`, **Push** sends HEAD to your own open PR's branch (below).
 - **New review.** `prv new_review <PR>` checks a PR out (or brings an existing checkout up to date),
-  with its submodules, and opens it.
+  with its submodules, and opens it. **Pull** in the header brings it up to date later.
 - Split or unified diff, whole-file view, Viewed marks, light and dark themes. Drag the edge of the
   side panel or of the notes column to change that panel's width; a double-click on the edge restores the default.
 
@@ -112,6 +112,12 @@ lost. A PR already merged into its base branch is reviewed against the base comm
 for it, so its own commits show. Explanations and line notes are written in the background unless
 you pass `--no-explain`.
 The checkout skips Git LFS downloads (ScyllaDB's LFS files are PGO profiles that review does not need).
+
+**Pull** in the header does the same update while prv runs, then serves the range from the new fork
+point, so a PR rebased onto a newer base shows only its own commits. After a force-push, **Changes
+since** the old head shows what the author changed. Pull shows in a checkout on branch `pr<N>` whose
+`upstream` remote is on GitHub. It is refused while a Claude thread, an explanation or a review runs, since
+they read the working tree.
 
 ## Changes since an earlier version
 

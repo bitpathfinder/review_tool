@@ -1205,6 +1205,174 @@ class NewReviewTest(unittest.TestCase):
         self.assertIn(f"{self.d}  upstream/master", line, err)
         self.assertEqual(self.git(self.d, "remote", "get-url", "origin"), self.reference)
 
+    def serving(self):
+        """The checkout as `prv new_review` serves it, with upstream configured as GitHub and fetched from self.up."""
+        self.prepare()
+        self.git(self.d, "config", "remote.upstream.url", "https://github.com/o/r.git")
+        self.git(self.d, "config", f"url.{self.up}.insteadOf", "https://github.com/o/r.git")
+        repo = prv.Repo(self.d, self.c1, "HEAD", "upstream/master")
+        store = prv.Store(repo.git_dir)
+        runner = prv.Runner(repo, store, "/bin/false")
+        github = prv.GitHub(repo, self.gh)
+        github.start = mock.Mock()  # the background refresh is GitHubTest's
+        return repo, store, runner, github, prv.Changes(repo, runner, github, reference=self.reference)
+
+    def test_pull_fast_forward_and_rewrite(self):
+        repo, _, _, github, changes = self.serving()
+        busy = lambda: None
+        r = changes.pull(busy)
+        self.assertEqual((r["before"], r["after"], r["backup"]), (self.p1, self.p1, None))
+        self.assertIn("pr7 is up to date", r["messages"][-1])
+        # New commit on top: a fast-forward, the same fork point.
+        self.git(self.up, "checkout", "-q", "feat")
+        p2 = self.write(self.up, "base\nfeature\nmore\n", "more")
+        self.set_pr(p2)
+        r = changes.pull(busy)
+        self.assertEqual((r["before"], r["after"], r["backup"]), (self.p1, p2, None))
+        self.assertEqual((self.head(), repo.base, repo.base_label), ((p2, "pr7"), self.c1, "upstream/master"))
+        github.start.assert_called()
+        # Force-pushed onto a newer master: the old tip is kept, and the range starts at the new fork point,
+        # so master's new commit stays out of it.
+        self.git(self.up, "checkout", "-q", "master")
+        m2 = self.write(self.up, "base2\n", "master moves")
+        self.git(self.up, "checkout", "-q", "-b", "feat2")
+        p3 = self.write(self.up, "base2\nrewritten\n", "rewritten")
+        self.set_pr(p3)
+        r = changes.pull(busy)
+        self.assertEqual((r["after"], r["backup"]), (p3, f"pr7-old-{p2[:10]}"))
+        self.assertEqual(self.git(self.d, "rev-parse", r["backup"]), p2)
+        self.assertEqual((self.head(), repo.base), ((p3, "pr7"), m2))
+        self.assertEqual([c["sha"] for c in repo.meta()["commits"]], [p3])
+
+    def test_pull_of_a_merged_pr_serves_its_base_commit(self):
+        repo, _, _, _, changes = self.serving()
+        self.git(self.up, "merge", "-q", "--no-ff", "-m", "Merge PR 7", "feat")
+        self.set_pr(self.p1, base_sha=self.c1)
+        r = changes.pull(lambda: None)
+        self.assertEqual((r["base"], repo.base), (self.c1, self.c1))
+        self.assertEqual([c["sha"] for c in repo.meta()["commits"]], [self.p1])
+
+    def test_pull_refusals(self):
+        repo, _, runner, _, changes = self.serving()
+        self.git(self.up, "checkout", "-q", "feat")
+        p2 = self.write(self.up, "base\nfeature\nmore\n", "more")
+        self.set_pr(p2)
+        with self.assertRaises(prv.ChangeError) as e:
+            changes.pull(lambda: "the AI review")
+        self.assertEqual((str(e.exception), e.exception.status),
+                         ("the AI review is running; wait for it or stop it, then pull", 409))
+        with runner.edit_lock:
+            with self.assertRaises(prv.ChangeError) as e:
+                changes.pull(lambda: None)
+            self.assertEqual(e.exception.status, 409)
+        with changes.lock:
+            with self.assertRaises(prv.ChangeError) as e:
+                changes.pull(lambda: None)
+            self.assertEqual(e.exception.status, 409)
+            # Push is refused at once instead of waiting out a pull's fetch.
+            with self.assertRaises(prv.ChangeError) as e:
+                changes.push_state()
+            self.assertEqual(e.exception.status, 409)
+        with open(os.path.join(self.d, "f.txt"), "a") as fh:
+            fh.write("local edit\n")
+        with self.assertRaisesRegex(prv.GitError, "has uncommitted changes"):
+            changes.pull(lambda: None)
+        self.assertEqual((self.head(), repo.base), ((self.p1, "pr7"), self.c1))
+        # The locks are free again after each refusal.
+        self.git(self.d, "checkout", "--", "f.txt")
+        self.assertEqual(changes.pull(lambda: None)["after"], p2)
+        # A GitHub base name that git would take as an option.
+        os.environ["FAKE_GH"] = json.dumps({"repos/o/r/pulls/7": {"base": {"ref": "--upload-pack=x"}}})
+        with self.assertRaisesRegex(prv.ChangeError, "no usable base branch"):
+            changes.pull(lambda: None)
+
+    def test_pull_keeps_local_commits_on_a_backup_branch(self):
+        _, _, _, _, changes = self.serving()
+        mine = self.write(self.d, "base\nfeature\nmine\n", "mine")
+        r = changes.pull(lambda: None)
+        self.assertEqual((r["after"], r["backup"]), (self.p1, f"pr7-old-{mine[:10]}"))
+        self.assertIn("pr7 had commits that PR #7 does not", r["messages"][-1])
+        self.assertEqual(self.git(self.d, "rev-parse", r["backup"]), mine)
+
+    def test_pull_reports_what_moved_when_the_submodule_update_fails(self):
+        repo, _, _, github, changes = self.serving()
+        self.git(self.up, "checkout", "-q", "master")
+        m2 = self.write(self.up, "base2\n", "master moves")
+        self.git(self.up, "checkout", "-q", "-b", "feat2")
+        p2 = self.write(self.up, "base2\nrewritten\n", "rewritten")
+        self.set_pr(p2)
+        with mock.patch.object(prv, "update_submodules", side_effect=prv.GitError("no network")):
+            with self.assertRaises(prv.ChangeError) as e:
+                changes.pull(lambda: None)
+        self.assertIn(f"PR #7 was rewritten: pr7 now at {p2[:10]}", str(e.exception))
+        self.assertIn("the submodule update failed: no network", str(e.exception))
+        # HEAD moved, so the range starts at the new fork point and the page's GitHub data is read again.
+        self.assertEqual((self.head(), repo.base), ((p2, "pr7"), m2))
+        github.start.assert_called()
+        self.assertFalse(changes.pulling.is_set())
+
+    def test_new_review_refuses_a_bad_base_before_cloning(self):
+        os.environ["FAKE_GH"] = json.dumps({"repos/o/r/pulls/7": {
+            "title": "T", "state": "open", "base": {"ref": "--upload-pack=x"}, "head": {"sha": self.p1}}})
+        with self.assertRaisesRegex(prv.GitError, "no usable base branch"):
+            self.prepare()
+        self.assertFalse(os.path.exists(os.path.dirname(self.d)))
+
+    def test_pull_target(self):
+        repo, _, runner, github, changes = self.serving()
+        self.assertEqual(changes.pull_target(), (7, "o/r"))
+        self.assertIsNone(prv.Changes(repo, runner, None).pull_target())  # --no-github
+        fixed = prv.Repo(self.d, self.c1, self.p1, "upstream/master")  # a BASE..HEAD range
+        self.assertIsNone(prv.Changes(fixed, runner, github).pull_target())
+        self.git(self.d, "checkout", "-q", "-b", "mine")
+        self.assertIsNone(changes.pull_target())
+        with self.assertRaisesRegex(prv.ChangeError, "needs a `prv new_review` checkout"):
+            changes.pull(lambda: None)
+        self.git(self.d, "checkout", "-q", "pr7")
+        self.git(self.d, "config", "remote.upstream.url", self.up)
+        self.assertIsNone(changes.pull_target())
+
+    def test_pull_from_the_page(self):
+        repo, store, runner, github, changes = self.serving()
+        explainer = prv.Explainer(repo, "/bin/false")
+        h = prv.make_handler(repo, store, runner, explainer, "tok", prv.PAGE, github, {}, changes)
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), h)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+
+        def req(path, body=None):
+            r = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}{path}",
+                                       data=None if body is None else json.dumps(body).encode(),
+                                       headers={"X-Prv-Token": "tok", "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(r) as resp:
+                    return resp.status, json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                with e:
+                    return e.code, json.loads(e.read())
+        self.assertTrue(req("/api/meta")[1]["pull"])
+        self.git(self.up, "checkout", "-q", "feat")
+        p2 = self.write(self.up, "base\nfeature\nmore\n", "more")
+        self.set_pr(p2)
+        store.threads["t"] = {"id": "t", "running": True}
+        self.assertEqual(req("/api/pull", {}), (409, {"error": "a Claude thread is running; wait for it or stop it, then pull"}))
+        store.threads["t"]["running"] = False
+        explainer.job = {"running": True}
+        self.assertEqual(req("/api/pull", {})[0], 409)
+        explainer.job = None
+        code, r = req("/api/pull", {})
+        self.assertEqual((code, r["after"]), (200, p2))
+        self.assertEqual(req("/api/meta")[1]["commits"][-1]["sha"], p2)
+        # While a pull moves the tree, no thread or explanation starts reading it.
+        changes.pulling.set()
+        moving = (409, {"error": "a pull is moving the working tree; try again when it ends"})
+        self.assertEqual(req("/api/ask", {"question": "q", "anchor": {"view": "all"}}), moving)
+        self.assertEqual(req("/api/ask", {"question": "q", "id": "t"}), moving)
+        self.assertEqual(req("/api/explain", {}), moving)
+        self.assertEqual((store.threads["t"]["running"], len(store.threads), explainer.job), (False, 1, None))
+        changes.pulling.clear()
+
 
 class InstallTest(unittest.TestCase):
     """install.sh, run from a copy of the checkout with HOME in a temp dir."""
