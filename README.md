@@ -7,7 +7,8 @@ to answer.
 ![prv on a pull request: commits, files, the AI and Qodo review summary and the GitHub threads](docs/overview.png)
 
 - **Ask about lines.** Click a line number (shift-click for a range), type a question. The answer
-  streams in, and the thread is saved in `<git-dir>/prv/threads.json`.
+  streams in, and the thread is saved in `<git-dir>/prv/threads.json`. **hide** on a thread shrinks
+  it to a one-line header; **Hide threads** in the header shrinks every thread in the view.
 - **Chat about the PR.** In "All changes", **Chat about this PR** starts a thread about the whole PR;
   Claude also gets the PR title, description and Jira keys. In a commit view the same button asks
   about that commit.

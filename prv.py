@@ -4140,6 +4140,11 @@ tr.trow>td{padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",san
 .thead{display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--border);font-size:12px;color:var(--muted)}
 .thead .sp{flex:1}
 .thead a{cursor:pointer;color:var(--muted)}
+.thead .tq{display:none;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}
+.thread.folded .thead{border-bottom:0}
+.thread.folded .msgs,.thread.folded .composer,.thread.folded .thead .sp{display:none}
+.thread.folded .thead .tq{display:block}
+.thead .trun{display:none}.thread.folded.running .thead .trun{display:inline}
 .m{padding:8px 12px;border-bottom:1px solid var(--border);background:var(--bg)}
 .m.user{white-space:pre-wrap;background:var(--thread)}
 .m .who{font-size:11px;color:var(--muted);margin-bottom:4px}
@@ -4227,6 +4232,7 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 </head>
 <body>
 <header><span class="title" id="title">prv</span><span class="range" id="range"></span><span class="ghlinks" id="ghpr"></span><span class="prtitle" id="prtitle"></span><span class="ghlinks" id="ghlinks"></span><span class="sp"></span>
+<button id="tfold" hidden title="Hide or show the Claude threads in this view; a hidden thread keeps a one-line header">Hide threads</button>
 <button id="xtoggle" hidden title="Show or hide the explanations next to the diff">Notes</button>
 <button id="back" hidden title="Back to where you jumped to a definition from (b)">← Back</button>
 <button id="chprev" title="Previous change (p)" aria-label="Previous change">↑</button><button id="chnext" title="Next change (n)" aria-label="Next change">↓</button>
@@ -4242,7 +4248,7 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <div class="layout"><aside id="side"></aside><div class="vgrip" id="sidegrip" title="Drag to resize the side panel; double-click for its default width"></div><main id="main"><div class="empty">Loading…</div></main></div>
 <script>
 const TOKEN = __PRV_TOKEN__;
-const S = {meta:null, view:null, diff:null, threads:{}, sel:null, live:{}, x:null, back:[]};
+const S = {meta:null, view:null, diff:null, threads:{}, sel:null, live:{}, x:null, back:[], fold:null};
 const SINCE = 'since:';
 const $ = (s, el=document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -4272,6 +4278,7 @@ async function loadMeta(){
   $('#title').textContent = `${S.meta.repo} · ${S.meta.branch}`;
   $('#range').textContent = `${S.meta.base_label} (${S.meta.base_short})..${S.meta.head}`;
   $('#pull').hidden = !S.meta.pull;
+  loadFold();
   setTitle();
 }
 function setTitle(){
@@ -4279,9 +4286,13 @@ function setTitle(){
   document.title = pr ? `#${pr.number} ${pr.title} · prv` : `prv · ${S.meta?.repo || ''}`;
 }
 async function loadThreads(){
+  // Forget hidden ids of deleted threads. Read them before the fetch: another tab may make and hide a thread meanwhile.
+  loadFold(); const fold = [...S.fold];
   const list = await api('/api/threads');
   for (const t of list) if (!S.live[t.id]) S.threads[t.id] = t;
   for (const id of Object.keys(S.threads)) if (!list.find(t => t.id === id) && !S.live[id]) delete S.threads[id];
+  const gone = fold.filter(id => !S.threads[id]);
+  if (gone.length) setFold(gone, false);
 }
 
 async function setView(v, scrollTo){
@@ -4293,6 +4304,7 @@ async function setView(v, scrollTo){
   document.body.classList.remove('xon'); S.xplaced = false;
   history.replaceState(null, '', location.pathname + location.search + '#view=' + encodeURIComponent(v));
   $('#main').innerHTML = '<div class="empty">Loading diff…</div>';
+  foldLabel();
   renderSide();
   // Only the latest call renders: an older fetch, even for the same view (Refresh), may finish last.
   if (v.startsWith(SINCE)) loadRange(v);  // alongside the diff: range-diff of a large rewrite takes seconds
@@ -4349,7 +4361,7 @@ function renderSide(){
   const ts = Object.values(S.threads).sort((a,b) => a.created - b.created);
   h += `<h3>Threads (${ts.length})</h3>`;
   for (const t of ts) {
-    const a = t.anchor, q = t.messages.find(x => x.role==='user')?.text || '';
+    const a = t.anchor, q = firstQuestion(t);
     const where = a.path ? `${a.path.split('/').pop()}:${a.end?.line ?? ''}` : viewLabel(a.view);
     h += `<a class="item" data-thread="${t.id}" title="${esc(viewLabel(a.view))}\n${esc(q)}">${t.running?'<span class="spin"></span> ':''}<span class="sha">${esc(where)}</span> ${esc(q.slice(0,80))}</a>`;
   }
@@ -4440,6 +4452,7 @@ $('#side').addEventListener('click', e => {
   else if (it.dataset.thread) {
     const t = S.threads[it.dataset.thread];
     const el = document.getElementById('t-' + t.id);
+    if (el) foldThreads([el], false); else setFold([t.id], false);  // opened from the list: show it
     if (t.anchor.view === S.view && el) el.scrollIntoView({block:'center'});
     else setView(t.anchor.view, 't-' + t.id);
   }
@@ -4732,9 +4745,11 @@ function placeThreads(){
   const pending = $('#conv > .thread.new');
   document.querySelectorAll('.trow[data-thread]').forEach(e => e.remove());
   $('#conv') && ($('#conv').innerHTML = '');
+  loadFold();  // another tab may have hidden or shown threads
   placeThreadRows();
   restoreDrafts(drafts);
   if (pending) $('#conv').append(pending);
+  foldLabel();
 }
 function placeThreadRows(){
   for (const t of Object.values(S.threads).sort((a,b) => a.created - b.created)) {
@@ -4806,9 +4821,11 @@ function msgHtml(m, running){
   return h + '</div>';
 }
 function msgsHtml(t){ return t.messages.map((m, i) => msgHtml(m, t.running && i === t.messages.length - 1)).join(''); }
+function firstQuestion(t){ return t.messages.find(x => x.role === 'user')?.text || ''; }
 function threadHtml(t, detached){
-  return `<div class="thread" id="t-${t.id}" data-id="${t.id}">
-    <div class="thead"><span>${anchorLabel(t.anchor, detached)}</span><span class="sp"></span><a class="del" title="Delete thread">delete</a></div>
+  const folded = S.fold.has(t.id), q = firstQuestion(t);
+  return `<div class="thread${folded ? ' folded' : ''}${t.running ? ' running' : ''}" id="t-${t.id}" data-id="${t.id}">
+    <div class="thead"><span>${anchorLabel(t.anchor, detached)}</span><span class="tq" title="${esc(q)}">${esc(q.slice(0, 200))}</span><span class="trun spin" title="Claude is answering"></span><span class="sp"></span><a class="fold" title="${folded ? FOLD_SHOW : FOLD_HIDE}">${folded ? 'show' : 'hide'}</a><a class="del" title="Delete thread">delete</a></div>
     <div class="msgs">${msgsHtml(t)}</div>${composerHtml(t.running).replace('<button class="cancel">Cancel</button>', '')}</div>`;
 }
 function rerenderThread(t){
@@ -4817,10 +4834,41 @@ function rerenderThread(t){
   $('.msgs', el).innerHTML = msgsHtml(t);
   $('.ask', el).disabled = t.running;
   $('.stop', el).hidden = !t.running;
+  el.classList.toggle('running', !!t.running);
+}
+// Hidden threads, by id, kept per browser and repository: --port can serve two repositories on one origin.
+// loadThreads() drops the ids of deleted threads; S.threads may miss threads another tab made since.
+function parseFold(raw){
+  try { const v = JSON.parse(raw || '[]'); return Array.isArray(v) ? v.filter(x => typeof x === 'string') : []; } catch(e){ return []; }
+}
+function foldKey(){ return 'prv:tfold:' + S.meta.root; }
+function loadFold(){ S.fold = new Set(parseFold(ls.get(foldKey()))); }
+function setFold(ids, on){
+  loadFold();  // another tab may have hidden or shown threads since this one loaded
+  for (const id of ids) if (on) S.fold.add(id); else S.fold.delete(id);
+  ls.set(foldKey(), JSON.stringify([...S.fold]));
+}
+const FOLD_HIDE = 'Shrink the thread to one line', FOLD_SHOW = 'Show the whole thread';
+function foldThread(th, on){
+  th.classList.toggle('folded', on);
+  $('.fold', th).textContent = on ? 'show' : 'hide';
+  $('.fold', th).title = on ? FOLD_SHOW : FOLD_HIDE;
+}
+function foldThreads(ths, on){
+  ths.forEach(th => foldThread(th, on));
+  setFold(ths.map(th => th.dataset.id), on);
+  foldLabel();
+}
+function viewThreads(){ return [...document.querySelectorAll('#main .thread[data-id]')]; }
+function foldLabel(){
+  const ths = viewThreads();
+  $('#tfold').hidden = !ths.length;
+  $('#tfold').textContent = ths.length && ths.every(th => th.classList.contains('folded')) ? 'Show threads' : 'Hide threads';
 }
 function removeThreadEl(id){
   const el = document.getElementById('t-' + id);
   (el?.closest('.trow') || el)?.remove();
+  foldLabel();
 }
 
 // A second Stop escalates to SIGKILL; a double-click must not count as two. Keyed by action, not
@@ -4863,6 +4911,7 @@ $('#main').addEventListener('click', e => {
   const th = e.target.closest('.thread');
   if (!th) return;
   if (e.target.closest('.del')) return deleteThread(th.dataset.id);
+  if (e.target.closest('.fold')) return foldThreads([th], !th.classList.contains('folded'));
   if (e.target.closest('.stop')) return oncePerSecond('stop:' + th.dataset.id) && api('/api/stop', {method:'POST', body:JSON.stringify({id:th.dataset.id})}).catch(err => alert(err.message));
   if (e.target.closest('.cancel')) { clearSel(); return; }
   if (e.target.closest('.ask')) return submit(th);
@@ -5333,6 +5382,14 @@ function askNote(ni){
   if (n.finding) th._anchor.note_kind = 'finding';
   $('.thead span', th).insertAdjacentText('beforeend', n.finding ? ' · about the finding' : ' · about the note');
 }
+$('#tfold').addEventListener('click', () => {
+  // Threads above the window change height. A thread at the window's top keeps its header there,
+  // since a long one can fill the window and leave no line to anchor on.
+  const ths = viewThreads(), top = threadAtTop(ths), a = !top && S.diff && pageAnchor();
+  foldThreads(ths, ths.some(th => !th.classList.contains('folded')));
+  if (top) scrollBy(0, top.th.getBoundingClientRect().top - top.y);
+  else if (a) keepAnchor(a);
+});
 $('#xtoggle').addEventListener('click', () => { ls.set('prv:xhide', ls.get('prv:xhide') === '1' ? '0' : '1'); renderExplain(false); });
 
 let wasSplit = isSplit();
@@ -5370,6 +5427,20 @@ function rerenderDiff(a){
   }
   window.scrollTo(0, y);
   // A line anchor gone from the page keeps y: its top is not where the file box was.
+  return keepAnchor(a);
+}
+function threadAtTop(ths){
+  // The thread across the top of the reading area, which for a thread in a file is below its sticky header.
+  const hb = $('header').getBoundingClientRect().bottom;
+  for (const th of ths) {
+    const file = th.closest('.file'), y = file ? $('.fhead', file).getBoundingClientRect().bottom : hb;
+    const r = th.getBoundingClientRect();
+    if (r.top <= y + 2 && r.bottom > y) return {th, y};  // + 2: a header just placed there by the last click
+  }
+  return null;
+}
+function keepAnchor(a){
+  // Scrolls a's line, or the file box of a file anchor, back to its old top; false when it is gone.
   const el = a && (a.line == null ? document.getElementById('f' + a.i) : anchorLine(a));
   if (el) scrollBy(0, el.getBoundingClientRect().top - a.top);
   return !!el;
@@ -5584,6 +5655,7 @@ async function deleteThread(id){
   try { await api('/api/delete', {method:'POST', body:JSON.stringify({id})}); } catch(e){ return alert(e.message); }
   delete S.threads[id];
   removeThreadEl(id);
+  setFold([id], false);
   renderSide();
 }
 
@@ -5622,6 +5694,7 @@ async function submit(th){
             th.outerHTML = threadHtml(t);
             document.querySelectorAll('td.sel').forEach(r => r.classList.remove('sel'));
             S.sel = null;
+            foldLabel();
           } else {
             // The question is accepted; clear it unless a new draft replaced it already.
             const cur = $(`#t-${t.id} textarea`);

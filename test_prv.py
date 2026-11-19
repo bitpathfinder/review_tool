@@ -1449,9 +1449,49 @@ class HighlightTest(unittest.TestCase):
 
 def node_call(name, *args):
     """Runs the page's top-level function name in node on JSON args; returns its integer result."""
+    return int(node_json(name, *args))
+
+
+def node_json(name, *args):
+    """Runs the page's top-level function name in node on JSON args; returns its result through JSON."""
     fn = re.search(rf"function {name}\(.*?\n}}\n", prv.PAGE, re.S).group(0)
-    js = fn + f"process.stdout.write(String({name}(...{json.dumps(list(args))})));"
-    return int(subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout)
+    js = fn + f"process.stdout.write(JSON.stringify({name}(...{json.dumps(list(args))})));"
+    return json.loads(subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout)
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class ThreadFoldTest(unittest.TestCase):
+    def test_hidden_thread_ids_survive_a_bad_stored_value(self):
+        # localStorage is shared by every prv version served on the port, and by hand edits.
+        self.assertEqual(node_json("parseFold", '["a1","b2"]'), ["a1", "b2"])
+        for raw in [None, "", "{", "5", '{"a":1}', "null"]:
+            self.assertEqual(node_json("parseFold", raw), [], raw)
+        self.assertEqual(node_json("parseFold", '["a1",3,null]'), ["a1"])
+
+    @staticmethod
+    def run_fold(stored, js):
+        """Runs js after the page's hidden-thread functions, with stored as repository /r's hidden ids in a
+        localStorage stub. js ends with done(); returns the ids stored then, sorted."""
+        fns = "".join(re.search(rf"function {n}\(.*?\n}}\n", prv.PAGE, re.S).group(0) for n in ["parseFold", "setFold"])
+        fns += "".join(re.search(rf"function {n}\(\).*\n", prv.PAGE).group(0) for n in ["foldKey", "loadFold"])
+        pre = (f"const store = {{'prv:tfold:/r': {json.dumps(json.dumps(stored))}}};"
+               "const ls = {get: k => store[k] ?? null, set: (k, v) => { store[k] = v; }};"
+               "const done = () => process.stdout.write(store['prv:tfold:/r']);")
+        out = subprocess.run(["node", "-e", pre + fns + js], capture_output=True, text=True, check=True).stdout
+        return sorted(json.loads(out))
+
+    def test_a_tab_keeps_threads_another_tab_hid(self):
+        # A tab's S.threads misses threads another tab made after it loaded; its setFold() must keep their ids.
+        js = "const S = {meta: {root: '/r'}, threads: {mine: {}}, fold: null}; setFold(['mine'], true); done();"
+        self.assertEqual(self.run_fold(["other"], js), ["mine", "other"])
+
+    def test_refresh_forgets_deleted_threads_only(self):
+        # "late" is made and hidden by another tab while the thread list is in flight: the list misses it.
+        js = ("const S = {meta: {root: '/r'}, threads: {}, live: {}, fold: null};"
+              "const api = async () => { store['prv:tfold:/r'] = '[\"kept\",\"deleted\",\"late\"]'; return [{id: 'kept'}]; };"
+              "async " + re.search(r"function loadThreads\(.*?\n}\n", prv.PAGE, re.S).group(0)
+              + "loadThreads().then(done);")
+        self.assertEqual(self.run_fold(["kept", "deleted"], js), ["kept", "late"])
 
 
 class PageScriptTest(unittest.TestCase):
