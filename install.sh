@@ -99,6 +99,10 @@ command -v gh >/dev/null ||
     say "warning: gh (GitHub CLI) is not on PATH: no GitHub comments, and \`prv new_review\` will not work"
 command -v qodo >/dev/null || [ -x "$HOME/.qodo/bin/qodo" ] ||
     say "note: qodo is not installed: the Qodo review button is hidden (optional)"
+case "$(ctags --version 2>/dev/null || true)" in
+    *"Universal Ctags"*"+json"*) ;;
+    *) say "note: Universal Ctags with JSON output (ctags) is not installed: Ctrl-click on a name cannot jump to its definition (optional)" ;;
+esac
 
 [ -f "$SRC/prv.py" ] && [ -d "$SRC/vendor" ] || die "run install.sh from the prv checkout"
 mkdir -p "$PRV_BIN"

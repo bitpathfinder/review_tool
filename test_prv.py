@@ -1507,6 +1507,163 @@ class WholeFileAnchorTest(unittest.TestCase):
         self.assertEqual(self.nearest([], "new", 3), -1)
 
 
+@unittest.skipUnless(prv.universal_ctags(), "needs Universal Ctags")
+class DefinitionsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        d = self.root = os.path.realpath(self.tmp.name)
+        self.git("init", "-q", "-b", "master")
+        self.write("a.hh", "namespace ns {\nclass foo {\n    int bar(int x);\n};\n}\n")
+        self.write("a.cc", '#include "a.hh"\nint ns::foo::bar(int x) {\n    return x;\n}\nstatic int helper() { return 0; }\n')
+        self.git("add", ".")
+        self.git("commit", "-qm", "base")
+        self.base = self.git("rev-parse", "HEAD").strip()
+        self.git("checkout", "-qb", "pr")
+        self.write("my tool.py", "def util():\n    return 1\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "tool")
+        self.c1 = self.git("rev-parse", "HEAD").strip()
+        self.write("a.cc", '#include "a.hh"\nint ns::foo::bar(int x) {\n    return x + 1;\n}\nstatic int helper() { return 0; }\n')
+        self.write("a.hh", "namespace ns {\nclass foo {\n    int bar(int x);  // adds one\n};\n}\n")
+        self.git("commit", "-qam", "bar adds one")
+        self.repo = prv.Repo(d, self.base, "HEAD", "master")
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.root, check=True, capture_output=True, text=True).stdout
+
+    def write(self, name, text):
+        with open(os.path.join(self.root, name), "w") as fh:
+            fh.write(text)
+
+    def defs(self, view, name):
+        return [(d["path"], d["line"], d["kind"], d["scope"]) for d in self.repo.definitions(view, name)["defs"]]
+
+    def test_the_views_files_at_its_head(self):
+        self.assertEqual(self.defs("all", "bar"), [("a.cc", 2, "function", "ns::foo"), ("a.hh", 3, "prototype", "ns::foo")])
+        self.assertEqual(self.defs("all", "helper"), [("a.cc", 5, "function", "")])  # file-scoped
+        self.assertEqual(self.defs("all", "util"), [("my tool.py", 1, "function", "")])
+        self.assertEqual(self.defs(self.c1, "util"), [("my tool.py", 1, "function", "")])
+        self.assertEqual(self.defs(self.c1, "bar"), [])  # a.cc is not in the first commit
+        self.assertEqual(self.defs("all", "nothing"), [])
+
+    def test_the_working_tree_view_reads_the_files_on_disk(self):
+        self.write("my tool.py", "import os\n\n\ndef util():\n    return 2\n")
+        self.assertEqual(self.defs("wt", "util"), [("my tool.py", 4, "function", "")])
+        self.assertEqual(self.defs("all", "util"), [("my tool.py", 1, "function", "")])  # committed views read HEAD
+        self.write("my tool.py", "def util():\n    return 3\n")
+        self.assertEqual(self.defs("wt", "util"), [("my tool.py", 1, "function", "")])  # not cached
+
+    def test_a_symlink_out_of_the_checkout_is_not_read(self):
+        outside = os.path.join(self.root, ".git", "outside")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "s.py"), "w") as fh:
+            fh.write("def secret():\n    pass\n")
+        os.symlink(os.path.join(outside, "s.py"), os.path.join(self.root, "link.py"))
+        os.symlink(outside, os.path.join(self.root, "dir"))
+        self.write("dir/t.py", "def secret2():\n    pass\n")  # an untracked file under a symlinked folder
+        self.assertEqual(self.defs("wt", "secret"), [])
+        self.assertEqual(self.defs("wt", "secret2"), [])
+
+    def test_option_files_do_not_apply(self):
+        # A reviewed branch could ship ctags options; --options=NONE reads none, here from HOME.
+        home = os.path.join(self.root, ".git", "home")
+        os.makedirs(os.path.join(home, ".ctags.d"))
+        with open(os.path.join(home, ".ctags.d", "x.ctags"), "w") as fh:
+            fh.write("--exclude=*\n--kinds-C++=-f\n")
+        with mock.patch.dict(os.environ, {"HOME": home, "XDG_CONFIG_HOME": home}):
+            self.assertEqual(self.defs("all", "bar")[0], ("a.cc", 2, "function", "ns::foo"))
+
+    def test_a_path_missing_from_the_commit_is_skipped(self):
+        got = self.repo._view_contents("all", ["no such file", "my tool.py"])
+        self.assertEqual(got, ([("my tool.py", b"def util():\n    return 1\n")], 0))
+
+    def test_a_file_over_the_size_limit_is_skipped(self):
+        with mock.patch.object(prv, "MAX_DEF_BYTES", 30):
+            got = self.repo._view_contents("all", ["a.cc", "my tool.py", "a.hh"])
+        self.assertEqual(got, ([("my tool.py", b"def util():\n    return 1\n")], 2))
+
+    def test_files_past_the_limits_are_counted_as_left_out(self):
+        size = lambda name: os.path.getsize(os.path.join(self.root, name))
+        cc, hh, tool = size("a.cc"), size("a.hh"), size("my tool.py")
+        for budget, found, left in [(cc + hh + tool, 1, 0),  # every file fits
+                                    (cc + hh, 0, 1),  # "my tool.py" comes last in the diff
+                                    (cc + tool, 1, 1)]:  # a.hh does not fit; the files after it still can
+            self.repo._defs.clear()
+            with mock.patch.object(prv, "MAX_DEF_TOTAL", budget):
+                r = self.repo.definitions("all", "util")
+            self.assertEqual((len(r["defs"]), r["left_out"]), (found, left), budget)
+        self.write("my tool.py", "def util():\n    return 2\n")
+        with mock.patch.object(prv, "MAX_DEF_TOTAL", tool - 1):
+            self.assertEqual(self.repo.definitions("wt", "util"), {"defs": [], "left_out": 1})
+        self.repo._defs.clear()
+        with mock.patch.object(prv, "MAX_DEF_FILES", 1):
+            self.assertEqual(self.repo.definitions("all", "util")["left_out"], 2)
+
+    def test_a_commit_view_keeps_its_index_when_the_branch_moves(self):
+        self.defs(self.c1, "util")
+        self.write("new.py", "x = 1\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "more")
+        with mock.patch.object(self.repo, "_tag_index", side_effect=AssertionError("indexed again")):
+            self.assertEqual(self.defs(self.c1, "util"), [("my tool.py", 1, "function", "")])
+
+    def test_ctags_installed_after_a_miss_is_found(self):
+        with mock.patch.object(prv.shutil, "which", return_value=None):
+            self.assertIsNone(prv.universal_ctags())
+        self.assertTrue(prv.universal_ctags())
+
+    def test_ctags_switched_behind_the_same_path_is_found(self):
+        # Debian's alternatives repoint /usr/bin/ctags from Exuberant to Universal Ctags.
+        bin_dir = os.path.join(self.root, ".git", "bin")
+        os.makedirs(bin_dir)
+        exuberant = os.path.join(self.root, ".git", "exuberant")
+        with open(exuberant, "w") as fh:
+            fh.write('#!/bin/sh\necho "Exuberant Ctags 5.8"\n')
+        os.chmod(exuberant, 0o755)
+        link, universal = os.path.join(bin_dir, "ctags"), shutil.which("ctags")
+        os.symlink(exuberant, link)
+        with mock.patch.object(prv.shutil, "which", return_value=link):
+            self.assertIsNone(prv.universal_ctags())
+            os.remove(link)
+            os.symlink(universal, link)
+            self.assertEqual(prv.universal_ctags(), link)
+
+    def test_ctags_rebuilt_in_place_is_found(self):
+        # `make install` over an Exuberant Ctags keeps its path.
+        path = os.path.join(self.root, ".git", "ctags")
+        with open(path, "w") as fh:
+            fh.write('#!/bin/sh\necho "Exuberant Ctags 5.8"\n')
+        os.chmod(path, 0o755)
+        os.utime(path, ns=(1, 1))
+        universal = shutil.which("ctags")  # before the patch: shutil is prv.shutil
+        with mock.patch.object(prv.shutil, "which", return_value=path):
+            self.assertIsNone(prv.universal_ctags())
+            with open(path, "w") as fh:
+                fh.write(f'#!/bin/sh\nexec {universal} "$@"\n')
+            os.utime(path, ns=(2, 2))
+            self.assertEqual(prv.universal_ctags(), path)
+
+    def test_a_file_name_ending_in_a_space_is_indexed(self):
+        # ctags trims the names it reads with -L.
+        self.write("t.py ", "def spaced():\n    pass\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "spaced")
+        self.assertEqual(self.defs("all", "spaced"), [("t.py ", 1, "function", "")])
+
+    def test_a_file_name_with_a_carriage_return_is_indexed(self):
+        # -L ends a name at a carriage return.
+        self.write("c\rr.py", "def returned():\n    pass\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "cr")
+        self.assertEqual(self.defs("all", "returned"), [("c\rr.py", 1, "function", "")])
+
+    def test_a_bad_name_is_refused(self):
+        for name in ("a-b", "", "1x", "x" * 201, "--help"):
+            with self.assertRaises(prv.GitError, msg=name):
+                self.repo.definitions("all", name)
+
+
 class InstallTest(unittest.TestCase):
     """install.sh, run from a copy of the checkout with HOME in a temp dir."""
 
@@ -2385,6 +2542,14 @@ class ServerTest(unittest.TestCase):
                                    headers={"X-Prv-Token": token, "Content-Type": "application/json"})
         with urllib.request.urlopen(r) as resp:
             return resp.read().decode()
+
+    @unittest.skipUnless(prv.universal_ctags(), "needs Universal Ctags")
+    def test_defs(self):
+        self.assertEqual(json.loads(self.req("/api/defs?view=all&name=one")), {"defs": [], "left_out": 0})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            self.req("/api/defs?view=all&name=a%20b")
+        with cm.exception as e:
+            self.assertEqual((e.code, json.loads(e.read())), (400, {"error": "not a name"}))
 
     def test_second_stop_kills_claude_that_ignores_sigterm(self):
         proc = subprocess.Popen(["sh", "-c", "trap '' TERM; sleep 30"], start_new_session=True)

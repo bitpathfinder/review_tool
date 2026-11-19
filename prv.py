@@ -27,6 +27,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -55,6 +56,11 @@ SINCE = "since:"  # view prefix: the changes since an earlier tip of the branch
 MAX_TIPS = 20
 RANGE_DIFF_TIMEOUT = 120  # seconds; a pair of ranges near MAX_COMMITS each can run far longer
 MAX_RANGE_DIFF = 400_000  # chars of range-diff patches; a rewrite of a large PR can produce megabytes
+NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,199}\Z")  # a name to look up with ctags
+MAX_DEF_FILES = 500
+MAX_DEF_BYTES = 4 << 20  # per file; larger ones are generated or data
+MAX_DEF_TOTAL = 64 << 20  # all files of one index; read into memory and copied to a temp dir
+CTAGS_TIMEOUT = 120
 VENDOR_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "vendor")
 VENDOR_FILES = {
     "highlight.min.js": "text/javascript", "marked.min.js": "text/javascript",
@@ -356,6 +362,7 @@ class Repo:
         self.base_label = base_label
         self._trees = {}  # since_tree() results; all its inputs are commits, so an entry never goes stale
         self._ranges = {}  # range_diff() results, keyed by their two ranges of full shas
+        self._defs = {}  # definitions() indexes of committed views, keyed by view, base and head
         self.git_dir = os.path.abspath(os.path.join(root, git(root, "rev-parse", "--git-dir").strip()))
 
     def head_is_worktree(self):
@@ -558,6 +565,115 @@ class Repo:
                 self._ranges.clear()
             self._ranges[ranges] = hit
         return hit  # shared between requests: callers only read it
+
+    def definitions(self, view, name):
+        """Where the view's files (the new side, deleted files left out) define or declare name, from Universal Ctags:
+        {"defs": [{path, line, kind, scope}], "left_out": files not searched, as too many or too large}."""
+        if not isinstance(name, str) or not NAME_RE.match(name):
+            raise GitError("not a name")
+        view = self.check_view(view)
+        # A commit view's files never change; other committed views' for one base and head; the working tree's do.
+        # The files are read at this head; the file list is not, so an index built across a commit is not kept.
+        head = key = None
+        if SHA_RE.match(view):
+            key = (view,)
+        elif view != "wt":
+            head = self.head_sha()
+            key = (view, self.base, head)
+        hit = self._defs.get(key) if key else None
+        if hit is None:
+            hit = self._tag_index(view, head)
+            if key and (head is None or self.head_sha() == head):
+                if len(self._defs) >= 8:
+                    self._defs.clear()
+                self._defs[key] = hit
+        index, left = hit
+        return {"defs": [{"path": p, "line": n, "kind": k, "scope": sc} for p, n, k, sc in sorted(index.get(name, []))],
+                "left_out": left}
+
+    def _tag_index(self, view, head=None):
+        ctags = universal_ctags()
+        if not ctags:
+            raise GitError("jumping to a definition needs Universal Ctags (ctags) with JSON output (+json) on PATH")
+        files = [f for f in self.diff(view)["files"] if f["status"] != "D" and not f["binary"]]
+        # A newline in a path would end its cat-file request and its line in ctags' file list.
+        paths = list(dict.fromkeys(f["new_path"] for f in files if "\n" not in f["new_path"]))
+        contents, left = self._view_contents(view, paths[:MAX_DEF_FILES], head)
+        left += max(0, len(paths) - MAX_DEF_FILES)
+        with tempfile.TemporaryDirectory(prefix="prv-tags-") as tmp:
+            names = []
+            for i, (path, data) in enumerate(contents):
+                # Its own folder per file: ctags picks the language by the file name. -L trims trailing spaces
+                # and ends a name at a carriage return.
+                base = re.sub(r"[\x00-\x1f\x7f]", "_", os.path.basename(path).rstrip()) or "_"
+                rel = f"{i}/{base}"
+                os.mkdir(os.path.join(tmp, str(i)))
+                with open(os.path.join(tmp, rel), "wb") as fh:
+                    fh.write(data)
+                names.append((rel, path))
+            byrel = dict(names)
+            # --options=NONE: no option files, so a .ctags.d in the reviewed tree has no say. Prototypes: C++ headers declare methods.
+            try:
+                r = subprocess.run([ctags, "--options=NONE", "-f", "-", "--output-format=json", "--fields=+n",
+                                    "--kinds-C=+p", "--kinds-C++=+p", "-L", "-"], cwd=tmp, capture_output=True,
+                                   input="".join(rel + "\n" for rel, _ in names).encode(), timeout=CTAGS_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                raise GitError(f"ctags took over {CTAGS_TIMEOUT} s") from None
+        if r.returncode != 0:
+            raise GitError("ctags failed: " + r.stderr.decode("utf-8", "replace").strip()[-500:])
+        index = {}
+        for row in r.stdout.decode("utf-8", "replace").splitlines():
+            try:
+                t = json.loads(row)
+            except ValueError:
+                continue
+            path = byrel.get(t.get("path")) if isinstance(t, dict) and t.get("_type") == "tag" else None
+            if path and isinstance(t.get("name"), str) and isinstance(t.get("line"), int):
+                index.setdefault(t["name"], []).append((path, t["line"], t.get("kind", ""), t.get("scope", "")))
+        return index, left
+
+    def _view_contents(self, view, paths, head=None):
+        """([(path, bytes)], left_out) for the paths as the view's new side has them: the working tree for "wt", else
+        the head commit of the view (head: its sha, when the caller has it). Missing files and, in the working tree,
+        symlinks are skipped. Files over MAX_DEF_BYTES, or past MAX_DEF_TOTAL in all, are counted in left_out."""
+        total, left = 0, 0
+        def fits(size):
+            nonlocal total, left
+            if size > MAX_DEF_BYTES or total + size > MAX_DEF_TOTAL:
+                left += 1
+                return False
+            total += size
+            return True
+        if view == "wt":
+            out = []
+            # git lists a symlinked folder as the link itself, never a path through it.
+            for path in paths:
+                full = os.path.join(self.root, path)
+                if not os.path.islink(full) and os.path.isfile(full) and fits(size := os.path.getsize(full)):
+                    with open(full, "rb") as fh:
+                        out.append((path, fh.read(size)))  # a file growing meanwhile stays within the budget
+            return out, left
+        def cat_file(mode, lines):
+            r = subprocess.run(["git", "cat-file", mode], cwd=self.root, capture_output=True,
+                               input="".join(x + "\n" for x in lines).encode())
+            if r.returncode != 0:
+                raise GitError(r.stderr.decode("utf-8", "replace").strip() or "git cat-file failed")
+            return r.stdout
+        rev = view if SHA_RE.match(view) else head or self.head_sha()
+        # Sizes first: --batch would read every blob into memory, however large.
+        small = []
+        for path, line in zip(paths, cat_file("--batch-check", [f"{rev}:{p}" for p in paths]).split(b"\n")):
+            info = line.split(b" ")
+            # "<name> missing" and "<name> ambiguous" carry no object; a path may hold spaces.
+            if (len(info) == 3 and SHA_RE.match(info[0].decode("ascii", "replace")) and info[1] == b"blob"
+                    and fits(int(info[2]))):
+                small.append((path, info[0].decode("ascii"), int(info[2])))
+        out, pos, res = cat_file("--batch", [oid for _, oid, _ in small]), 0, []
+        for path, _, size in small:
+            pos = out.index(b"\n", pos) + 1
+            res.append((path, out[pos:pos + size]))
+            pos += size + 1
+        return res, left
 
     def since_tips(self, github_head=None):
         """Earlier tips to compare with: GitHub's head, `<branch>-old-*` branches (new_review keeps
@@ -1337,6 +1453,31 @@ class ExplainError(Exception):
     def __init__(self, msg, cost=None):
         super().__init__(msg)
         self.cost = cost
+
+
+@functools.cache
+def _is_universal_ctags(p, mtime_ns):
+    # mtime_ns only keys the cache: a ctags rebuilt in place at the same path is checked again.
+    try:
+        out = subprocess.run([p, "--version"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "Universal Ctags" in out and "+json" in out
+
+
+def universal_ctags():
+    """ctags if it is Universal Ctags with JSON output, else None. Exuberant Ctags has neither --options=NONE nor JSON.
+    PATH is searched on each call: a ctags installed after the error message works without a restart.
+    Checked by the resolved path: Debian's alternatives switch /usr/bin/ctags between the two."""
+    p = shutil.which("ctags")
+    if not p:
+        return None
+    real = os.path.realpath(p)
+    try:
+        mtime_ns = os.stat(real).st_mtime_ns
+    except OSError:
+        return None
+    return p if _is_universal_ctags(real, mtime_ns) else None
 
 
 def file_fp(f):
@@ -2504,6 +2645,8 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                     if not v.startswith(SINCE):
                         return self._json({"error": "range-diff needs a since view"}, 400)
                     return self._json({"range": repo.range_diff(v[len(SINCE):])})
+                if u.path == "/api/defs":
+                    return self._json(repo.definitions(q.get("view", ["all"])[0], q.get("name", [""])[0]))
                 if u.path == "/api/since":
                     return self._json({"tips": repo.since_tips(github.head_sha() if github else None)})
                 if u.path == "/api/threads":
@@ -4014,6 +4157,9 @@ tr.trow>td{padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",san
 .pushcard{position:fixed;top:52px;right:16px;z-index:6;width:min(560px,calc(100vw - 32px));max-height:70vh;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.25);padding:10px 14px;font-size:13px}
 .pushcard pre{white-space:pre-wrap;font-size:12px;margin:4px 0}
 .pushcard .muted{color:var(--muted);font-size:12px}
+.defpop{position:fixed;z-index:7;max-width:min(560px,calc(100vw - 32px));max-height:50vh;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,.25);padding:6px 10px;font-size:12px}
+.defpop a{font-family:ui-monospace,monospace;cursor:pointer}.defpop .muted{color:var(--muted)}.defpop .err{color:var(--err);white-space:pre-wrap}
+body.defkey td.code{cursor:pointer}
 .pushcard .warn,.commitcard .err{color:var(--err);white-space:pre-wrap}
 .pushcard .row,.commitcard .row{display:flex;gap:8px;align-items:center;margin-top:8px}
 .pushcard .sp,.commitcard .sp{flex:1}
@@ -4082,6 +4228,7 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <body>
 <header><span class="title" id="title">prv</span><span class="range" id="range"></span><span class="ghlinks" id="ghpr"></span><span class="prtitle" id="prtitle"></span><span class="ghlinks" id="ghlinks"></span><span class="sp"></span>
 <button id="xtoggle" hidden title="Show or hide the explanations next to the diff">Notes</button>
+<button id="back" hidden title="Back to where you jumped to a definition from (b)">← Back</button>
 <button id="chprev" title="Previous change (p)" aria-label="Previous change">↑</button><button id="chnext" title="Next change (n)" aria-label="Next change">↓</button>
 <button id="split" title="Switch between unified and side-by-side diff">Split</button>
 <select id="theme" title="Color theme"></select>
@@ -4091,10 +4238,11 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <button id="refresh" title="Reload commits and diff">Refresh</button></header>
 <div class="pushcard" id="pushcard" hidden></div>
 <div class="pushcard" id="pullcard" hidden></div>
+<div class="defpop" id="defpop" hidden></div>
 <div class="layout"><aside id="side"></aside><div class="vgrip" id="sidegrip" title="Drag to resize the side panel; double-click for its default width"></div><main id="main"><div class="empty">Loading…</div></main></div>
 <script>
 const TOKEN = __PRV_TOKEN__;
-const S = {meta:null, view:null, diff:null, threads:{}, sel:null, live:{}, x:null};
+const S = {meta:null, view:null, diff:null, threads:{}, sel:null, live:{}, x:null, back:[]};
 const SINCE = 'since:';
 const $ = (s, el=document) => el.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -4140,6 +4288,7 @@ async function setView(v, scrollTo){
   // S.diff stays null until this view's diff renders: rerenderDiff and "Ask about this view" need its tables.
   S.view = v; S.diff = null; S.sel = null; S.sel0 = null; S.range = null; S.rdopen = new Set();
   const seq = S.seq = (S.seq || 0) + 1;
+  S.back = []; $('#back').hidden = true; $('#defpop').hidden = true;  // their places are lines of the old view
   // The old view's notes column; loadExplain sets it again. A Notes click before then must not restore it.
   document.body.classList.remove('xon'); S.xplaced = false;
   history.replaceState(null, '', location.pathname + location.search + '#view=' + encodeURIComponent(v));
@@ -4686,6 +4835,7 @@ function oncePerSecond(key){
 
 // Line selection: click a line number, shift-click to extend within one file.
 $('#main').addEventListener('click', e => {
+  if ((e.ctrlKey || e.metaKey) && e.target.closest('tr.ln td.code')) { e.preventDefault(); return gotoDef(e); }
   const xg = e.target.closest('[data-xgen]');
   if (xg) return genExplain(xg);
   const wb = e.target.closest('[data-whole]');
@@ -5232,7 +5382,15 @@ function splitLabel(){
 $('#split').addEventListener('click', () => { ls.set('prv:split', ls.get('prv:split') === '1' ? '0' : '1'); splitLabel(); rerenderDiff(); });
 splitLabel();
 // Previous and next change: the first row of each run of added or removed lines, in every expanded file with its diff loaded.
-const CHG = {row:null, top:0, timer:0};  // the change jumped to last, and where it landed
+const CHG = {row:null, top:0};  // the change jumped to last, and where it landed
+let flashed = null, flashTimer = 0;
+function flashRow(tr){
+  clearTimeout(flashTimer);
+  flashed?.classList.remove('flash');
+  flashed = tr;
+  tr.classList.add('flash');
+  flashTimer = setTimeout(() => tr.classList.remove('flash'), 800);
+}
 function changeTarget(tops, y0, dir, cur, atEdge){
   // tops: each change's top in the viewport. cur: the change jumped to last, if the page has not scrolled since;
   // stepping past cur reaches the changes that the top or bottom of the page keeps from scrolling to y0.
@@ -5257,18 +5415,118 @@ function jumpChange(dir){
   const j = changeTarget(tops, y0, dir, c >= 0 && Math.abs(tops[c] - CHG.top) < 2 ? c : -1, atEdge);
   if (j < 0) return;
   scrollBy(0, tops[j] - y0);
-  clearTimeout(CHG.timer);
-  CHG.row?.classList.remove('flash');
   const tr = CHG.row = starts[j];
   CHG.top = tr.getBoundingClientRect().top;
-  tr.classList.add('flash');
-  CHG.timer = setTimeout(() => tr.classList.remove('flash'), 800);
+  flashRow(tr);
 }
+// Ctrl- or Cmd-click on a name in the code: where this view's files define or declare it (ctags on the server).
+function wordAt(x, y){
+  const p = document.caretPositionFromPoint?.(x, y), r = p ? null : document.caretRangeFromPoint?.(x, y);
+  const node = p ? p.offsetNode : r?.startContainer, off = p ? p.offset : r?.startOffset;
+  if (node?.nodeType !== Node.TEXT_NODE) return '';
+  const s = node.data;
+  let a = off, b = off;
+  while (a > 0 && /\w/.test(s[a - 1])) a--;
+  while (b < s.length && /\w/.test(s[b])) b++;
+  return s.slice(a, b);
+}
+async function gotoDef(e){
+  const name = wordAt(e.clientX, e.clientY);
+  // S.diff is null while the next view loads; the old view's rows still show then.
+  if (!S.diff || !/^[A-Za-z_]\w{0,199}$/.test(name)) return;
+  const td = e.target.closest('td.code'), f = S.diff.files[+td.closest('tr.ln').dataset.f], here = filePath(f), seq = S.seq;
+  const l = f.flat[+td.dataset.k];
+  // Where Back returns to: the clicked line, at its place in the window.
+  const from = {seq, path:here, side:lineSide(l), line:lineNo(l), top:td.getBoundingClientRect().top};
+  let defs, left;
+  try { ({defs, left_out:left} = await api('/api/defs?view=' + encodeURIComponent(S.view) + '&name=' + encodeURIComponent(name))); }
+  catch(err){ if (S.seq === seq) defPop(e, `<div class="err">${esc(err.message)}</div>`); return; }
+  if (S.seq !== seq) return;
+  defs.sort((a, b) => (b.path === here) - (a.path === here));  // stable: the clicked file first, then by path
+  // One match jumps there; when this page cannot show its line, the list below names it.
+  if (defs.length === 1) {
+    if (await jumpFrom(from, defs[0]) || S.seq !== seq) return;
+    // "Whole file" may have scrolled the page; its scroll event, fired on the next frame, would close the list.
+    await new Promise(requestAnimationFrame);
+    if (S.seq !== seq) return;
+  }
+  S.defs = defs; S.defFrom = from;
+  defPop(e, defs.length ? defs.map((d, j) => `<div><a data-def="${j}">${esc(d.path)}:${d.line}</a> <span class="muted">${esc(d.kind)}${d.scope ? ' in ' + esc(d.scope) : ''}</span></div>`).join('')
+    : `No definition of <code>${esc(name)}</code> in the files of this view.`
+      + (left ? ` ${left} of them ${left === 1 ? 'was' : 'were'} not searched: too many or too large.` : ''));
+}
+function defPop(e, html){
+  const p = $('#defpop');
+  p.innerHTML = html;
+  p.hidden = false;
+  p.style.left = Math.max(8, Math.min(e.clientX, innerWidth - p.offsetWidth - 8)) + 'px';
+  p.style.top = (e.clientY + 16 + p.offsetHeight < innerHeight ? e.clientY + 16 : Math.max(8, e.clientY - p.offsetHeight - 8)) + 'px';
+}
+async function showLine(path, line){
+  // A new-side line of a file in this view; "Whole file" when the hunks do not show it. False when it cannot show it.
+  const i = S.diff.files.findIndex(f => filePath(f) === path && f.status !== 'D');
+  if (i < 0) return false;
+  const f = S.diff.files[i], el = document.getElementById('f' + i), seq = S.seq;
+  el.classList.remove('collapsed');
+  ensureTable(i);
+  const find = () => f.flat ? f.flat.findIndex(l => lineAt(l, 'new', line)) : -1;
+  let k = find();
+  if (k < 0 && !f.whole) {
+    const btn = $(`[data-whole="${i}"]`, el);
+    if (!btn) return false;
+    await toggleWhole(i, btn);
+    if (S.seq !== seq) return true;  // another view: nothing of this one to show
+    k = find();
+  }
+  const td = k >= 0 && $(`#f${i} td.code[data-k="${k}"]`);
+  if (!td) return false;
+  scrollBy(0, td.getBoundingClientRect().top - innerHeight / 3);
+  flashRow(td.closest('tr'));
+  return true;
+}
+$('#defpop').addEventListener('click', e => {
+  const a = e.target.closest('[data-def]'); if (!a) return;
+  $('#defpop').hidden = true;
+  jumpFrom(S.defFrom, S.defs[+a.dataset.def]);
+});
+async function jumpFrom(from, d){
+  const ok = await showLine(d.path, d.line);
+  if (ok && S.seq === from.seq) {
+    S.back.push(from);
+    if (S.back.length > 50) S.back.shift();
+    $('#back').hidden = false;
+  }
+  return ok;
+}
+function goBack(){
+  const b = S.back.pop();
+  $('#back').hidden = !S.back.length;
+  if (!b || b.seq !== S.seq) return;
+  const i = S.diff.files.findIndex(f => filePath(f) === b.path), el = document.getElementById('f' + i);
+  if (!el) return;
+  el.classList.remove('collapsed');
+  ensureTable(i);
+  const td = anchorLine({i, side:b.side, line:b.line});
+  if (!td) return;
+  scrollBy(0, td.getBoundingClientRect().top - b.top);
+  flashRow(td.closest('tr'));
+}
+$('#back').addEventListener('click', goBack);
+document.addEventListener('click', e => { if (!e.target.closest('#defpop')) $('#defpop').hidden = true; }, true);
+window.addEventListener('scroll', () => { $('#defpop').hidden = true; });
+// Firefox starts a table-cell selection on Ctrl-mousedown.
+$('#main').addEventListener('mousedown', e => { if ((e.ctrlKey || e.metaKey) && e.target.closest('tr.ln td.code')) e.preventDefault(); });
+const defKey = e => document.body.classList.toggle('defkey', e.ctrlKey || e.metaKey);
+document.addEventListener('keydown', defKey);
+document.addEventListener('keyup', defKey);
+window.addEventListener('blur', () => document.body.classList.remove('defkey'));
 $('#chprev').addEventListener('click', () => jumpChange(-1));
 $('#chnext').addEventListener('click', () => jumpChange(1));
 document.addEventListener('keydown', e => {
   if (e.ctrlKey || e.metaKey || e.altKey || e.target.closest?.('input:not([type=checkbox]), textarea, select, [contenteditable]')) return;
   if (e.key === 'n' || e.key === 'p') { e.preventDefault(); jumpChange(e.key === 'n' ? 1 : -1); }
+  if (e.key === 'Escape') $('#defpop').hidden = true;
+  if (e.key === 'b') { e.preventDefault(); goBack(); }
 });
 // Dragging the side panel's edge or the notes column's left edge sets its width; double-click resets it.
 function dragPanel(e, v, w0, dir, min, max){

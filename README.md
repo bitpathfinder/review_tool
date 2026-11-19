@@ -29,6 +29,10 @@ to answer.
   last commit. With `--allow-push`, **Push** sends HEAD to your own open PR's branch (below).
 - **New review.** `prv new_review <PR>` checks a PR out (or brings an existing checkout up to date),
   with its submodules, and opens it. **Pull** in the header brings it up to date later.
+- **Go to a definition.** Ctrl-click (Cmd-click on a Mac) a name in the code to jump to where the
+  files of the view define or declare it, opening "Whole file" when needed. Several matches show a
+  list, those in the clicked file first. **← Back** in the header (key `b`) returns to where you clicked.
+  Found with [Universal Ctags](https://ctags.io/) (`ctags`).
 - Split or unified diff, whole-file view, Viewed marks, light and dark themes. **↑** and **↓** in the
   header (keys `p` and `n`) jump to the previous or next change shown, across files and inside a whole file.
   Drag the edge of the side panel or of the notes column to change that panel's width; a double-click
@@ -60,7 +64,7 @@ The commit card in "Uncommitted changes":
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude` on PATH, logged in) for
   questions, explanations and the AI review.
 - Optional: [GitHub CLI](https://cli.github.com/) (`gh`, logged in) for PR links, review comments
-  and `prv new_review`; the qodo CLI for the Qodo review.
+  and `prv new_review`; the qodo CLI for the Qodo review; Universal Ctags for go to definition.
 
 ## Install
 
