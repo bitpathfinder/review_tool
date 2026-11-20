@@ -420,7 +420,21 @@ def out(o): print(json.dumps(o), flush=True)
 if "--json-schema" in sys.argv:
     out({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read", "input": {"file_path": "a.txt"}}]}})
     res = json.loads(os.environ.get("FAKE_EXPLAIN") or "null")
-    if '"findings"' in sys.argv[sys.argv.index("--json-schema") + 1]:  # AI review
+    if '"diagram"' in sys.argv[sys.argv.index("--json-schema") + 1]:  # call paths
+        import re
+        labels = re.findall(r"^(L[0-9]+) ", prompt, re.M)
+        root = os.getcwd()
+        res = {"summary": "CP " + ("commit" if "paths of commit" in prompt else "range"), "paths": [
+            {"from": labels[0], "to": labels[-1], "title": "P1", "frames": [
+                {"path": "main.cc", "line": 7, "function": "main", "note": "entry"},
+                {"path": root + "/a.txt", "line": 0, "function": "two"},
+                {"path": "./a.txt", "line": 2, "function": "TWO"}, {"path": "../x", "line": 1, "function": "out"}]},
+            {"from": "L999", "title": "P2", "frames": [{"path": "a.txt", "line": 1, "function": "f"}]},
+            {"from": labels[0], "title": "no frames", "frames": []}],
+            "diagram": {"nodes": [{"id": "x", "label": "X", "path": "a.txt", "line": 2, "changed": True},
+                                  {"id": "y", "label": "Y"}, {"id": "x", "label": "dup"}, {"id": "z", "label": " "}],
+                        "edges": [{"from": "x", "to": "y", "label": "calls"}, {"from": "x", "to": "z"}]}}
+    elif '"findings"' in sys.argv[sys.argv.index("--json-schema") + 1]:  # AI review
         import re
         labels = re.findall(r"^(L[0-9]+) ", prompt, re.M)
         res = {"summary": "RS", "findings": [
@@ -1494,6 +1508,32 @@ class ThreadFoldTest(unittest.TestCase):
         self.assertEqual(self.run_fold(["kept", "deleted"], js), ["kept", "late"])
 
 
+class BuildCallpathsTest(unittest.TestCase):
+    def test_edges_with_ends_that_are_not_strings_are_dropped(self):
+        raw = {"paths": [], "diagram": {"nodes": [{"id": "x", "label": "X"}],
+                                        "edges": [{"from": ["x"], "to": "x"}, {"from": "x", "to": {"x": 1}},
+                                                  {"from": "x", "to": "x", "label": "self"}]}}
+        got = prv.build_callpaths(raw, [], {}, "/nonexistent", "f" * 40, {})
+        self.assertEqual(got["diagram"]["edges"], [{"from": "n0", "to": "n0", "label": "self"}])
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class MermaidTextTest(unittest.TestCase):
+    def test_labels_cannot_add_syntax_and_bad_ids_are_left_out(self):
+        dg = {"nodes": [{"id": "n0", "label": 'A"<b>#1&`x`\\;%%\nz', "changed": True}, {"id": "n1", "label": "B"},
+                        {"id": "evil];x", "label": "C"}],
+              "edges": [{"from": "n0", "to": "n1", "label": "calls"}, {"from": "n0", "to": "evil];x", "label": ""},
+                        {"from": "n1", "to": "n0", "label": ""}]}
+        self.assertEqual(node_json("mermaidText", dg), "\n".join([
+            "flowchart LR",
+            '  n0["A#34;#60;b#62;#35;1#38;#96;x#96;#92;;%% z"]',
+            '  n1["B"]',
+            '  n0 -->|"calls"| n1',
+            "  n1 --> n0",
+            "  classDef changed stroke-width:3px",
+            "  class n0 changed"]))
+
+
 class PageScriptTest(unittest.TestCase):
     def test_no_function_is_declared_twice(self):
         # A second declaration of a name silently replaces the first for every caller on the page.
@@ -2564,8 +2604,10 @@ class ServerTest(unittest.TestCase):
         self.reviewers = {"claude": prv.Reviewer(self.repo, self.fake, "claude", explainer=self.explainer),
                           "qodo": prv.Reviewer(self.repo, self.fake, "qodo", qodo=self.qodo)}
         self.token = "tok"
+        self.cp = prv.Callpaths(self.repo, self.fake)
         h = prv.make_handler(self.repo, self.store, self.runner, self.explainer, self.token, prv.PAGE,
-                             reviewers=self.reviewers, sessions=prv.Sessions(self.repo, self.store))
+                             reviewers=self.reviewers, sessions=prv.Sessions(self.repo, self.store),
+                             callpaths=self.cp)
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), h)
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
@@ -3479,6 +3521,118 @@ class ServerTest(unittest.TestCase):
             prv.MAX_COMMITS = old
         self.assertIn("(1 oldest commits not shown)\n", self.fake_calls()[-1]["prompt"])
 
+    def callpaths(self, view="all"):
+        return json.loads(self.req("/api/callpaths?view=" + view))
+
+    def wait_callpaths(self, view="all"):
+        for _ in range(300):
+            x = self.callpaths(view)
+            if not x["job"]["running"]:
+                return x
+            time.sleep(0.05)
+        self.fail("call paths job did not finish")
+
+    def test_callpaths_for_the_range_and_a_commit(self):
+        self.assertEqual(self.callpaths(), {"view": "all", "job": None, "error": None, "doc": None})
+        self.assertEqual(json.loads(self.req("/api/callpaths", {})), {"started": True})
+        x = self.wait_callpaths()
+        self.assertIsNone(x["job"]["error"])
+        d = x["doc"]
+        head = self.git("rev-parse", "HEAD")
+        self.assertEqual((d["summary"], d["model"], d["cost"], d["rev"], d["current"]), ("CP range", "sonnet", 0.25, head, True))
+        self.assertTrue(self.cp.current())  # prv new_review does not map the same range again
+        p1, p2 = d["paths"]  # a stack without frames is dropped
+        self.assertEqual((p1["title"], p1["anchor"], p1["end"], p1["stale"]),
+                         ("P1", {"path": "a.txt", "side": "old", "line": 2}, {"side": "new", "line": 2}, False))
+        # Paths are made relative to the root; a bad line becomes 1; a file missing at the head is not clickable.
+        self.assertEqual([(f["path"], f["line"], f["ok"]) for f in p1["frames"]],
+                         [("main.cc", 7, False), ("a.txt", 1, True), ("a.txt", 2, True), ("../x", 1, False)])
+        self.assertEqual((p2["anchor"], p2["target"]), (None, ""))  # an unknown label
+        self.assertEqual(d["diagram"], {"nodes": [
+            {"id": "n0", "label": "X", "path": "a.txt", "line": 2, "changed": True, "ok": True},
+            {"id": "n1", "label": "Y", "path": "", "line": 1, "changed": False, "ok": False}],
+            "edges": [{"from": "n0", "to": "n1", "label": "calls"}]})
+        [call] = self.fake_calls()
+        argv = call["argv"]
+        self.assertEqual(argv[argv.index("--model") + 1], "sonnet")
+        self.assertIn("L1 -two", call["prompt"])
+        self.assertIn("call stacks", argv[argv.index("--append-system-prompt") + 1])
+        # The range's paths are not a commit's.
+        self.assertIsNone(self.callpaths(head)["doc"])
+        self.assertEqual(json.loads(self.req("/api/callpaths", {"commit": head, "model": "haiku"})), {"started": True})
+        c = self.wait_callpaths(head)["doc"]
+        self.assertEqual((c["summary"], c["model"], c["rev"]), ("CP commit", "haiku", head))
+        self.assertEqual(c["paths"][0]["anchor"], {"path": "a.txt", "side": "old", "line": 2})
+        self.assertIn(f"paths of commit {head}", self.fake_calls()[-1]["prompt"])
+        base = self.git("rev-parse", "master")
+        self.assertEqual(json.loads(self.req("/api/callpaths", {"commit": base})), {"started": True})
+        self.assertEqual(self.wait_callpaths(base)["job"]["error"], "the commit is not in the reviewed range")
+        # A new commit moves the head: the range's paths are stale where the file's diff changed.
+        self.write_commit("a.txt", "zero\none\nTWO\nthree\n", "shift")
+        d = self.callpaths()["doc"]
+        self.assertEqual((d["current"], [(p["anchor"], p["stale"]) for p in d["paths"]]),
+                         (False, [(None, True), (None, False)]))
+        self.assertFalse(self.cp.current())
+        self.assertEqual(self.callpaths("wt")["doc"], None)
+
+    def test_callpaths_of_a_commit_follow_a_rebase(self):
+        # Keyed by patch-id with hunk-relative anchors: a rebase that shifts lines keeps them on the line.
+        sha = self.git("rev-parse", "HEAD")
+        self.assertEqual(json.loads(self.req("/api/callpaths", {"commit": sha})), {"started": True})
+        self.wait_callpaths(sha)
+        self.git("checkout", "-q", "master")
+        self.write_commit("b.txt", "b\n", "unrelated")
+        self.git("checkout", "-q", "feature")
+        self.git("-c", "user.name=t", "-c", "user.email=t@t", "rebase", "-q", "master")
+        new = self.git("rev-parse", "HEAD")
+        self.assertNotEqual(new, sha)
+        c = self.callpaths(new)["doc"]
+        self.assertEqual((c["rev"], c["current"], c["paths"][0]["anchor"]),
+                         (sha, False, {"path": "a.txt", "side": "old", "line": 2}))
+
+    def test_callpaths_requests_are_checked(self):
+        for body in ({"model": "gpt"}, {"commit": "all"}, {"commit": "wt"}, {"commit": ["x"]}, {"commit": "f" * 40}):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.req("/api/callpaths", body)
+            with cm.exception as e:
+                self.assertEqual(e.code, 400, body)
+        self.assertEqual(json.loads(self.req("/api/callpaths/stop", {})), {"stopped": False})
+        os.makedirs(os.path.dirname(self.cp.path), exist_ok=True)
+        with open(self.cp.path, "w") as fh:
+            fh.write('{"version": 1, "pr": {"rev": 1}, "commits": {}}')
+        self.assertIn("not a valid callpaths.json", self.callpaths()["error"])
+
+    def test_source_lines_around_a_frame(self):
+        head = self.git("rev-parse", "HEAD")
+        got = json.loads(self.req(f"/api/source?rev={head}&path=a.txt&line=2"))
+        self.assertEqual(got, {"path": "a.txt", "rev": head, "line": 2, "start": 1, "total": 3,
+                               "lines": ["one", "TWO", "three"]})
+        got = prv.read_source(self.repo, head, "a.txt", 99, 0)
+        self.assertEqual((got["line"], got["start"], got["lines"]), (3, 3, ["three"]))  # clamped to the last line
+        self.write_commit("bin.dat", "a\0b", "binary")
+        os.symlink("/etc/passwd", os.path.join(self.root, "link"))
+        self.git("add", "link"); self.git("commit", "-qm", "link")
+        top = self.git("rev-parse", "HEAD")
+        # A symlink at a commit is a blob holding its target, never the file it points to.
+        self.assertEqual(prv.read_source(self.repo, top, "link", 1)["lines"], ["/etc/passwd"])
+        for q, why in [(f"rev={top}&path=bin.dat", "binary file"), (f"rev={top}&path=nope.txt", "no file nope.txt"),
+                       (f"rev={top}&path=../a.txt", "bad path"), (f"rev={top}&path=/etc/passwd", "bad path"),
+                       (f"rev={top}&path=.git/config", "no file .git/config"), (f"rev=HEAD&path=a.txt", "bad rev"),
+                       (f"rev={'f' * 40}&path=a.txt", ""), (f"rev={top}&path=a.txt&line=x", "bad line"),
+                       (f"rev={self.git('rev-parse', 'HEAD^{tree}')}&path=a.txt", "")]:
+            with self.assertRaises(urllib.error.HTTPError, msg=q) as cm:
+                self.req("/api/source?" + q)
+            with cm.exception as e:
+                self.assertEqual(e.code, 400, q)
+                self.assertIn(why, json.loads(e.read())["error"], q)
+        old = prv.MAX_DEF_BYTES
+        try:
+            prv.MAX_DEF_BYTES = 5
+            with self.assertRaisesRegex(prv.GitError, "too large"):
+                prv.read_source(self.repo, top, "a.txt", 1)
+        finally:
+            prv.MAX_DEF_BYTES = old
+
     def test_review_requests_are_checked(self):
         for body in ({"source": "nope"}, {"source": ["claude"]}, {}, {"source": "claude", "model": "gpt"}):
             with self.assertRaises(urllib.error.HTTPError) as cm:
@@ -3629,6 +3783,13 @@ class ServerTest(unittest.TestCase):
         prompt = self.fake_calls()[-1]["prompt"]
         self.assertIn("possible defect", prompt)
         self.assertIn("Claude finding (high): T1", prompt)
+
+    def test_call_path_note_reaches_the_prompt_as_quoted_data(self):
+        a = {"view": "all", "path": None, "note": "Call path: P1\n1. main (main.cc:7)", "note_kind": "callpath"}
+        self.req("/api/ask", {"question": "right?", "model": "haiku", "anchor": a})
+        prompt = self.fake_calls()[-1]["prompt"]
+        self.assertIn("mapped this call stack", prompt)
+        self.assertIn("1. main (main.cc:7)", prompt)
 
     def test_prepare_job_cost_counts_the_range_notes_when_line_notes_stop(self):
         self.add_b()
@@ -3910,6 +4071,46 @@ class ServerTest(unittest.TestCase):
         for bad in ("nan", "inf", "0", "-1"):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 self.run_cli("master", "--max-budget-usd", bad)
+
+    def test_callpaths_cli(self):
+        cwd = os.getcwd()
+        try:
+            os.chdir(self.root)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(prv.main(["callpaths", "master", "--claude", self.fake, "--commits"]), 0)
+                self.assertEqual(prv.main(["callpaths", "master", "--claude", self.fake, "--commits"]), 0)  # none left
+                self.assertEqual(prv.main(["callpaths", "master", "--claude", self.fake, "--max-budget-usd", "3"]), 0)
+                self.assertEqual(prv.main(["callpaths", "master", "--claude", "/bin/false"]), 1)
+        finally:
+            os.chdir(cwd)
+        self.assertEqual([c["argv"][c["argv"].index("--max-budget-usd") + 1] if "--max-budget-usd" in c["argv"] else None
+                          for c in self.fake_calls()], [None, "3.0"])  # one commit, then the range
+        head = self.git("rev-parse", "HEAD")
+        self.assertEqual(self.callpaths(head)["doc"]["summary"], "CP commit")
+        self.assertEqual(self.callpaths()["doc"]["summary"], "CP range")
+
+    def test_callpaths_cli_replaces_a_bad_file(self):
+        os.makedirs(os.path.dirname(self.cp.path), exist_ok=True)
+        with open(self.cp.path, "w") as fh:
+            fh.write("{}")
+        cwd = os.getcwd()
+        try:
+            os.chdir(self.root)
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(prv.main(["callpaths", "master", "--claude", self.fake, "--commits"]), 0)
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(self.callpaths(self.git("rev-parse", "HEAD"))["doc"]["summary"], "CP commit")
+
+    def test_callpaths_failed_save_leaves_the_stored_doc_alone(self):
+        self.assertEqual(json.loads(self.req("/api/callpaths", {})), {"started": True})
+        self.wait_callpaths()
+        old = self.cp.load()
+        with mock.patch.object(self.cp, "save", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.cp._store("pid", {"x": 1})
+        self.assertEqual(self.cp.load(), old)
+        self.assertNotIn("pid", self.cp.load()["commits"])
 
     def test_cli_sigterm_kills_claude(self):
         pidfile = os.path.join(self.root, ".git", "claude.pid")

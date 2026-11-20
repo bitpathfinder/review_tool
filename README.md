@@ -16,6 +16,12 @@ to answer.
   lines they explain. Run from the page, or with `prv explain` (`prv explain --commits` for line notes).
 - **AI review.** A Claude review (Fable by default) that reports defects with a failure scenario.
   Each finding shows next to its lines; **Discuss** opens a thread about it.
+- **Call paths.** Claude walks the callers of the changed code and lists call stacks from an entry point
+  (a request handler, a timer, main, a test) down to each change, plus a diagram of the components the
+  change touches. Each stack shows next to its changed lines. Click a frame or a diagram box to open its
+  line: in the diff, or in a read-only source popup for a file the view does not change. **Map call
+  paths** in "All changes" maps the whole range, in a commit view that commit; `prv callpaths`
+  (`--commits` for each commit) does the same from the shell. Sonnet by default.
 - **Qodo review.** Runs `qodo review` and shows its findings the same way, when the
   [qodo CLI](https://www.qodo.ai/) is installed.
 - **GitHub.** Links to the PR and its Jira issues, and the PR's review comments under their lines,
@@ -33,7 +39,8 @@ to answer.
 - **Go to a definition.** Ctrl-click (Cmd-click on a Mac) a name in the code to jump to where the
   files of the view define or declare it, opening "Whole file" when needed. Several matches show a
   list, those in the clicked file first. **← Back** in the header (key `b`) returns to where you clicked.
-  Found with [Universal Ctags](https://ctags.io/) (`ctags`).
+  Found with [Universal Ctags](https://ctags.io/) (`ctags`). Ctrl-click works in the source popup too,
+  but finds only definitions in the files of the view.
 - Split or unified diff, whole-file view, Viewed marks, light and dark themes. **↑** and **↓** in the
   header (keys `p` and `n`) jump to the previous or next change shown, across files and inside a whole file.
   Drag the edge of the side panel or of the notes column to change that panel's width; a double-click
@@ -117,7 +124,7 @@ Run it again to bring the checkout up to date: a fast-forward is applied, and a 
 keeps the old tip on a branch `pr12345-old-<sha>`. Local changes stop the update instead of being
 lost. A PR already merged into its base branch is reviewed against the base commit GitHub reports
 for it, so its own commits show. Explanations and line notes are written in the background unless
-you pass `--no-explain`.
+you pass `--no-explain`. So are the call paths of the whole range (not per commit, which would cost one run per commit).
 The checkout skips Git LFS downloads (ScyllaDB's LFS files are PGO profiles that review does not need).
 
 **Pull** in the header does the same update while prv runs, then serves the range from the new fork
@@ -182,12 +189,14 @@ through `prv.py git`, a wrapper that refuses options that write files or run pro
 `--setting-sources user`, so a reviewed branch's `.claude/settings.json` cannot change Claude's
 permissions. "Allow edits" in the question box lets Claude edit files (never commit).
 
-There is no cost cap by default. Pass `--max-budget-usd` to `prv explain` or `prv new_review` to set one.
+There is no cost cap by default. Pass `--max-budget-usd` to `prv explain`, `prv callpaths` or `prv new_review`
+to set one. `prv new_review` applies the cap to the explanations and to the call paths separately, so the two
+together can cost twice the cap. `prv callpaths --commits` applies it to each commit's run.
 
 ## Files
 
 Everything prv writes for a checkout lives in `<git-dir>/prv/`: threads, explanations, review
-findings, the ids of its Claude sessions and the cached GitHub data.
+findings, call paths, the ids of its Claude sessions and the cached GitHub data.
 
 ## Tests
 
@@ -198,8 +207,9 @@ python3 -m unittest test_prv.py
 ## Third-party code
 
 `vendor/` holds [highlight.js](https://highlightjs.org/) (BSD-3-Clause),
-[marked](https://marked.js.org/) (MIT) and [DOMPurify](https://github.com/cure53/DOMPurify)
-(Apache-2.0 or MPL-2.0), each with its license header.
+[marked](https://marked.js.org/) (MIT), [DOMPurify](https://github.com/cure53/DOMPurify)
+(Apache-2.0 or MPL-2.0) and [Mermaid](https://mermaid.js.org/) 11.4.1 (MIT), each with its license header.
+The page loads Mermaid only when it draws a diagram.
 
 ## License
 
