@@ -13,7 +13,7 @@ usage() {
 Usage: ./install.sh [--deps] [--dev] [--reference PATH] [--repo OWNER/NAME]
        ./install.sh --uninstall
 
-  --deps              install the missing tools prv uses: git, python3, gh and Universal Ctags with the
+  --deps              install the missing tools prv uses: git, python3, Universal Ctags and gh with the
                       system package manager (apt-get, dnf, zypper, pacman or brew; sudo when not root),
                       and Claude Code with its installer (https://claude.ai/install.sh)
   --dev               link \`prv\` to this checkout instead of copying it: edits take effect at once
@@ -81,7 +81,14 @@ fi
 [ -z "$repo" ] || [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repo must be OWNER/NAME"
 
 have_python() { command -v python3 >/dev/null && python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))'; }
-have_ctags() { case "$(ctags --version 2>/dev/null || true)" in *"Universal Ctags"*"+json"*) return 0 ;; esac; return 1; }
+# Debian's universal-ctags installs ctags-universal, and ctags may still be an Exuberant Ctags; prv tries both.
+have_ctags() {
+    local c
+    for c in ctags ctags-universal; do
+        case "$($c --version 2>/dev/null || true)" in *"Universal Ctags"*"+json"*) return 0 ;; esac
+    done
+    return 1
+}
 have_claude() { command -v claude >/dev/null || [ -x "$HOME/.local/bin/claude" ]; }
 
 # --deps: the tools from the system package manager; Claude Code from its own installer, into $HOME.
@@ -104,7 +111,7 @@ install_deps() {
     have_python || need="$need $(pkg python)"
     have_claude || command -v curl >/dev/null || opt="$opt $(pkg curl)"
     command -v gh >/dev/null || opt="$opt $(pkg gh)"
-    have_ctags || opt="$opt $(pkg ctags)"
+    have_ctags || need="$need $(pkg ctags)"
     run_pm() {
         case $pm in
             apt-get) $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$@" ;;
@@ -114,8 +121,8 @@ install_deps() {
             brew) brew install "$@" ;;
         esac
     }
-    # Claude Code needs no package manager or root. Without them, a missing git or python3 stops the install;
-    # a missing gh, ctags or curl (for Claude Code), which are optional, is a warning.
+    # Claude Code needs no package manager or root. Without them, a missing git, python3 or ctags stops the
+    # install; a missing gh or curl (for Claude Code) is a warning.
     if [ -z "$pm" ]; then
         why="no apt-get, dnf, zypper, pacman or brew"
     elif [ "$pm" != brew ] && [ "$(id -u)" != 0 ]; then
@@ -127,8 +134,13 @@ install_deps() {
     elif [ -n "$need$opt" ]; then
         say "installing with $pm:$need$opt"
         [ "$pm" != apt-get ] || $sudo apt-get update -q || [ -z "$need" ] || die "apt-get update failed"
-        # shellcheck disable=SC2086 # word lists
-        [ -z "$need" ] || run_pm $need || die "$pm could not install$need"
+        # One at a time: a release without universal-ctags must not keep git and python3 from installing,
+        # and the error names the missing package.
+        for p in $need; do
+            run_pm "$p" || die "$pm could not install $p"
+        done
+        # Some releases (RHEL 8) package only Exuberant Ctags, which has no JSON output.
+        have_ctags || die "--deps: $pm installed no Universal Ctags with JSON output; install it from https://github.com/universal-ctags/ctags"
         # One at a time: an older release may lack gh, which must not stop the others.
         for p in $opt; do
             run_pm "$p" || case $p in
@@ -185,7 +197,7 @@ fi
 command -v gh >/dev/null || { missing=1
     say "warning: gh (GitHub CLI) is not on PATH: no GitHub comments, and \`prv new_review\` will not work"; }
 have_ctags || { missing=1
-    say "note: Universal Ctags with JSON output (ctags) is not installed: Ctrl-click on a name cannot jump to its definition (optional)"; }
+    say "warning: Universal Ctags with JSON output (ctags) is not installed: Ctrl-click on a name cannot jump to its definition"; }
 [ "$missing" = 0 ] || [ "$deps" = 1 ] || say "./install.sh --deps installs the missing tools"
 command -v qodo >/dev/null || [ -x "$HOME/.qodo/bin/qodo" ] ||
     say "note: qodo is not installed: the Qodo review button is hidden (optional, https://www.qodo.ai/)"
