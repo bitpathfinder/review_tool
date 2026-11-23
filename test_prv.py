@@ -1884,7 +1884,10 @@ class InstallTest(unittest.TestCase):
                     if k not in ("PRV_HOME", "PRV_BIN", "XDG_CONFIG_HOME")}
         self.env["HOME"] = self.home
 
-    def install(self, *args, cwd=None, env=None):
+    def install(self, *args, cwd=None, env=None, tools=False):
+        """tools: install.sh installs missing tools, its default. Off, it gets a leading --no-deps, so a test
+        never runs the real package manager or Claude Code installer."""
+        args = args if tools else ("--no-deps", *args)
         return subprocess.run([os.path.join(self.src, "install.sh"), *args], cwd=cwd or self.root,
                               env={**self.env, **(env or {})}, capture_output=True, text=True)
 
@@ -1929,7 +1932,7 @@ class InstallTest(unittest.TestCase):
                 fh.write("#!/bin/bash\n" + body + "\n")
             os.chmod(os.path.join(fake, name), 0o755)
 
-    def test_deps_installs_missing_tools(self):
+    def test_installs_missing_tools_by_default(self):
         # A PATH with the basics and none of gh, ctags or claude; apt-get, sudo and curl are fakes.
         fake = self.basic_path()
         log = os.path.join(self.root, "deps.log")
@@ -1942,7 +1945,7 @@ class InstallTest(unittest.TestCase):
             "curl": 'echo "curl $*" >> "$LOG"; ' + self.CLAUDE_INSTALLER,
         }
         self.write_scripts(fake, scripts)
-        r = self.install("--deps", env={"PATH": fake, "LOG": log, "FAKE": fake})
+        r = self.install(env={"PATH": fake, "LOG": log, "FAKE": fake}, tools=True)  # no flag: the default
         self.assertEqual(r.returncode, 0, r.stderr)
         with open(log) as fh:
             calls = fh.read()
@@ -1955,7 +1958,7 @@ class InstallTest(unittest.TestCase):
         self.assertNotIn("Universal Ctags with JSON output (ctags) is not installed", r.stdout)
         self.assertNotIn("claude (Claude Code CLI) is not installed", r.stdout)
         self.assertIn("which is not on PATH: prv cannot find it", r.stdout)  # prv looks up claude on PATH
-        self.assertNotIn("./install.sh --deps installs the missing tools", r.stdout)  # gh failed, but --deps ran
+        self.assertNotIn("install the missing tools", r.stdout)  # gh failed, but the install already tried it
         self.assertEqual(os.readlink(self.link), os.path.join(self.home, ".local", "share", "prv", "prv.py"))
 
     def test_deps_installs_claude_without_a_package_manager(self):
@@ -1967,7 +1970,7 @@ class InstallTest(unittest.TestCase):
             "curl": self.CLAUDE_INSTALLER,
         }
         self.write_scripts(fake, scripts)
-        r = self.install("--deps", env={"PATH": fake})
+        r = self.install("--deps", env={"PATH": fake}, tools=True)  # --deps, the default, still parses
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertTrue(os.access(os.path.join(self.bin, "claude"), os.X_OK))
 
@@ -1975,7 +1978,7 @@ class InstallTest(unittest.TestCase):
         # Claude Code is optional: no curl to fetch its installer is a warning, not a failed install.
         fake = self.basic_path()
         self.write_scripts(fake, {"gh": "exit 0", "ctags": 'echo "Universal Ctags 6.0, +json"'})
-        r = self.install("--deps", env={"PATH": fake})
+        r = self.install(env={"PATH": fake}, tools=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("install curl yourself", r.stdout)
         self.assertIn("no curl to install Claude Code with", r.stdout)
@@ -1992,7 +1995,7 @@ class InstallTest(unittest.TestCase):
         fake = self.basic_path()
         self.write_scripts(fake, {"ctags": 'echo "Universal Ctags 6.0, +json"'})
         self.fake_claude()
-        r = self.install("--deps", env={"PATH": fake})
+        r = self.install(env={"PATH": fake}, tools=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("no apt-get, dnf, zypper, pacman or brew; install gh yourself", r.stdout)
         self.assertEqual(os.readlink(self.link), os.path.join(self.home, ".local", "share", "prv", "prv.py"))
@@ -2006,35 +2009,69 @@ class InstallTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("Universal Ctags with JSON output (ctags) is not installed", r.stdout)
 
-    def test_deps_needs_universal_ctags(self):
-        # Go to definition needs Universal Ctags: --deps stops when the package manager cannot provide it.
+    def test_ctags_that_cannot_be_installed_is_a_warning(self):
+        # Installs what it can: no package manager for ctags still installs prv, with a warning.
+        ctags_warning = "Universal Ctags with JSON output (ctags) is not installed"
         fake = self.basic_path()
         self.fake_claude()
-        r = self.install("--deps", env={"PATH": fake})
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("no apt-get, dnf, zypper, pacman or brew; install ctags yourself", r.stderr)
-        self.assertFalse(os.path.lexists(self.link))
+        r = self.install(env={"PATH": fake}, tools=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no apt-get, dnf, zypper, pacman or brew; install gh ctags yourself", r.stdout)
+        self.assertIn(ctags_warning, r.stdout)
+        self.assertTrue(os.path.lexists(self.link))
         # Installed, but the package is an Exuberant Ctags without JSON output (RHEL 8).
         self.write_scripts(fake, {"sudo": 'exec "$@"', "apt-get": 'case " $* " in *" universal-ctags "*) '
                                   'printf \'#!/bin/sh\\necho "Exuberant Ctags 5.9"\\n\' > "$FAKE/ctags"; '
                                   'chmod +x "$FAKE/ctags" ;; esac'})
-        r = self.install("--deps", env={"PATH": fake, "FAKE": fake})
+        r = self.install(env={"PATH": fake, "FAKE": fake}, tools=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.path.exists(os.path.join(fake, "ctags")))  # apt-get ran and installed it
+        self.assertIn(ctags_warning, r.stdout)
+
+    def test_git_that_cannot_be_installed_stops_the_install(self):
+        # prv cannot run without git: no package manager to install it stops before prv is installed.
+        fake = self.basic_path()
+        os.remove(os.path.join(fake, "git"))
+        self.fake_claude()
+        self.write_scripts(fake, {"gh": "exit 0", "ctags": 'echo "Universal Ctags 6.0, +json"'})
+        r = self.install(env={"PATH": fake}, tools=True)
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("installed no Universal Ctags with JSON output", r.stderr)
+        self.assertIn("no apt-get, dnf, zypper, pacman or brew; install git yourself", r.stderr)
         self.assertFalse(os.path.lexists(self.link))
 
+    def test_failed_claude_installer_is_a_warning(self):
+        fake = self.basic_path()
+        self.write_scripts(fake, {"gh": "exit 0", "ctags": 'echo "Universal Ctags 6.0, +json"', "curl": "exit 22"})
+        r = self.install(env={"PATH": fake}, tools=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("warning: the Claude Code installer failed", r.stdout)
+        self.assertIn("claude (Claude Code CLI) is not installed", r.stdout)
+        self.assertTrue(os.path.lexists(self.link))
+
+    def test_failed_apt_get_update_still_installs_optional_tools(self):
+        fake = self.basic_path()
+        self.fake_claude()
+        log = os.path.join(self.root, "deps.log")
+        self.write_scripts(fake, {"sudo": 'exec "$@"', "ctags": 'echo "Universal Ctags 6.0, +json"',
+                                  "apt-get": 'echo "apt-get $*" >> "$LOG"; [ "$1" != update ]'})
+        r = self.install(env={"PATH": fake, "LOG": log}, tools=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("warning: apt-get update failed", r.stdout)
+        with open(log) as fh:
+            self.assertIn("apt-get install -y -q gh", fh.read())
+
     def test_deps_installs_git_when_the_release_has_no_universal_ctags(self):
-        # Debian 10 has no universal-ctags: git still installs, and the error names the missing package.
+        # Debian 10 has no universal-ctags: git still installs, and the warning names the missing package.
         fake = self.basic_path()
         os.remove(os.path.join(fake, "git"))
         self.fake_claude()
         self.write_scripts(fake, {"sudo": 'exec "$@"', "apt-get": f'case " $* " in *" universal-ctags "*) exit 100 ;; '
                                   f'*" git "*) ln -s {shutil.which("git")} "$FAKE/git" ;; esac'})
-        r = self.install("--deps", env={"PATH": fake, "FAKE": fake})
-        self.assertNotEqual(r.returncode, 0)
-        self.assertIn("apt-get could not install universal-ctags", r.stderr)
+        r = self.install(env={"PATH": fake, "FAKE": fake}, tools=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("apt-get could not install universal-ctags", r.stdout)
         self.assertTrue(os.path.lexists(os.path.join(fake, "git")))
-        self.assertFalse(os.path.lexists(self.link))
+        self.assertTrue(os.path.lexists(self.link))
 
     def test_deps_installs_nothing_when_the_link_is_in_the_way(self):
         fake = self.basic_path()
@@ -2043,7 +2080,7 @@ class InstallTest(unittest.TestCase):
                                   "curl": 'echo "curl $*" >> "$LOG"'})
         os.makedirs(self.bin)
         os.symlink("/usr/bin/true", self.link)
-        r = self.install("--deps", env={"PATH": fake, "LOG": log})
+        r = self.install(env={"PATH": fake, "LOG": log}, tools=True)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not to prv", r.stderr)
         self.assertFalse(os.path.exists(log), "a package manager or installer ran")
@@ -2056,16 +2093,21 @@ class InstallTest(unittest.TestCase):
         os.makedirs(os.path.dirname(self.config))
         with open(self.config, "w") as fh:
             fh.write("[1]")
-        r = self.install("--deps", "--repo", "o/r", env={"PATH": fake, "LOG": log})
+        r = self.install("--repo", "o/r", env={"PATH": fake, "LOG": log}, tools=True)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("not a JSON object", r.stderr)
         self.assertFalse(os.path.exists(log), "a package manager or installer ran")
 
-    def test_without_deps_points_to_it(self):
+    def test_no_deps_points_to_the_default(self):
+        # --no-deps runs no package manager or installer, even with all of them on PATH.
         fake = self.basic_path()
-        r = self.install(env={"PATH": fake})
+        log = os.path.join(self.root, "deps.log")
+        self.write_scripts(fake, {"sudo": 'echo "sudo $*" >> "$LOG"', "apt-get": 'echo "apt-get $*" >> "$LOG"',
+                                  "curl": 'echo "curl $*" >> "$LOG"'})
+        r = self.install("--no-deps", env={"PATH": fake, "LOG": log}, tools=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("./install.sh --deps installs the missing tools", r.stdout)
+        self.assertIn("run ./install.sh without --no-deps to install the missing tools", r.stdout)
+        self.assertFalse(os.path.exists(log), "a package manager or installer ran")
 
     def test_foreign_link_is_kept(self):
         os.makedirs(self.bin)

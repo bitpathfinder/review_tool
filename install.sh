@@ -10,12 +10,14 @@ CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/prv/config.json"
 
 usage() {
     cat <<EOF
-Usage: ./install.sh [--deps] [--dev] [--reference PATH] [--repo OWNER/NAME]
+Usage: ./install.sh [--no-deps] [--dev] [--reference PATH] [--repo OWNER/NAME]
        ./install.sh --uninstall
 
-  --deps              install the missing tools prv uses: git, python3, Universal Ctags and gh with the
-                      system package manager (apt-get, dnf, zypper, pacman or brew; sudo when not root),
-                      and Claude Code with its installer (https://claude.ai/install.sh)
+  By default install.sh first installs the missing tools prv uses: git, python3, Universal Ctags and gh
+  with the system package manager (apt-get, dnf, zypper, pacman or brew; sudo when not root), and
+  Claude Code with its installer (https://claude.ai/install.sh). A tool it cannot install is a warning,
+  except git and python3.
+  --no-deps           install nothing but prv; only check the tools and warn about missing ones
   --dev               link \`prv\` to this checkout instead of copying it: edits take effect at once
   --reference PATH    a local clone of the reviewed repository; \`prv new_review\` clones from it
                       with hardlinks, so a new checkout takes seconds instead of a full GitHub clone
@@ -30,10 +32,11 @@ EOF
 say() { printf 'install.sh: %s\n' "$*"; }
 die() { say "$*" >&2; exit 1; }
 
-deps=0 dev=0 uninstall=0 reference='' repo=''
+deps=1 dev=0 uninstall=0 reference='' repo=''
 while [ $# -gt 0 ]; do
     case $1 in
-        --deps) deps=1 ;;
+        --deps) deps=1 ;;  # the default; kept so older instructions still work
+        --no-deps) deps=0 ;;
         --dev) dev=1 ;;
         --uninstall) uninstall=1 ;;
         --reference) [ $# -ge 2 ] || die "--reference needs a path"; reference=$2; shift ;;
@@ -91,7 +94,7 @@ have_ctags() {
 }
 have_claude() { command -v claude >/dev/null || [ -x "$HOME/.local/bin/claude" ]; }
 
-# --deps: the tools from the system package manager; Claude Code from its own installer, into $HOME.
+# The tools from the system package manager; Claude Code from its own installer, into $HOME.
 install_deps() {
     # Words, not arrays: macOS bash 3.2 with set -u calls an empty array unbound. No package name has a space.
     local pm='' c sudo='' need='' opt='' p why=''
@@ -111,7 +114,7 @@ install_deps() {
     have_python || need="$need $(pkg python)"
     have_claude || command -v curl >/dev/null || opt="$opt $(pkg curl)"
     command -v gh >/dev/null || opt="$opt $(pkg gh)"
-    have_ctags || need="$need $(pkg ctags)"
+    have_ctags || opt="$opt $(pkg ctags)"
     run_pm() {
         case $pm in
             apt-get) $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -q "$@" ;;
@@ -121,27 +124,27 @@ install_deps() {
             brew) brew install "$@" ;;
         esac
     }
-    # Claude Code needs no package manager or root. Without them, a missing git, python3 or ctags stops the
-    # install; a missing gh or curl (for Claude Code) is a warning.
+    # Installs what it can. Only a missing git or python3 stops the install: prv cannot run without them.
+    # Claude Code needs no package manager or root.
     if [ -z "$pm" ]; then
         why="no apt-get, dnf, zypper, pacman or brew"
     elif [ "$pm" != brew ] && [ "$(id -u)" != 0 ]; then
         if command -v sudo >/dev/null; then sudo=sudo; else why="$pm needs root, and sudo is not installed"; fi
     fi
     if [ -n "$need$opt" ] && [ -n "$why" ]; then
-        [ -z "$need" ] || die "--deps: $why; install$need yourself"
-        say "warning: --deps: $why; install$opt yourself"
+        [ -z "$need" ] || die "$why; install$need yourself"
+        say "warning: $why; install$opt yourself"
     elif [ -n "$need$opt" ]; then
         say "installing with $pm:$need$opt"
-        [ "$pm" != apt-get ] || $sudo apt-get update -q || [ -z "$need" ] || die "apt-get update failed"
-        # One at a time: a release without universal-ctags must not keep git and python3 from installing,
-        # and the error names the missing package.
+        if [ "$pm" = apt-get ] && ! $sudo apt-get update -q; then
+            [ -z "$need" ] || die "apt-get update failed"
+            say "warning: apt-get update failed; installing from the old package lists"
+        fi
+        # One at a time, so the error names the package that failed.
         for p in $need; do
             run_pm "$p" || die "$pm could not install $p"
         done
-        # Some releases (RHEL 8) package only Exuberant Ctags, which has no JSON output.
-        have_ctags || die "--deps: $pm installed no Universal Ctags with JSON output; install it from https://github.com/universal-ctags/ctags"
-        # One at a time: an older release may lack gh, which must not stop the others.
+        # One at a time: an older release may lack gh or universal-ctags, which must not stop the others.
         for p in $opt; do
             run_pm "$p" || case $p in
                 gh | github-cli) say "warning: $pm could not install $p; see https://github.com/cli/cli#installation" ;;
@@ -150,14 +153,14 @@ install_deps() {
         done
     fi
     if ! have_claude && ! command -v curl >/dev/null; then
-        say "warning: --deps: no curl to install Claude Code with"
+        say "warning: no curl to install Claude Code with"
     elif ! have_claude; then
         say "installing Claude Code from https://claude.ai/install.sh"
-        curl -fsSL https://claude.ai/install.sh | bash || die "the Claude Code installer failed"
+        curl -fsSL https://claude.ai/install.sh | bash || say "warning: the Claude Code installer failed"
     fi
 }
 [ -f "$SRC/prv.py" ] && [ -d "$SRC/vendor" ] || die "run install.sh from the prv checkout"
-# Before --deps: a link in the way must stop the install before any package is installed.
+# Before the tools: a link in the way must stop the install before any package is installed.
 if [ -e "$link" ] && [ ! -L "$link" ]; then
     die "$link exists and is not a link; move it away first"
 fi
@@ -170,7 +173,7 @@ check_config() {
         python3 -c 'import json, sys; sys.exit(not isinstance(json.load(open(sys.argv[1])), dict))' "$CONFIG" \
             2>/dev/null || die "$CONFIG is not a JSON object; fix or remove it"
 }
-# Before --deps too, when python3 can check it already: a broken config must not follow installed packages.
+# Before the tools too, when python3 can check it already: a broken config must not follow installed packages.
 [ "$deps" = 0 ] || ! have_python || check_config
 [ "$deps" = 0 ] || install_deps
 
@@ -197,8 +200,8 @@ fi
 command -v gh >/dev/null || { missing=1
     say "warning: gh (GitHub CLI) is not on PATH: no GitHub comments, and \`prv new_review\` will not work"; }
 have_ctags || { missing=1
-    say "warning: Universal Ctags with JSON output (ctags) is not installed: Ctrl-click on a name cannot jump to its definition"; }
-[ "$missing" = 0 ] || [ "$deps" = 1 ] || say "./install.sh --deps installs the missing tools"
+    say "warning: Universal Ctags with JSON output (ctags) is not installed: Ctrl-click on a name cannot jump to its definition; see https://github.com/universal-ctags/ctags"; }
+[ "$missing" = 0 ] || [ "$deps" = 1 ] || say "run ./install.sh without --no-deps to install the missing tools"
 command -v qodo >/dev/null || [ -x "$HOME/.qodo/bin/qodo" ] ||
     say "note: qodo is not installed: the Qodo review button is hidden (optional, https://www.qodo.ai/)"
 

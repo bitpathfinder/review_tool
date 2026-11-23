@@ -101,13 +101,13 @@ The commit card in "Uncommitted changes":
    curl -fsSL https://claude.ai/install.sh | bash
    ```
 
-   Only git is needed for the next step: `./install.sh --deps` installs whatever is still missing.
+   Only git is needed for the next step: `./install.sh` installs whatever is still missing.
 2. Clone prv and install it:
 
    ```sh
    git clone https://github.com/bitpathfinder/review_tool.git
    cd review_tool
-   ./install.sh --deps
+   ./install.sh
    ```
 3. If install.sh says `~/.local/bin` is not on PATH, add it to your shell profile and open a new shell:
    `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc`.
@@ -124,14 +124,14 @@ The commit card in "Uncommitted changes":
 
 ## Install options
 
-`install.sh` copies prv to `~/.local/share/prv` and links `~/.local/bin/prv` to it. It checks the
-requirements and warns about missing optional tools. Options:
+`install.sh` first installs the missing tools: git, python3, Universal Ctags and gh with the system
+package manager (apt-get, dnf, zypper, pacman or brew, with sudo when not root), and Claude Code with its
+installer (`curl -fsSL https://claude.ai/install.sh | bash`, into your home folder). It installs what it
+can and warns about the rest; only a missing git or python3 3.9 or newer stops it. The qodo CLI needs a
+Qodo account and is left to you. Then it copies prv to `~/.local/share/prv` and links `~/.local/bin/prv` to it.
+Options:
 
-- `--deps`: install the missing tools first: git, python3, Universal Ctags and gh with the system package
-  manager (apt-get, dnf, zypper, pacman or brew, with sudo when not root), and Claude Code with its
-  installer (`curl -fsSL https://claude.ai/install.sh | bash`, into your home folder). The install stops
-  when git, python3 or Universal Ctags with JSON output cannot be installed. The qodo CLI needs a Qodo
-  account and is left to you.
+- `--no-deps`: install nothing but prv; only check the tools and warn about missing ones.
 - `--dev`: link to the checkout instead of copying, so a `git pull` updates prv.
 - `--reference PATH`: optional, a local clone of the repository you review. `prv new_review` clones
   from it with hardlinks, which takes seconds instead of a full GitHub clone. Without one,
