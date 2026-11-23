@@ -83,12 +83,29 @@ The commit card in "Uncommitted changes":
 
 ## Install on a new machine
 
-1. If the repository is private, ask the owner to add you as a collaborator.
-2. Clone prv and install it with its dependencies. `--deps` asks for your sudo password when it
-   installs packages.
+1. Install the dependencies: git, Python 3.9 or newer, Universal Ctags, the GitHub CLI and Claude Code.
 
    ```sh
-   git clone https://github.com/bitpathfinder/review_tool.git   # or: gh repo clone bitpathfinder/review_tool
+   # Debian, Ubuntu
+   sudo apt-get update && sudo apt-get install -y git python3 universal-ctags gh curl
+   # Fedora
+   sudo dnf install -y git python3 ctags gh curl
+   # Arch
+   sudo pacman -S --needed git python ctags github-cli curl
+   # openSUSE
+   sudo zypper install git python3 ctags gh curl
+   # macOS
+   brew install git python universal-ctags gh
+
+   # Claude Code, into your home folder (no sudo)
+   curl -fsSL https://claude.ai/install.sh | bash
+   ```
+
+   Only git is needed for the next step: `./install.sh --deps` installs whatever is still missing.
+2. Clone prv and install it:
+
+   ```sh
+   git clone https://github.com/bitpathfinder/review_tool.git
    cd review_tool
    ./install.sh --deps
    ```
