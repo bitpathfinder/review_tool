@@ -1644,6 +1644,11 @@ class PageScriptTest(unittest.TestCase):
         names = re.findall(r"^(?:async )?function (\w+)\(", prv.PAGE, re.M)
         self.assertEqual([n for n in set(names) if names.count(n) > 1], [])
 
+    def test_hidden_attribute_hides_styled_elements(self):
+        # A class rule that sets display overrides the browser's [hidden]{display:none}, so `el.hidden = true`
+        # left the call path source popup on screen. The page's own rule must win over every class.
+        self.assertRegex(prv.PAGE, r"(?m)^\[hidden\]\{display:none!important\}")
+
 
 @unittest.skipUnless(shutil.which("node"), "needs node")
 class ChangeNavTest(unittest.TestCase):

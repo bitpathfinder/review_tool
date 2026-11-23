@@ -4557,6 +4557,8 @@ for (const [v, k] of Object.entries(PANELS)) {
 :root[data-theme="cb-dark"]{--bg:#0d1117;--bg2:#151b23;--fg:#e6edf3;--muted:#9198a1;--border:#3d444d;--accent:#4493f8;--addfg:#58a6ff;
 --addbg:#112a45;--addno:#1a4370;--delbg:#2c1d14;--delno:#5a3418;--hunk:#1c2128;--sel:#3a3417;--thread:#151b23;--err:#db6d28}
 *{box-sizing:border-box}
+/* A class rule that sets display would otherwise show an element with the hidden attribute. */
+[hidden]{display:none!important}
 body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif}
 header{position:sticky;top:0;z-index:5;display:flex;gap:12px;align-items:center;padding:8px 16px;background:var(--bg2);border-bottom:1px solid var(--border)}
 header .title{font-weight:600}
