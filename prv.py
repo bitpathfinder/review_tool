@@ -6,11 +6,12 @@ Usage: prv [--fetch] [--host H] [--port N] [--open] [--claude PATH] [BASE | BASE
        prv new_review PR [--no-explain] [--model M] [--host H] [--port N] [--open]
 
 Run inside a git repository. BASE defaults to the closest fork point of HEAD
-on master, main or branch-* of any remote (fewest commits wins; needs git 2.41+).
+on master, main or branch-* of any remote (fewest commits wins).
 Stdlib only; JS/CSS libraries are served from vendor/.
 `prv explain` writes review notes that the UI shows next to each hunk.
 """
 import argparse
+import concurrent.futures
 import contextlib
 import errno
 import fcntl
@@ -3819,6 +3820,23 @@ def base_rank(ref):
             0 if parts[-1] in ("master", "main") else 1, ref)
 
 
+def ahead_behind(root, patterns):
+    """(ahead, behind, ref) of each ref against HEAD. git before 2.41 has no %(ahead-behind),
+    so it gets one rev-list per ref (Ubuntu 22.04 ships git 2.34, Debian 12 git 2.39)."""
+    try:
+        out = git(root, "for-each-ref", "--format=%(ahead-behind:HEAD) %(refname)", *patterns)
+        return [(int(a), int(b), ref) for a, b, ref in (line.split(" ", 2) for line in out.splitlines())]
+    except GitError as e:
+        if "ahead-behind" not in str(e):
+            raise
+    def count(ref):
+        a, b = git(root, "rev-list", "--left-right", "--count", f"{ref}...HEAD").split()
+        return int(a), int(b), ref
+    # In parallel: scylladb's 73 base refs take 9.5 s one by one in a clone without a commit-graph, 2.1 s eight at a time.
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        return list(pool.map(count, git(root, "for-each-ref", "--format=%(refname)", *patterns).splitlines()))
+
+
 def default_base(root):
     """The fork point closest to HEAD among master, main and branch-* of every remote.
     Fewest commits wins: a fork's stale master or a backport's release branch would
@@ -3826,8 +3844,7 @@ def default_base(root):
     head = git(root, "rev-parse", "HEAD").strip()
     cur = git(root, "symbolic-ref", "-q", "HEAD", check=False).strip()
     on_base = cur in ("refs/heads/master", "refs/heads/main")
-    out = git(root, "for-each-ref", "--format=%(ahead-behind:HEAD) %(refname)", *BASE_REFS)
-    rows = [(int(a), int(b), ref) for a, b, ref in (line.split(" ", 2) for line in out.splitlines())]
+    rows = ahead_behind(root, BASE_REFS)
     def related(r):
         return bool(git(root, "merge-base", head, r, check=False).strip())
 
@@ -4229,15 +4246,25 @@ def checkout_pr(n, slug, parent, reference, gh, url):
         git(parent, "clone", "--no-checkout", *(["--local"] if local else []), reference if local else url, d)
     # No index: the first checkout never happened (a run stopped during the fetch), so finish it now.
     first = not os.path.exists(os.path.join(d, ".git", "index"))
-    if first:
-        # Review needs no PGO profiles; upstream's LFS server does not serve them anyway.
-        git(d, "config", "filter.lfs.smudge", "git-lfs smudge --skip -- %f")
-        git(d, "config", "filter.lfs.process", "git-lfs filter-process --skip")
-    else:
+    if not first:
         # Before any remote or fetch change: a checkout on another branch may be someone's work tree.
         cur = git(d, "branch", "--show-current", check=False).strip()
         if cur != branch:
             raise GitError(f"{d} is on branch {cur or '(detached)'}, not {branch}; switch to {branch} and run again")
+    if shutil.which("git-lfs"):
+        # Review needs no PGO profiles; upstream's LFS server does not serve them anyway. Every run: git-lfs
+        # installed after the first checkout brings its own filters. None drops an earlier run's no-git-lfs value.
+        lfs = {"smudge": "git-lfs smudge --skip -- %f", "process": "git-lfs filter-process --skip",
+               "clean": None, "required": None}
+    else:
+        # Empty filters, not unset ones: a `git lfs install` in ~/.gitconfig names the missing git-lfs
+        # with required=true, which fails the checkout. An earlier run's skip filters would fail it too.
+        lfs = {"smudge": "", "process": "", "clean": "", "required": "false"}
+    for key, value in lfs.items():
+        if value is None:
+            git(d, "config", "--unset-all", f"filter.lfs.{key}", check=False)
+        else:
+            git(d, "config", f"filter.lfs.{key}", value)
     if not git(d, "remote", "get-url", "upstream", check=False).strip():
         git(d, "remote", "add", "upstream", url)
     new = fetch_pr(d, n, base)

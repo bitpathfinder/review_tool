@@ -52,14 +52,19 @@ A finding from the AI review next to the lines it is about, and a GitHub review 
 
 ![An AI review finding beside the diff](docs/finding.png)
 
-A question about selected lines, with Claude's answer in the thread (light and dark theme):
+A question about selected lines, with Claude's answer in the thread:
 
 ![A question about lines and Claude's answer](docs/question.png)
-![The same thread in the dark theme](docs/question-dark.png)
 
 Line notes beside one commit's diff (`prv explain --commits`):
 
 ![Notes next to the lines they explain](docs/line-notes.png)
+
+Call paths (**Map call paths**): the components a change touches, and a call stack beside the changed
+lines it ends at. Each frame opens its line:
+
+![The call paths card with its component diagram](docs/callpaths.png)
+![A call stack beside the changed lines it ends at](docs/callpath-note.png)
 
 The commit card in "Uncommitted changes":
 
@@ -67,30 +72,51 @@ The commit card in "Uncommitted changes":
 
 ## Requirements
 
-- Linux (macOS should work but is untested), Python 3.9 or newer (standard library only), git. git 2.41 or newer lets prv
-  guess the base branch; with an older git, name it: `prv master`.
+- Linux (macOS should work but is untested), Python 3.9 or newer (standard library only), git.
+  "Changes since…" needs git 2.40 or newer. Tested on Fedora 43, Debian 12 (git 2.39) and Ubuntu 22.04 (git 2.34).
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude` on PATH, logged in) for
   questions, explanations and the AI review.
 - Optional: [GitHub CLI](https://cli.github.com/) (`gh`, logged in) for PR links, review comments
   and `prv new_review`; the qodo CLI for the Qodo review; Universal Ctags for go to definition.
+- git-lfs is not needed: without it, `prv new_review` checks LFS files out as their pointer files.
 
-## Install
+## Install on a new machine
 
-The repository is private: ask the owner to add you as a collaborator, then clone it with your
-GitHub login (`gh repo clone bitpathfinder/review_tool` works too).
+1. The repository is private: ask the owner to add you as a collaborator.
+2. Clone prv and install it with its dependencies. `--deps` asks for your sudo password when it
+   installs packages.
 
-```sh
-git clone https://github.com/bitpathfinder/review_tool.git
-cd review_tool
-./install.sh
-```
+   ```sh
+   git clone https://github.com/bitpathfinder/review_tool.git   # or: gh repo clone bitpathfinder/review_tool
+   cd review_tool
+   ./install.sh --deps
+   ```
+3. If install.sh says `~/.local/bin` is not on PATH, add it to your shell profile and open a new shell:
+   `echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc`.
+4. Log in once: `gh auth login` for GitHub, then `claude` for Claude Code.
+5. Review a PR. Any folder works; prv creates `PR_<N>/<repository name>` in it:
+
+   ```sh
+   mkdir -p ~/work && cd ~/work
+   prv new_review 12345          # --repo OWNER/NAME for another repository
+   ```
+
+   prv prints a URL: open it. The first clone of scylladb from GitHub, with its submodules, took
+   50 s in a test on a fast connection. A local scylladb clone and git-lfs are not needed.
+
+## Install options
 
 `install.sh` copies prv to `~/.local/share/prv` and links `~/.local/bin/prv` to it. It checks the
 requirements and warns about missing optional tools. Options:
 
+- `--deps`: install the missing tools first: git, python3, gh and Universal Ctags with the system package
+  manager (apt-get, dnf, zypper, pacman or brew, with sudo when not root), and Claude Code with its
+  installer (`curl -fsSL https://claude.ai/install.sh | bash`, into your home folder). The qodo CLI needs
+  a Qodo account and is left to you.
 - `--dev`: link to the checkout instead of copying, so a `git pull` updates prv.
-- `--reference PATH`: a local clone of the repository you review. `prv new_review` clones from it
-  with hardlinks, which takes seconds instead of a full GitHub clone.
+- `--reference PATH`: optional, a local clone of the repository you review. `prv new_review` clones
+  from it with hardlinks, which takes seconds instead of a full GitHub clone. Without one,
+  `prv new_review` clones from GitHub.
 - `--repo OWNER/NAME`: the GitHub repository for `prv new_review` (default `scylladb/scylladb`).
 - `--uninstall`: remove prv. The config file stays.
 

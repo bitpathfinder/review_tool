@@ -22,6 +22,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import prv
 
+GIT_VERSION = tuple(int(x) for x in re.findall(r"\d+", subprocess.run(
+    ["git", "--version"], capture_output=True, text=True).stdout)[:2])
+# Since views replay with `git merge-tree --merge-base`; prv reports the older git instead.
+needs_merge_tree = unittest.skipIf(GIT_VERSION < (2, 40), "needs git 2.40 for merge-tree --merge-base")
+
 
 # Git config from the tests alone: commit.gpgsign or a url.*.insteadOf in ~/.gitconfig, the system
 # config or `git -c` (GIT_CONFIG_PARAMETERS, GIT_CONFIG_COUNT) would change what git does in them.
@@ -622,6 +627,27 @@ class DefaultBaseTest(unittest.TestCase):
         self.assertEqual(prv.default_base(self.root), (head, "HEAD"))
 
 
+class DefaultBaseOldGitTest(DefaultBaseTest):
+    """git before 2.41 has no %(ahead-behind): the same choices from one rev-list per ref."""
+
+    def setUp(self):
+        super().setUp()
+        real = prv.git
+
+        def old_git(cwd, *args, **kw):
+            if any("ahead-behind" in a for a in args):
+                raise prv.GitError("fatal: unknown field name: ahead-behind:HEAD")
+            return real(cwd, *args, **kw)
+        patch = mock.patch.object(prv, "git", old_git)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_other_git_errors_still_raise(self):
+        with mock.patch.object(prv, "git", side_effect=prv.GitError("fatal: not a git repository")):
+            with self.assertRaises(prv.GitError):
+                prv.ahead_behind(self.root, prv.BASE_REFS)
+
+
 class FetchTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -932,10 +958,76 @@ class NewReviewTest(unittest.TestCase):
         self.assertEqual((d, base), (self.d, "upstream/master"))
         self.assertEqual(self.head(), (self.p1, "pr7"))
         self.assertIn("checked out pr7", out)
-        self.assertEqual(self.git(d, "config", "filter.lfs.smudge"), "git-lfs smudge --skip -- %f")
+        self.assert_lfs_skip(d)
         self.assertEqual(self.git(d, "remote", "get-url", "upstream"), self.up)
         self.assertEqual(self.git(d, "rev-parse", "upstream/master"), self.c1)
         self.assertEqual(self.git(d, "remote", "get-url", "origin"), self.reference)  # hardlinked local clone
+
+    def assert_lfs_skip(self, d):
+        """The skip filters where git-lfs is installed; empty, not required filters without it."""
+        def get(key):
+            return subprocess.run(["git", "config", key], cwd=d, capture_output=True, text=True).stdout.strip()
+        if shutil.which("git-lfs"):
+            self.assertEqual(get("filter.lfs.smudge"), "git-lfs smudge --skip -- %f")
+            self.assertEqual(get("filter.lfs.required"), "")
+        else:
+            self.assertEqual((get("filter.lfs.smudge"), get("filter.lfs.process")), ("", ""))
+            self.assertEqual(get("filter.lfs.required"), "false")
+
+    def tool_path(self, lfs):
+        """A PATH folder with git, python3 and, with lfs, a fake git-lfs that git never runs: no LFS files."""
+        bin_ = os.path.join(self.tmp.name, "withlfs" if lfs else "gitonly")
+        if os.path.isdir(bin_):  # a second call in one test
+            return bin_
+        os.makedirs(bin_)
+        for tool in ("git", "git-lfs") if lfs else ("git",):
+            os.symlink(shutil.which("git"), os.path.join(bin_, tool))
+        os.symlink(sys.executable, os.path.join(bin_, "python3"))  # the fake gh's interpreter
+        return bin_
+
+    def test_lfs_skip_filters_with_git_lfs(self):
+        with mock.patch.dict(os.environ, {"PATH": self.tool_path(lfs=True)}):
+            d = self.prepare()[0]
+            self.assert_lfs_skip(d)
+
+    def test_lfs_skip_filters_when_git_lfs_comes_later(self):
+        # git-lfs installed after the first checkout: its own filters would download on the next checkout.
+        with mock.patch.dict(os.environ, {"PATH": self.tool_path(lfs=False)}):
+            self.prepare()
+            self.assert_lfs_skip(self.d)
+        with mock.patch.dict(os.environ, {"PATH": self.tool_path(lfs=True)}):
+            self.prepare()
+            self.assert_lfs_skip(self.d)
+
+    def test_lfs_skip_filters_dropped_when_git_lfs_goes(self):
+        # git-lfs removed after the first checkout: the skip filters would fail the next checkout.
+        with mock.patch.dict(os.environ, {"PATH": self.tool_path(lfs=True)}):
+            self.prepare()
+        with mock.patch.dict(os.environ, {"PATH": self.tool_path(lfs=False)}):
+            self.prepare()
+            self.assert_lfs_skip(self.d)
+
+    def test_lfs_files_check_out_without_git_lfs(self):
+        # A PATH with git and no git-lfs, and the filters `git lfs install` writes to ~/.gitconfig.
+        self.git(self.up, "checkout", "-q", "feat")
+        with open(os.path.join(self.up, ".gitattributes"), "w") as fh:
+            fh.write("*.bin filter=lfs diff=lfs merge=lfs -text\n")
+        pointer = f"version https://git-lfs.github.com/spec/v1\noid sha256:{'0' * 64}\nsize 3\n"
+        with open(os.path.join(self.up, "a.bin"), "w") as fh:
+            fh.write(pointer)
+        self.git(self.up, "add", ".gitattributes", "a.bin")
+        self.git(self.up, "commit", "-qm", "lfs file")
+        self.set_pr(self.git(self.up, "rev-parse", "HEAD"))
+        self.git(self.up, "checkout", "-q", "master")
+        gitconfig = os.path.join(self.tmp.name, "gitconfig")
+        with open(os.environ["GIT_CONFIG_GLOBAL"]) as src, open(gitconfig, "w") as fh:
+            fh.write(src.read() + '[filter "lfs"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n'
+                     "\tprocess = git-lfs filter-process\n\trequired = true\n")
+        with mock.patch.dict(os.environ, {"PATH": self.tool_path(lfs=False), "GIT_CONFIG_GLOBAL": gitconfig}):
+            d = self.prepare()[0]
+            self.assert_lfs_skip(d)
+        with open(os.path.join(d, "a.bin")) as fh:
+            self.assertEqual(fh.read(), pointer)
 
     def test_up_to_date_fast_forward_and_rewrite(self):
         self.prepare()
@@ -1118,7 +1210,7 @@ class NewReviewTest(unittest.TestCase):
         self.git(self.parent, "clone", "-q", "--no-checkout", "--local", self.reference, self.d)
         self.assertIn("checked out pr7", self.prepare()[2])
         self.assertEqual(self.head(), (self.p1, "pr7"))
-        self.assertEqual(self.git(self.d, "config", "filter.lfs.smudge"), "git-lfs smudge --skip -- %f")
+        self.assert_lfs_skip(self.d)
 
     def test_rerun_from_inside_the_checkout_uses_its_parent(self):
         # Inside another PR's checkout too: the new clone must not land in that git tree.
@@ -1793,6 +1885,120 @@ class InstallTest(unittest.TestCase):
         self.assertTrue(os.path.exists(self.config))
         self.assertTrue(os.path.isdir(os.path.join(self.src, "vendor")))
 
+    def basic_path(self):
+        """A PATH folder with what install.sh needs and none of the optional tools."""
+        fake = os.path.join(self.root, "fakebin")
+        os.makedirs(fake)
+        for tool in ("bash", "env", "dirname", "cat", "readlink", "rm", "rmdir", "ls", "sed", "mkdir", "cp",
+                     "chmod", "ln", "id", "git", "python3"):
+            os.symlink(shutil.which(tool), os.path.join(fake, tool))
+        return fake
+
+    # Stands in for https://claude.ai/install.sh: curl prints it, bash runs it.
+    CLAUDE_INSTALLER = ('echo \'mkdir -p "$HOME/.local/bin"; printf "#!/bin/sh\\n" > "$HOME/.local/bin/claude"; '
+                        'chmod +x "$HOME/.local/bin/claude"\'')
+
+    def write_scripts(self, fake, scripts):
+        for name, body in scripts.items():
+            with open(os.path.join(fake, name), "w") as fh:
+                fh.write("#!/bin/bash\n" + body + "\n")
+            os.chmod(os.path.join(fake, name), 0o755)
+
+    def test_deps_installs_missing_tools(self):
+        # A PATH with the basics and none of gh, ctags or claude; apt-get, sudo and curl are fakes.
+        fake = self.basic_path()
+        log = os.path.join(self.root, "deps.log")
+        scripts = {
+            "sudo": 'echo "sudo $*" >> "$LOG"; exec "$@"',
+            # No gh in this release; universal-ctags installs a ctags with JSON output.
+            "apt-get": 'echo "apt-get $*" >> "$LOG"\ncase " $* " in *" gh "*) exit 100 ;; esac\n'
+                       'case " $* " in *" universal-ctags "*) printf \'#!/bin/sh\\necho "Universal Ctags 6.0, +json"\\n\' '
+                       '> "$FAKE/ctags"; chmod +x "$FAKE/ctags" ;; esac',
+            "curl": 'echo "curl $*" >> "$LOG"; ' + self.CLAUDE_INSTALLER,
+        }
+        self.write_scripts(fake, scripts)
+        r = self.install("--deps", env={"PATH": fake, "LOG": log, "FAKE": fake})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(log) as fh:
+            calls = fh.read()
+        self.assertIn("apt-get update -q", calls)
+        self.assertIn("apt-get install -y -q gh", calls)
+        self.assertIn("apt-get install -y -q universal-ctags", calls)
+        self.assertIn("curl -fsSL https://claude.ai/install.sh", calls)
+        self.assertTrue(os.access(os.path.join(self.bin, "claude"), os.X_OK))
+        self.assertIn("could not install gh", r.stdout)
+        self.assertNotIn("Universal Ctags with JSON output (ctags) is not installed", r.stdout)
+        self.assertNotIn("claude (Claude Code CLI) is not installed", r.stdout)
+        self.assertIn("which is not on PATH: prv cannot find it", r.stdout)  # prv looks up claude on PATH
+        self.assertNotIn("./install.sh --deps installs the missing tools", r.stdout)  # gh failed, but --deps ran
+        self.assertEqual(os.readlink(self.link), os.path.join(self.home, ".local", "share", "prv", "prv.py"))
+
+    def test_deps_installs_claude_without_a_package_manager(self):
+        # gh and ctags present, no apt-get and no sudo: only Claude Code is missing, which needs neither.
+        fake = self.basic_path()
+        scripts = {
+            "gh": "exit 0",
+            "ctags": 'echo "Universal Ctags 6.0, +json"',
+            "curl": self.CLAUDE_INSTALLER,
+        }
+        self.write_scripts(fake, scripts)
+        r = self.install("--deps", env={"PATH": fake})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(os.access(os.path.join(self.bin, "claude"), os.X_OK))
+
+    def test_deps_without_curl_or_a_package_manager_still_installs(self):
+        # Claude Code is optional: no curl to fetch its installer is a warning, not a failed install.
+        fake = self.basic_path()
+        self.write_scripts(fake, {"gh": "exit 0", "ctags": 'echo "Universal Ctags 6.0, +json"'})
+        r = self.install("--deps", env={"PATH": fake})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("install curl yourself", r.stdout)
+        self.assertIn("no curl to install Claude Code with", r.stdout)
+        self.assertEqual(os.readlink(self.link), os.path.join(self.home, ".local", "share", "prv", "prv.py"))
+
+    def test_deps_without_a_package_manager_still_installs(self):
+        # Only the optional gh and ctags are missing: no package manager is a warning, not a failed install.
+        fake = self.basic_path()
+        os.makedirs(os.path.join(self.home, ".local", "bin"))
+        with open(os.path.join(self.home, ".local", "bin", "claude"), "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(os.path.join(self.home, ".local", "bin", "claude"), 0o755)
+        r = self.install("--deps", env={"PATH": fake})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("no apt-get, dnf, zypper, pacman or brew; install gh ctags yourself", r.stdout)
+        self.assertEqual(os.readlink(self.link), os.path.join(self.home, ".local", "share", "prv", "prv.py"))
+
+    def test_deps_installs_nothing_when_the_link_is_in_the_way(self):
+        fake = self.basic_path()
+        log = os.path.join(self.root, "deps.log")
+        self.write_scripts(fake, {"sudo": 'echo "sudo $*" >> "$LOG"', "apt-get": 'echo "apt-get $*" >> "$LOG"',
+                                  "curl": 'echo "curl $*" >> "$LOG"'})
+        os.makedirs(self.bin)
+        os.symlink("/usr/bin/true", self.link)
+        r = self.install("--deps", env={"PATH": fake, "LOG": log})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not to prv", r.stderr)
+        self.assertFalse(os.path.exists(log), "a package manager or installer ran")
+
+    def test_deps_installs_nothing_when_the_config_is_broken(self):
+        fake = self.basic_path()
+        log = os.path.join(self.root, "deps.log")
+        self.write_scripts(fake, {"sudo": 'echo "sudo $*" >> "$LOG"', "apt-get": 'echo "apt-get $*" >> "$LOG"',
+                                  "curl": 'echo "curl $*" >> "$LOG"'})
+        os.makedirs(os.path.dirname(self.config))
+        with open(self.config, "w") as fh:
+            fh.write("[1]")
+        r = self.install("--deps", "--repo", "o/r", env={"PATH": fake, "LOG": log})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not a JSON object", r.stderr)
+        self.assertFalse(os.path.exists(log), "a package manager or installer ran")
+
+    def test_without_deps_points_to_it(self):
+        fake = self.basic_path()
+        r = self.install(env={"PATH": fake})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("./install.sh --deps installs the missing tools", r.stdout)
+
     def test_foreign_link_is_kept(self):
         os.makedirs(self.bin)
         os.symlink("/usr/bin/true", self.link)
@@ -1919,6 +2125,7 @@ class SinceTest(unittest.TestCase):
         return {prv.file_path(f): [(l["t"], l["s"]) for h in f["hunks"] for l in h["lines"] if l["t"] != " "]
                 for f in files}
 
+    @needs_merge_tree
     def test_since_view_leaves_out_the_base_changes(self):
         self.assertIn("a", self.git("diff", "--name-only", self.old, "HEAD"))  # what a plain diff would add
         d = self.repo.diff(prv.SINCE + self.old[:8])
@@ -1967,6 +2174,7 @@ class SinceTest(unittest.TestCase):
         self.assertEqual(len(quoted), 1)
         self.assertEqual(quoted[0]["patch"].split("\n")[1:], ["+    2:  ccccccc = 2:  ddddddd two", " -:  ------- > 3:  eeeeeee x"])
 
+    @needs_merge_tree
     def test_old_tip_on_a_newer_base(self):
         # The author rebased onto a newer master than HEAD's base; that master's changes are not the author's.
         self.git("checkout", "-q", "master")
@@ -1983,6 +2191,7 @@ class SinceTest(unittest.TestCase):
         self.assertEqual([(e["mark"], e["subject"]) for e in repo.range_diff(newer)],
                          [("=", "pr: a"), ("!", "pr: b [x] 'q'")])
 
+    @needs_merge_tree
     def test_rebase_after_prv_started(self):
         # self.repo's base is fixed; a rebase onto a newer master must still leave master's changes out.
         self.git("checkout", "-q", "master")
@@ -1997,6 +2206,7 @@ class SinceTest(unittest.TestCase):
         self.assertEqual([(e["mark"], e["subject"]) for e in self.repo.range_diff(tip)],
                          [("=", "pr: a"), ("!", "pr: b [x] 'q'")])
 
+    @needs_merge_tree
     def test_relative_base_label(self):
         # `prv HEAD~1`: the label is read again later, after a new commit moved what HEAD~1 names.
         repo = prv.Repo(self.root, self.sha("HEAD~1"), "HEAD", "HEAD~1")
@@ -2007,6 +2217,7 @@ class SinceTest(unittest.TestCase):
         self.assertEqual(self.changes(repo.diff(prv.SINCE + tip)["files"]), {"c": [("+", "c")]})
         self.assertEqual([e["mark"] for e in repo.range_diff(tip)], ["=", ">"])
 
+    @needs_merge_tree
     def test_conflicting_replay_leaves_the_file_out(self):
         # master rewrites the line the old tip changed in b; the new tip resolved it and changed a again.
         self.git("checkout", "-q", "master")
@@ -2022,6 +2233,7 @@ class SinceTest(unittest.TestCase):
         self.assertIn("conflicts in b;", d["message"])
         self.assertEqual([e["mark"] for e in repo.range_diff(self.old)], ["<", "<", ">"])
 
+    @needs_merge_tree
     def test_conflicting_replay_leaves_a_renamed_file_out(self):
         # The new tip renamed the conflicting file: the replayed file, with conflict markers,
         # pairs with the new name as a rename. Long lines, so the markers keep it similar enough.
@@ -2053,6 +2265,7 @@ class SinceTest(unittest.TestCase):
         fixed = prv.Repo(self.root, self.sha("HEAD"), "HEAD", "master")  # no commits in BASE..HEAD
         self.assertEqual([(e["mark"], e["new"]) for e in fixed.range_diff(self.old)], [("<", None)] * 2)
 
+    @needs_merge_tree
     def test_pruned_tree_is_rebuilt(self):
         d = self.repo.diff(prv.SINCE + self.old)
         tree = self.repo.since_tree(self.old)[1]
@@ -2176,6 +2389,7 @@ class SinceTest(unittest.TestCase):
         self.git("reset", "-q", "--hard", child)
         self.assertIn(tip, [t["sha"] for t in repo.since_tips()])
 
+    @needs_merge_tree
     def test_review_thread_on_a_changed_line(self):
         files = self.repo.diff(prv.SINCE + self.old)["files"]
         t = {"path": "b", "side": "RIGHT", "line": 5, "original_line": 5, "hunk": "@@ -4,2 +4,2 @@\n 4\n+FIVE"}
@@ -3704,6 +3918,7 @@ class ServerTest(unittest.TestCase):
         with open(self.qlog) as fh:
             self.assertEqual(len(fh.readlines()), 3)  # the refused runs never started qodo
 
+    @needs_merge_tree
     def test_since_view_endpoints(self):
         old = prv.git(self.root, "rev-parse", "HEAD").strip()
         with open(os.path.join(self.root, "a.txt"), "w") as fh:
