@@ -798,6 +798,9 @@ class Store:
               and all(isinstance(m, dict) and "role" in m and isinstance(m.get("text", ""), str)
                       and isinstance(m.get("tools", []), list) for m in t["messages"])
               and isinstance(a, dict) and isinstance(a.get("view"), str)
+              # Names a folder: Snapshots.path() joins it.
+              and (t.get("tree") is None
+                   or isinstance(t["tree"], str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", t["tree"]))
               and (not a.get("path") or (isinstance(a["path"], str) and isinstance(a.get("start"), dict)
                                          and isinstance(a.get("end"), dict))))
         if not ok:
@@ -887,18 +890,26 @@ def record_session(git_dir, sid, kind, label):
         print(f"prv: cannot record claude session {sid}: {e}", file=sys.stderr)
 
 
-def claude_env():
+def claude_env(root=None):
     """The variables that pick where Claude Code keeps transcripts, if set: {name: value}. A resume command
-    needs them too, or `claude --resume` looks in ~/.claude and finds no such session."""
+    needs them too, or `claude --resume` looks in ~/.claude and finds no such session. root: the folder a
+    relative CLAUDE_CONFIG_DIR is in, for a claude started elsewhere, such as in a worktree."""
     config = os.environ.get("CLAUDE_CONFIG_DIR")
     if not config:
         return {}
+    if root:
+        config = os.path.join(root, config)
     # With CLAUDE_CONFIG_DIR set, Claude Code takes a valid CLAUDE_CODE_PROJECT_DIR_NAME as the folder name.
     override = os.environ.get("CLAUDE_CODE_PROJECT_DIR_NAME") or ""
     if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", override) and \
             not re.fullmatch(r"con|prn|aux|nul|com[0-9]|lpt[0-9]", override, re.I):
         return {"CLAUDE_CONFIG_DIR": config, "CLAUDE_CODE_PROJECT_DIR_NAME": override}
     return {"CLAUDE_CONFIG_DIR": config}
+
+
+def _project_name(path):
+    # Claude Code's regex works on UTF-16 units: a character past U+FFFF becomes "--" and counts as 2.
+    return re.sub(r"[^A-Za-z0-9]", lambda m: "--" if ord(m.group()) > 0xFFFF else "-", path)
 
 
 def claude_projects_dirs(root):
@@ -910,12 +921,25 @@ def claude_projects_dirs(root):
     projects = os.path.join(root, env.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "projects")
     if "CLAUDE_CODE_PROJECT_DIR_NAME" in env:
         return [os.path.join(projects, env["CLAUDE_CODE_PROJECT_DIR_NAME"])]
-    # Claude Code's regex works on UTF-16 units: a character past U+FFFF becomes "--" and counts as 2.
-    name = re.sub(r"[^A-Za-z0-9]", lambda m: "--" if ord(m.group()) > 0xFFFF else "-", root)
+    name = _project_name(root)
     if len(name) <= 200:
         return [os.path.join(projects, name)]
     try:  # the full name never exists, and past 255 characters listdir() fails on it
         return [os.path.join(projects, n) for n in sorted(os.listdir(projects)) if n.startswith(name[:200] + "-")]
+    except FileNotFoundError:
+        return []
+
+
+def claude_projects_subdirs(root, parent):
+    """Transcript folders of sessions started in a folder under parent, removed since or not. Raises OSError
+    like claude_projects_dirs()."""
+    env = claude_env(root)
+    if "CLAUDE_CODE_PROJECT_DIR_NAME" in env:
+        return []  # every session shares the one folder claude_projects_dirs() returns
+    projects = os.path.join(env.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"), "projects")
+    prefix = _project_name(parent + "/")[:200]
+    try:
+        return [os.path.join(projects, n) for n in sorted(os.listdir(projects)) if n.startswith(prefix)]
     except FileNotFoundError:
         return []
 
@@ -1014,8 +1038,9 @@ class Sessions:
         root = self.repo.root
         errors, found, seen = [], {}, set()
         try:
-            folders = claude_projects_dirs(root)
-        except OSError as e:  # the projects folder of a long root is unreadable
+            # A question about a committed view starts its session in a worktree of the commit.
+            folders = claude_projects_dirs(root) + claude_projects_subdirs(root, snapshot_dir(self.repo.git_dir))
+        except OSError as e:  # the projects folder is unreadable
             folders = []
             errors.append(f"{e.filename}: {e.strerror or e}")
         for folder in folders:
@@ -1040,10 +1065,12 @@ class Sessions:
             errors.append(f"{session_log_path(self.repo.git_dir)}: {e}")
         out["error"] = "; ".join(errors) or None
 
-        env = "".join(f"{k}={shlex.quote(v)} " for k, v in claude_env().items())
+        # Absolute: a resume command may cd to a worktree.
+        env = "".join(f"{k}={shlex.quote(v)} " for k, v in claude_env(root).items())
 
         def row(sid, info, extra):
-            cwd = info.get("cwd") or root
+            # claude --resume finds a session from any folder, and a removed worktree is no folder to cd to.
+            cwd = info.get("cwd") if info.get("cwd") and os.path.isdir(info["cwd"]) else root
             return {"id": sid, "cwd": cwd, "resume": f"cd {shlex.quote(cwd)} && {env}claude --resume {sid}",
                     "title": info.get("title") or "", "prompt": info.get("prompt") or "",
                     "headless": bool(info.get("headless")), "continued_in": info.get("continued_in"),
@@ -1075,8 +1102,9 @@ def system_prompt(edits):
     return s
 
 
-def anchor_context(repo, anchor):
-    """Describe the anchor (view + optional path/line range) for the first prompt."""
+def anchor_context(repo, anchor, tree=None):
+    """Describe the anchor (view + optional path/line range) for the first prompt. tree: the commit
+    checked out in claude's working directory, None when it runs in the reviewer's checkout."""
     view = anchor.get("view")
     lines = [f"Review range: {repo.base}..{repo.head} (base: {repo.base_label})."]
     if view == "all":
@@ -1087,8 +1115,8 @@ def anchor_context(repo, anchor):
         old = view[len(SINCE):]
         try:
             onto = repo.since_onto()
-            b, tree, _ = repo.since_tree(old, onto=onto)
-            cmp = (f" 'old' lines are the lines of `{GIT_CMD} show {tree}:<path>`. Compare commit by commit"
+            b, replayed, _ = repo.since_tree(old, onto=onto)
+            cmp = (f" 'old' lines are the lines of `{GIT_CMD} show {replayed}:<path>`. Compare commit by commit"
                    f" with `{GIT_CMD} range-diff {b}..{old} {onto}..{repo.head}`.")
         except GitError:
             cmp = ""
@@ -1097,6 +1125,8 @@ def anchor_context(repo, anchor):
                      f"so changes that came with the base are left out.{cmp}")
     else:
         lines.append(f"Current view: commit {view}. Inspect it with `{GIT_CMD} show {view}`.")
+    if tree:
+        lines.append(tree_note(repo, tree))
     path = anchor.get("path")
     if not path:
         lines.append("The question is about this view as a whole. Use git to inspect it.")
@@ -1106,7 +1136,7 @@ def anchor_context(repo, anchor):
     start, end = anchor.get("start") or {}, anchor.get("end") or {}
     lines.append(f"File: {path}, selected lines {start.get('side')}:{start.get('line')}"
                  f" to {end.get('side')}:{end.get('line')} ('new' = after the change, 'old' = before).")
-    if view != "wt":
+    if view != "wt" and not tree:
         lines.append("Note: the file in the working directory may differ from this view; "
                      f"use `{GIT_CMD} show <rev>:<path>` for the exact version.")
     excerpt = None
@@ -1119,6 +1149,17 @@ def anchor_context(repo, anchor):
     elif anchor.get("text"):
         lines.append("Selected text:\n```\n" + str(anchor["text"])[:4000] + "\n```")
     return "\n".join(lines + note_context(anchor))
+
+
+def tree_note(repo, tree):
+    return (f"Your working directory is a checkout of commit {tree}, the 'new' side of this view: Read, Grep, "
+            f"Glob and `{GIT_CMD} grep` see the files as that commit has them. Submodules are not checked out "
+            f"there. The reviewer's own checkout, {repo.root}, may differ.")
+
+
+def edit_note(repo, tree):
+    return (f"This turn runs in the reviewer's checkout, {repo.root}, so that you can edit files there. Its "
+            f"files may differ from commit {tree}; use `{GIT_CMD} show {tree}:<path>` for that commit's version.")
 
 
 def note_context(anchor):
@@ -1174,12 +1215,110 @@ def hunk_excerpt(files, path, start, end, cap=400, ctx=20):
 
 # ------------------------------------------------------------------- runner
 
+def snapshot_dir(git_dir):
+    return os.path.join(git_dir, "prv", "wt")
+
+
+class Snapshots:
+    """Detached worktrees of commits. A question about a committed view runs claude in one, so Read, Grep and
+    Glob see that commit's files: a file renamed later is still under its old name there. A thread's worktree
+    is <sha12>, kept while a thread uses it; an explain run's is x-<sha12>, removed when the run ends."""
+
+    def __init__(self, repo):
+        self.repo = repo
+        self.dir = snapshot_dir(repo.git_dir)
+        self.locks = self.dir + ".locks"
+        self.lock = threading.Lock()  # one checkout or removal at a time; two threads may ask on one commit
+
+    def path(self, sha):
+        return os.path.join(self.dir, sha[:12])
+
+    def ensure(self, sha):
+        """The worktree of sha, checked out first if missing or not at sha. Raises GitError or OSError."""
+        p = self.path(sha)
+        with self.lock:
+            self._check_out(p, sha)
+        return p
+
+    @contextlib.contextmanager
+    def scratch(self, sha):
+        """A worktree of sha for one explain run, removed after it. A file lock keeps a `prv explain` beside
+        the server off the same folder, and the server's prune() off a folder in use. Raises GitError or OSError."""
+        name = "x-" + sha[:12]
+        os.makedirs(self.locks, exist_ok=True)
+        with open(os.path.join(self.locks, name), "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            p = os.path.join(self.dir, name)
+            try:
+                self._check_out(p, sha)
+                yield p
+            finally:
+                self._remove(p)
+
+    def _check_out(self, p, sha):
+        # Without its .git file, git would find the repository holding self.dir and answer for it.
+        if os.path.isfile(os.path.join(p, ".git")):
+            at = git(p, "rev-parse", "--show-toplevel", "HEAD", check=False).splitlines()
+            if at == [os.path.realpath(p), sha]:
+                return
+        self._remove(p)
+        os.makedirs(self.dir, exist_ok=True)
+        # No hooks: post-checkout would run code of the reviewed branch. LFS files stay pointers, as in
+        # checkout_pr(), so neither git-lfs nor a download is needed. --force: a worktree removed by hand
+        # is still registered at p.
+        git(self.repo.root, "-c", f"core.hooksPath={os.devnull}", "-c", "filter.lfs.smudge=",
+            "-c", "filter.lfs.process=", "-c", "filter.lfs.required=false",
+            "worktree", "add", "--quiet", "--force", "--detach", p, sha)
+
+    def prune(self, keep):
+        """Removes the threads' worktrees of shas not in keep, a callable run under self.lock, so a thread that
+        ensure()s its worktree after the call is in keep, and explain worktrees no run holds, left by a prv
+        killed during the run."""
+        with self.lock:
+            shas = {s[:12] for s in keep() if s}
+            try:
+                names = os.listdir(self.dir)
+            except FileNotFoundError:
+                return
+            for n in names:
+                if not n.startswith("x-"):
+                    if n not in shas:
+                        self._remove(os.path.join(self.dir, n))
+                    continue
+                try:
+                    with open(os.path.join(self.locks, n), "a") as lk:
+                        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        self._remove(os.path.join(self.dir, n))
+                except BlockingIOError:
+                    pass  # an explain run uses it
+                except OSError as e:
+                    print(f"prv: cannot remove {os.path.join(self.dir, n)}: {e}", file=sys.stderr)
+
+    def _remove(self, p):
+        if not os.path.lexists(p):
+            return
+        subprocess.run(["git", "worktree", "remove", "--force", "--force", p], cwd=self.repo.root,
+                       capture_output=True)
+        if os.path.lexists(p):  # not a registered worktree, such as a checkout cut short
+            shutil.rmtree(p, ignore_errors=True)
+        if os.path.lexists(p):
+            print(f"prv: cannot remove {p}", file=sys.stderr)
+
+
 class Runner:
     def __init__(self, repo, store, claude):
         self.repo = repo
         self.store = store
         self.claude = claude
         self.edit_lock = threading.Lock()
+        self.snapshots = Snapshots(repo) if repo else None
+
+    def prune_snapshots(self):
+        """Removes the worktrees no thread reads from."""
+        def keep():
+            with self.store.lock:
+                return [t.get("tree") for t in self.store.threads.values()]
+        self.snapshots.prune(keep)
 
     def command(self, model, edits, session_id):
         # User settings only: the reviewed branch's .claude/settings.json could add
@@ -1204,6 +1343,10 @@ class Runner:
             first = not t["session_id"]
             session_id = t["session_id"]
             anchor = t["anchor"]
+            tree = t.get("tree")
+            asks = [m for m in t["messages"] if m["role"] == "user"]
+            # Edits go to the reviewer's checkout; other turns read the commit's worktree.
+            moved = tree and not first and len(asks) > 1 and bool(asks[-2].get("edits")) != edits
         msg = {"role": "assistant", "text": "", "tools": [], "model": model,
                "edits": edits, "cost": None, "error": None}
         with st.lock:
@@ -1218,10 +1361,20 @@ class Runner:
                 emit({"type": "done", "is_error": True, "error": msg["error"]})
                 return
             try:
+                cwd = self.repo.root
+                if tree and not edits:
+                    try:
+                        cwd = self.snapshots.ensure(tree)
+                    except (GitError, OSError) as e:
+                        self._finish(t, msg, error=f"cannot check out {tree[:12]} for Claude: {e}")
+                        emit({"type": "done", "is_error": True, "error": msg["error"]})
+                        return
                 prompt = question
                 if first:
-                    prompt = anchor_context(self.repo, anchor) + "\n\nQuestion:\n" + question
-                self._run_proc(t, msg, prompt, model, edits, session_id, emit)
+                    prompt = anchor_context(self.repo, anchor, None if edits else tree) + "\n\nQuestion:\n" + question
+                elif moved:
+                    prompt = (edit_note(self.repo, tree) if edits else tree_note(self.repo, tree)) + "\n\n" + question
+                self._run_proc(t, msg, prompt, model, edits, session_id, emit, cwd)
             finally:
                 if edits:
                     self.edit_lock.release()
@@ -1231,13 +1384,15 @@ class Runner:
             emit({"type": "done", "is_error": True, "error": msg["error"]})
             raise
 
-    def _run_proc(self, t, msg, prompt, model, edits, session_id, emit):
+    def _run_proc(self, t, msg, prompt, model, edits, session_id, emit, cwd):
         st = self.store
         tr = StreamTranslator()
         stderr_buf = []
         try:
             # claude reads and writes UTF-8; a C or Latin-1 locale would garble the prompt and the answer.
-            proc = subprocess.Popen(self.command(model, edits, session_id), cwd=self.repo.root,
+            # A relative CLAUDE_CONFIG_DIR is under the root, also for a claude run in a worktree.
+            proc = subprocess.Popen(self.command(model, edits, session_id), cwd=cwd,
+                                    env={**os.environ, **claude_env(self.repo.root)},
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
                                     start_new_session=True)
@@ -1405,10 +1560,10 @@ EXPLAIN_SYSTEM = (
     "invariants, failure modes, edge cases, links to other hunks. Do not restate the code. Start a "
     "sentence with 'Concern:' for anything that looks wrong or risky. Skip trivial hunks.\n"
     "Commit messages are the main source for why. Read surrounding code when a hunk is unclear. "
-    f"Plain `git` is blocked; run git read commands as `{GIT_CMD} <subcommand> ...`. The working tree "
-    f"may differ from the reviewed head; use `{GIT_CMD} show <head>:<path>` for exact versions. Do not modify "
-    "files. Write plain English in short sentences, no em dashes. Markdown is allowed; put identifiers "
-    "in backticks."
+    f"Plain `git` is blocked; run git read commands as `{GIT_CMD} <subcommand> ...`. Your working directory "
+    "is a checkout of the reviewed head, without submodules: Read, Grep and Glob see the files as the head "
+    "has them. Do not modify files. Write plain English in short sentences, no em dashes. Markdown is "
+    "allowed; put identifiers in backticks."
 )
 
 
@@ -1436,10 +1591,10 @@ COMMIT_SYSTEM = (
     "sentence with 'Concern:' for anything that looks wrong or risky. Skip trivial lines such as "
     "includes and formatting.\n"
     "The commit message is the main source for why. Read surrounding code when a change is unclear. "
-    f"Plain `git` is blocked; run git read commands as `{GIT_CMD} <subcommand> ...`. The working tree "
-    f"may differ from the commit; use `{GIT_CMD} show <commit>:<path>` for exact versions. Do not modify "
-    "files. Write plain English in short sentences, no em dashes. Markdown is allowed; put identifiers "
-    "in backticks."
+    f"Plain `git` is blocked; run git read commands as `{GIT_CMD} <subcommand> ...`. Your working directory "
+    "is a checkout of the commit, without submodules: Read, Grep and Glob see the files as the commit has "
+    f"them; `{GIT_CMD} show HEAD^:<path>` shows a file before it. Do not modify files. Write plain English in "
+    "short sentences, no em dashes. Markdown is allowed; put identifiers in backticks."
 )
 
 
@@ -1834,6 +1989,7 @@ class Explainer:
         self.stopping = False
         self._cache = {}
         self._pids = {}
+        self.snapshots = Snapshots(repo)
 
     def _read(self, path, check):
         try:
@@ -1985,8 +2141,8 @@ class Explainer:
         head, files, commits = self._range()
         log = self._range_log(head, len(commits), "commit %H%n%B")
         prompt, hunks = explain_prompt(repo.base, head, files, log)
-        out, cost = self._claude(prompt, model, budget, on_tool,
-                                 run=("explanation", f"{repo.base[:10]}..{head[:10]}"))
+        out, cost = self._claude_at(head, prompt, model, budget, on_tool,
+                                    run=("explanation", f"{repo.base[:10]}..{head[:10]}"))
 
         def anchors(n):
             got = []
@@ -2040,8 +2196,8 @@ class Explainer:
             prompt, labels = commit_prompt(sha, d["message"], d["files"], series, pr["summary"] if pr else "")
             try:
                 subject = next((x.partition(" ")[2] for x in subjects if x.startswith(sha)), "")
-                out, cost = self._claude(prompt, model, budget_left(budget, spent), on_tool, COMMIT_SYSTEM,
-                                         COMMIT_SCHEMA, run=("line notes", f"{sha[:10]} {subject}"[:300]))
+                out, cost = self._claude_at(sha, prompt, model, budget_left(budget, spent), on_tool, COMMIT_SYSTEM,
+                                            COMMIT_SCHEMA, run=("line notes", f"{sha[:10]} {subject}"[:300]))
             except ExplainError as e:
                 spent += e.cost or 0
                 if str(e) == "stopped" or (budget is not None and spent >= budget):
@@ -2057,15 +2213,15 @@ class Explainer:
             done += 1
         return done, len(todo), failed, spent
 
-    def _supervise(self, cmd, name, stdin_text, read_stdout, read_stderr):
+    def _supervise(self, cmd, name, stdin_text, read_stdout, read_stderr, cwd=None):
         """Run cmd in its own session as self.proc, so stop() can signal it. read_stdout(proc.stdout)
-        runs here and read_stderr(proc.stderr) in a thread. Returns (exit code, stopped)."""
+        runs here and read_stderr(proc.stderr) in a thread. cwd: repo.root by default. Returns (exit code, stopped)."""
         err_thread = threading.Thread(target=lambda: read_stderr(proc.stderr), daemon=True)
         try:
-            # UTF-8 whatever the locale, as in Runner._run_proc.
-            proc = subprocess.Popen(cmd, cwd=self.repo.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            # UTF-8 whatever the locale, as in Runner._run_proc, and its claude_env() for a cwd outside root.
+            proc = subprocess.Popen(cmd, cwd=cwd or self.repo.root, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                                    start_new_session=True)
+                                    start_new_session=True, env={**os.environ, **claude_env(self.repo.root)})
         except OSError as e:
             raise ExplainError(f"cannot start {name}: {e}")
         # Everything after Popen sits in the try: a signal raised before it would orphan the process.
@@ -2104,9 +2260,18 @@ class Explainer:
                 stopped = self.stopping
         return proc.returncode, stopped
 
-    def _claude(self, prompt, model, budget, on_tool, system=EXPLAIN_SYSTEM, schema=EXPLAIN_SCHEMA, *, run):
+    def _claude_at(self, sha, *args, **kw):
+        """_claude() in a worktree of sha, so Read and Grep see the files as that commit has them."""
+        with contextlib.ExitStack() as stack:
+            try:
+                cwd = stack.enter_context(self.snapshots.scratch(sha))
+            except (GitError, OSError) as e:
+                raise ExplainError(f"cannot check out {sha[:12]} for Claude: {e}") from None
+            return self._claude(*args, cwd=cwd, **kw)
+
+    def _claude(self, prompt, model, budget, on_tool, system=EXPLAIN_SYSTEM, schema=EXPLAIN_SCHEMA, *, run, cwd=None):
         """One claude run. Returns (structured output, cost); raises ExplainError.
-        run: (kind, label) to list the session in sessions.json, stopped and failed runs too."""
+        run: (kind, label) to list the session in sessions.json, stopped and failed runs too. cwd: as _supervise()."""
         stderr_buf = []
         tr = StreamTranslator()
         result = None
@@ -2133,7 +2298,7 @@ class Explainer:
                     result = ev
         try:
             code, stopped = self._supervise(self.command(model, budget, system, schema), "claude", prompt, read,
-                                            lambda f: stderr_buf.append(f.read()))
+                                            lambda f: stderr_buf.append(f.read()), cwd)
         finally:  # no init event seen, or read() raised after claude started the session
             if tr.session_id != recorded:
                 record_session(self.repo.git_dir, tr.session_id, *run)
@@ -3147,6 +3312,8 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                         return self._json({"error": "thread is running"}, 409)
                     store.threads.pop(tid, None)
                     store.save_locked()
+                if t and t.get("tree"):
+                    runner.prune_snapshots()
                 return self._json({"deleted": bool(t)})
             self._json({"error": "not found"}, 404)
 
@@ -3183,6 +3350,10 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                 # first prompt when a first turn ended without a session.
                 if github and view == "all" and not anchor["path"]:
                     anchor["pr"] = github.pr_context()
+                try:
+                    tree = None if view == "wt" else view if SHA_RE.match(view) else repo.head_sha()
+                except GitError as e:
+                    return self._json({"error": str(e)}, 400)
             with store.lock:
                 if tid:
                     t = store.threads.get(str(tid))
@@ -3195,7 +3366,7 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                     return self._json({"error": PULLING}, 409)
                 if not tid:
                     t = {"id": uuid.uuid4().hex[:12], "created": time.time(), "anchor": anchor,
-                         "session_id": None, "messages": [], "running": False}
+                         "session_id": None, "messages": [], "running": False, "tree": tree}
                     store.threads[t["id"]] = t
                 t["running"] = True
                 t["messages"].append({"role": "user", "text": question, "model": model, "edits": edits})
@@ -4446,6 +4617,7 @@ def main(argv=None, auto_explain=None, reference=None):
         return 2
     store = Store(repo.git_dir)
     runner = Runner(repo, store, args.claude)
+    runner.prune_snapshots()  # worktrees no thread uses, such as those of a prv killed after a thread delete
     explainer = Explainer(repo, args.claude)
     gh = shutil.which("gh")
     github = None if args.no_github or not gh else GitHub(repo, gh, args.pr, args.jira_url, login=args.allow_push)

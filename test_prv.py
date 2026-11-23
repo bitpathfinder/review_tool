@@ -419,7 +419,8 @@ import json, os, sys
 prompt = sys.stdin.read()
 log = os.environ["FAKE_LOG"]
 with open(log, "a") as fh:
-    fh.write(json.dumps({"argv": sys.argv[1:], "prompt": prompt, "cwd": os.getcwd()}) + "\n")
+    fh.write(json.dumps({"argv": sys.argv[1:], "prompt": prompt, "cwd": os.getcwd(),
+                         "files": sorted(os.listdir())}) + "\n")
 sid = os.environ.get("FAKE_SID") or "SESS"
 def out(o): print(json.dumps(o), flush=True)
 if "--json-schema" in sys.argv:
@@ -2249,6 +2250,13 @@ class SinceTest(unittest.TestCase):
         whole = self.repo.diff(prv.SINCE + self.old, ["b"])["files"]
         self.assertEqual(len(whole[0]["hunks"][0]["lines"]), 21)  # 20 lines, one of them changed
 
+    @needs_merge_tree
+    def test_since_prompt_names_the_worktree_commit(self):
+        # The replayed tree in the since note is no worktree: only the tree argument names one.
+        view, head = prv.SINCE + self.old, self.sha("HEAD")
+        self.assertNotIn("checkout of commit", prv.anchor_context(self.repo, {"view": view}))
+        self.assertIn(f"checkout of commit {head},", prv.anchor_context(self.repo, {"view": view}, head))
+
     def test_range_diff_pairs_the_commits(self):
         r = self.repo.range_diff(self.old)
         self.assertEqual([(e["mark"], e["subject"]) for e in r], [("=", "pr: a"), ("!", "pr: b [x] 'q'")])
@@ -3327,18 +3335,25 @@ class ServerTest(unittest.TestCase):
         self.assertEqual([e["type"] for e in lines], ["thread", "session", "text", "done"])
         tid = lines[0]["thread"]["id"]
         self.req("/api/ask", {"id": tid, "question": "and?", "model": "haiku", "edits": True})
+        self.req("/api/ask", {"id": tid, "question": "so?", "model": "haiku"})
+        self.req("/api/ask", {"id": tid, "question": "then?", "model": "haiku"})
 
         with open(self.log) as fh:
             calls = [json.loads(l) for l in fh]
-        self.assertEqual(len(calls), 2)
-        first, second = calls
-        self.assertEqual(os.path.realpath(first["cwd"]), self.root)
+        self.assertEqual(len(calls), 4)
+        first, second, third, fourth = calls
+        # Reading turns run in a worktree of the view's commit; an editing turn in the reviewer's checkout.
+        wt = os.path.join(self.repo.git_dir, "prv", "wt", self.git("rev-parse", "HEAD")[:12])
+        self.assertEqual([os.path.realpath(c["cwd"]) for c in calls], [wt, self.root, wt, wt])
         self.assertIn(">>+TWO", first["prompt"])
         self.assertIn("Question:\nwhy?", first["prompt"])
         self.assertNotIn("--resume", first["argv"])
         self.assertEqual(first["argv"][first["argv"].index("--permission-mode") + 1], "dontAsk")
         self.assertNotIn("Edit", first["argv"])
-        self.assertEqual(second["prompt"], "and?")
+        # A turn that moves to the other folder says where it runs.
+        self.assertRegex(second["prompt"], r"^This turn runs in the reviewer's checkout, .*\n\nand\?\Z")
+        self.assertRegex(third["prompt"], r"^Your working directory is a checkout of commit .*\n\nso\?\Z")
+        self.assertEqual(fourth["prompt"], "then?")
         self.assertEqual(second["argv"][second["argv"].index("--resume") + 1], "SESS")
         self.assertEqual(second["argv"][second["argv"].index("--permission-mode") + 1], "acceptEdits")
         self.assertIn("Edit", second["argv"])
@@ -3346,7 +3361,7 @@ class ServerTest(unittest.TestCase):
         threads = json.loads(self.req("/api/threads"))
         self.assertEqual(len(threads), 1)
         msgs = threads[0]["messages"]
-        self.assertEqual([m["role"] for m in msgs], ["user", "assistant", "user", "assistant"])
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant"] * 4)
         self.assertEqual(msgs[1]["text"], "answer")
         self.assertEqual(msgs[1]["cost"], 0.5)
         # Persisted and reloadable.
@@ -3457,6 +3472,125 @@ class ServerTest(unittest.TestCase):
                          ("race fix", "fix the race", False, "T1", ids[5]))
         self.assertEqual(r["resume"], f"cd {self.root} && {env} claude --resume {ids[4]}")
 
+    def test_question_reads_the_commit_it_is_about(self):
+        # A file renamed by a later commit keeps its old name in the earlier commit's worktree.
+        c1 = self.git("rev-parse", "HEAD")
+        self.git("mv", "a.txt", "b.txt")
+        self.git("commit", "-qm", "rename")
+        ran = os.path.join(self.root, ".git", "hook-ran")
+        hook = os.path.join(self.root, ".git", "hooks", "post-checkout")
+        os.makedirs(os.path.dirname(hook), exist_ok=True)
+        with open(hook, "w") as fh:
+            fh.write(f"#!/bin/sh\ntouch {ran}\n")
+        os.chmod(hook, 0o755)
+        ask = lambda view: json.loads(self.req("/api/ask", {"question": "q", "model": "haiku",
+                                                             "anchor": {"view": view}}).splitlines()[0])["thread"]
+        t1, t2, _ = ask(c1[:10]), ask(c1), ask("wt")
+        calls = self.fake_calls()
+        wt = os.path.join(self.repo.git_dir, "prv", "wt", c1[:12])
+        self.assertEqual([os.path.realpath(c["cwd"]) for c in calls], [wt, wt, self.root])
+        self.assertEqual(sorted(os.listdir(wt)), [".git", "a.txt"])
+        self.assertIn(f"Your working directory is a checkout of commit {c1}", calls[0]["prompt"])
+        self.assertNotIn("may differ from this view", calls[0]["prompt"])
+        self.assertNotIn("checkout of commit", calls[2]["prompt"])
+        self.assertFalse(os.path.exists(ran), "the reviewed branch's post-checkout hook ran")
+        # Removed by hand: the next turn checks it out again.
+        shutil.rmtree(wt)
+        self.req("/api/ask", {"id": t1["id"], "question": "more", "model": "haiku"})
+        self.assertTrue(os.path.isfile(os.path.join(wt, "a.txt")))
+        # Kept while a thread reads from it.
+        self.req("/api/delete", {"id": t1["id"]})
+        self.assertTrue(os.path.isdir(wt))
+        self.req("/api/delete", {"id": t2["id"]})
+        self.assertFalse(os.path.lexists(wt))
+        self.assertNotIn(wt, self.git("worktree", "list", "--porcelain"))
+
+    def test_worktree_under_a_path_with_spaces_is_reused(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = os.path.join(os.path.realpath(tmp.name), "a b")
+        subprocess.run(["git", "clone", "-q", self.root, d], check=True, capture_output=True)
+        snaps = prv.Snapshots(prv.Repo(d, "HEAD", "HEAD", "HEAD"))
+        sha = self.git("rev-parse", "HEAD")
+        wt = snaps.ensure(sha)
+        open(os.path.join(wt, "marker"), "w").close()
+        self.assertEqual(snaps.ensure(sha), wt)
+        self.assertTrue(os.path.exists(os.path.join(wt, "marker")), "checked out again")
+
+    def test_explain_reads_each_commit_in_its_worktree(self):
+        # The line notes of a commit read its files: a later rename leaves the old name in its worktree.
+        c1 = self.git("rev-parse", "HEAD")
+        self.git("mv", "a.txt", "b.txt")
+        with open(os.path.join(self.root, "b.txt"), "a") as fh:
+            fh.write("four\n")
+        self.git("commit", "-qam", "rename")
+        c2 = self.git("rev-parse", "HEAD")
+        self.explainer.generate("haiku", None)
+        self.assertEqual(self.explainer.generate_commits("haiku", None)[:3], (2, 2, []))
+        calls = self.fake_calls()
+        wt = lambda sha: os.path.join(self.repo.git_dir, "prv", "wt", "x-" + sha[:12])
+        self.assertEqual([(os.path.realpath(c["cwd"]), c["files"]) for c in calls],
+                         [(wt(c2), [".git", "b.txt"]), (wt(c1), [".git", "a.txt"]), (wt(c2), [".git", "b.txt"])])
+        system = lambda c: c["argv"][c["argv"].index("--append-system-prompt") + 1]
+        self.assertIn("Your working directory is a checkout of the reviewed head", system(calls[0]))
+        self.assertIn("Your working directory is a checkout of the commit", system(calls[1]))
+        # Removed when each run ends.
+        self.assertEqual(os.listdir(os.path.join(self.repo.git_dir, "prv", "wt")), [])
+        self.assertNotIn("x-", self.git("worktree", "list"))
+
+    def test_prune_removes_the_explain_worktrees_no_run_holds(self):
+        c1, snaps = self.git("rev-parse", "HEAD"), self.runner.snapshots
+        left = os.path.join(snaps.dir, "x-" + "0" * 12)  # left by a prv killed during a run
+        with self.explainer.snapshots.scratch(c1) as p:
+            os.makedirs(left)
+            snaps.prune(lambda: [])
+            self.assertTrue(os.path.isfile(os.path.join(p, "a.txt")), "removed under a running explain job")
+            self.assertFalse(os.path.lexists(left))
+        self.assertFalse(os.path.lexists(p))
+
+    def test_question_on_a_missing_commit_says_so(self):
+        self.store.threads["t"] = {"id": "t", "created": 5, "anchor": {"view": "all", "path": None},
+                                   "session_id": "S", "running": False, "tree": "f" * 40,
+                                   "messages": [{"role": "user", "text": "why?"}]}
+        done = json.loads(self.req("/api/ask", {"id": "t", "question": "and?", "model": "haiku"}).splitlines()[-1])
+        self.assertEqual(done["type"], "done")
+        self.assertIn("cannot check out ffffffffffff for Claude", done["error"])
+        self.assertEqual(self.fake_calls(), [])
+
+    def test_unused_worktrees_are_removed_at_startup(self):
+        c1 = self.git("rev-parse", "HEAD")
+        wt = self.runner.snapshots.ensure(c1)
+        self.assertEqual(self.runner.snapshots.ensure(c1), wt)
+        self.store.threads["t"] = {"id": "t", "created": 5, "anchor": {"view": c1}, "session_id": None,
+                                   "running": False, "messages": [], "tree": c1}
+        os.makedirs(os.path.join(self.repo.git_dir, "prv", "wt", "leftover"))  # a checkout cut short
+        self.runner.prune_snapshots()
+        self.assertEqual(os.listdir(os.path.dirname(wt)), [c1[:12]])
+        del self.store.threads["t"]
+        self.runner.prune_snapshots()
+        self.assertEqual(os.listdir(os.path.dirname(wt)), [])
+
+    def test_bad_saved_tree_is_set_aside(self):
+        os.makedirs(os.path.join(self.repo.git_dir, "prv"), exist_ok=True)
+        with open(os.path.join(self.repo.git_dir, "prv", "threads.json"), "w") as fh:
+            json.dump([{"id": "t", "created": 5, "anchor": {"view": "all"}, "session_id": None, "running": False,
+                        "messages": [], "tree": "../../x"}], fh)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(prv.Store(self.repo.git_dir).threads, {})
+
+    def test_claude_session_started_in_a_worktree(self):
+        sid, c1 = str(uuid.UUID(int=9)), self.git("rev-parse", "HEAD")
+        wt = self.runner.snapshots.ensure(c1)
+        self.store.threads["t"] = {"id": "t", "created": 5, "anchor": {"view": c1, "path": None}, "session_id": sid,
+                                   "running": False, "messages": [{"role": "user", "text": "why?"}], "tree": c1}
+        self.transcript(sid, {"type": "user", "cwd": wt, "message": {"content": "why?"}}, cwd=wt)
+        [r] = json.loads(self.req("/api/sessions"))["prv"]
+        self.assertEqual((r["id"], r["gone"], r["cwd"]), (sid, False, wt))
+        # claude --resume finds the session from any folder; a removed worktree is none to cd to.
+        shutil.rmtree(wt)
+        [r] = json.loads(self.req("/api/sessions"))["prv"]
+        self.assertEqual((r["gone"], r["cwd"]), (False, self.root))
+
     def test_claude_session_resume_quotes_the_folder(self):
         sid = str(uuid.UUID(int=8))
         repo = mock.Mock(root="/w/a b'c", git_dir=self.repo.git_dir)
@@ -3558,6 +3692,14 @@ class ServerTest(unittest.TestCase):
         # claude runs in the root, so a relative config dir is there, whatever prv's own cwd.
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "cfg", "CLAUDE_CODE_PROJECT_DIR_NAME": "p"}):
             self.assertEqual(prv.claude_projects_dirs(self.root), [os.path.join(self.root, "cfg", "projects", "p")])
+        # A claude run in a worktree gets the root's config dir, and its transcripts are there.
+        projects = os.path.join(self.root, "cfg", "projects")
+        wt = prv.snapshot_dir(self.repo.git_dir)
+        os.makedirs(os.path.join(projects, prv._project_name(os.path.join(wt, "abc"))))
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "cfg"}):
+            self.assertEqual(prv.claude_env(self.root), {"CLAUDE_CONFIG_DIR": os.path.join(self.root, "cfg")})
+            self.assertEqual(prv.claude_projects_subdirs(self.root, wt),
+                             [os.path.join(projects, prv._project_name(os.path.join(wt, "abc")))])
 
     def test_session_log_entry_checks(self):
         path = prv.session_log_path(self.repo.git_dir)
