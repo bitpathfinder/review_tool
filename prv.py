@@ -1460,18 +1460,23 @@ def _is_universal_ctags(p, mtime_ns):
 
 
 def universal_ctags():
-    """ctags if it is Universal Ctags with JSON output, else None. Exuberant Ctags has neither --options=NONE nor JSON.
+    """ctags or ctags-universal, the first that is Universal Ctags with JSON output, else None.
+    Exuberant Ctags has neither --options=NONE nor JSON.
     PATH is searched on each call: a ctags installed after the error message works without a restart.
-    Checked by the resolved path: Debian's alternatives switch /usr/bin/ctags between the two."""
-    p = shutil.which("ctags")
-    if not p:
-        return None
-    real = os.path.realpath(p)
-    try:
-        mtime_ns = os.stat(real).st_mtime_ns
-    except OSError:
-        return None
-    return p if _is_universal_ctags(real, mtime_ns) else None
+    Checked by the resolved path: Debian's alternatives switch /usr/bin/ctags between the two, and
+    Debian's universal-ctags always installs ctags-universal too."""
+    for name in ("ctags", "ctags-universal"):
+        p = shutil.which(name)
+        if not p:
+            continue
+        real = os.path.realpath(p)
+        try:
+            mtime_ns = os.stat(real).st_mtime_ns
+        except OSError:
+            continue
+        if _is_universal_ctags(real, mtime_ns):
+            return p
+    return None
 
 
 def file_fp(f):
@@ -4693,7 +4698,7 @@ td.xhl{background:var(--sel)!important}
 .xnote.cpath{border-left:3px solid var(--accent)}
 .cpcard{border-left-color:var(--accent)}
 .frames{margin:4px 0 2px;padding-left:22px;font-size:12px}
-.frames li{margin:1px 0}
+.frames li{margin:1px 0;overflow-wrap:anywhere}
 .frames a{cursor:pointer;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 .frames a.off{cursor:default;color:var(--muted)}
 .frames li:last-child a{font-weight:600}
@@ -5908,8 +5913,13 @@ function cpathNotes(){
 function cpathText(p){
   return `Call path: ${p.title}\n` + p.frames.map((f, j) => `${j + 1}. ${f.function} (${f.path}:${f.line})${f.note ? ': ' + f.note : ''}`).join('\n');
 }
+// Breaks a qualified name after :: and . so a long name such as db::commitlog::segment_manager::f
+// wraps at a scope boundary; overflow-wrap:anywhere on .frames li is only the fallback.
+function wrapName(s){
+  return esc(s).replace(/::|\./g, '$&<wbr>');
+}
 function framesHtml(p, pi){
-  return `<ol class="frames">${p.frames.map((f, j) => `<li><a ${f.ok ? `data-frame="${pi}:${j}"` : 'class="off"'} title="${esc(f.path)}:${f.line}${f.ok ? '' : ' (no such file at this commit)'}">${esc(f.function || '?')}</a> <span class="where">${esc(f.path.split('/').pop())}:${f.line}</span>${f.note ? ' · ' + esc(f.note) : ''}</li>`).join('')}</ol>`;
+  return `<ol class="frames">${p.frames.map((f, j) => `<li><a ${f.ok ? `data-frame="${pi}:${j}"` : 'class="off"'} title="${esc(f.path)}:${f.line}${f.ok ? '' : ' (no such file at this commit)'}">${wrapName(f.function || '?')}</a> <span class="where">${esc(f.path.split('/').pop())}:${f.line}</span>${f.note ? ' · ' + esc(f.note) : ''}</li>`).join('')}</ol>`;
 }
 function cpathHtml(n, ni, at, a){
   return `<div class="xnote cpath" id="xn${ni}" ${at}><div class="xh"><span>Call path · ${noteWhere(a, n.end)}</span><span class="sp"></span><a data-xask="${ni}" title="Ask Claude about these lines and the call path">Ask</a></div><div class="ftitle">${esc(n.cpath.title)}</div>${framesHtml(n.cpath, n.pi)}</div>`;

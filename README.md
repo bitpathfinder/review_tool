@@ -4,7 +4,7 @@
 a branch against its base. Select lines and ask Claude about them; Claude reads the whole checkout
 to answer.
 
-![prv on a pull request: commits, files, the AI and Qodo review summary and the GitHub threads](docs/overview.png)
+![prv on a pull request: commits, files, the AI and Qodo review summary and the call paths diagram](docs/overview.png)
 
 - **Ask about lines.** Click a line number (shift-click for a range), type a question. The answer
   streams in, and the thread is saved in `<git-dir>/prv/threads.json`. **hide** on a thread shrinks
@@ -76,13 +76,14 @@ The commit card in "Uncommitted changes":
   "Changes since…" needs git 2.40 or newer. Tested on Fedora 43, Debian 12 (git 2.39) and Ubuntu 22.04 (git 2.34).
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) (`claude` on PATH, logged in) for
   questions, explanations and the AI review.
+- [Universal Ctags](https://ctags.io/) with JSON output (`ctags`) for go to definition.
 - Optional: [GitHub CLI](https://cli.github.com/) (`gh`, logged in) for PR links, review comments
-  and `prv new_review`; the qodo CLI for the Qodo review; Universal Ctags for go to definition.
+  and `prv new_review`; the qodo CLI for the Qodo review.
 - git-lfs is not needed: without it, `prv new_review` checks LFS files out as their pointer files.
 
 ## Install on a new machine
 
-1. The repository is private: ask the owner to add you as a collaborator.
+1. If the repository is private, ask the owner to add you as a collaborator.
 2. Clone prv and install it with its dependencies. `--deps` asks for your sudo password when it
    installs packages.
 
@@ -109,10 +110,11 @@ The commit card in "Uncommitted changes":
 `install.sh` copies prv to `~/.local/share/prv` and links `~/.local/bin/prv` to it. It checks the
 requirements and warns about missing optional tools. Options:
 
-- `--deps`: install the missing tools first: git, python3, gh and Universal Ctags with the system package
+- `--deps`: install the missing tools first: git, python3, Universal Ctags and gh with the system package
   manager (apt-get, dnf, zypper, pacman or brew, with sudo when not root), and Claude Code with its
-  installer (`curl -fsSL https://claude.ai/install.sh | bash`, into your home folder). The qodo CLI needs
-  a Qodo account and is left to you.
+  installer (`curl -fsSL https://claude.ai/install.sh | bash`, into your home folder). The install stops
+  when git, python3 or Universal Ctags with JSON output cannot be installed. The qodo CLI needs a Qodo
+  account and is left to you.
 - `--dev`: link to the checkout instead of copying, so a `git pull` updates prv.
 - `--reference PATH`: optional, a local clone of the repository you review. `prv new_review` clones
   from it with hardlinks, which takes seconds instead of a full GitHub clone. Without one,

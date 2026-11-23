@@ -1558,10 +1558,14 @@ def node_call(name, *args):
     return int(node_json(name, *args))
 
 
-def node_json(name, *args):
-    """Runs the page's top-level function name in node on JSON args; returns its result through JSON."""
-    fn = re.search(rf"function {name}\(.*?\n}}\n", prv.PAGE, re.S).group(0)
-    js = fn + f"process.stdout.write(JSON.stringify({name}(...{json.dumps(list(args))})));"
+def node_json(name, *args, deps=()):
+    """Runs the page's top-level function name in node on JSON args; returns its result through JSON.
+    deps: page functions and consts that name calls; they are emitted before name."""
+    # One-line functions first: the multi-line pattern would run on to the next function's closing brace.
+    fns = [re.search(rf"^(function {re.escape(f)}\([^\n]*}}\n|function {re.escape(f)}\(.*?\n}}\n|const {re.escape(f)} = [^\n]*\n)",
+                     prv.PAGE, re.S | re.M).group(0)
+           for f in (*deps, name)]
+    js = "".join(fns) + f"process.stdout.write(JSON.stringify({name}(...{json.dumps(list(args))})));"
     return json.loads(subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout)
 
 
@@ -1624,6 +1628,14 @@ class MermaidTextTest(unittest.TestCase):
             "  n1 --> n0",
             "  classDef changed stroke-width:3px",
             "  class n0 changed"]))
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class FrameNameTest(unittest.TestCase):
+    def test_qualified_names_can_wrap_and_stay_escaped(self):
+        # Without break points, a long C++ name in the notes column widened the whole page.
+        self.assertEqual(node_json("wrapName", "db::segment_manager<T>::f", deps=["esc"]), "db::<wbr>segment_manager&lt;T&gt;::<wbr>f")
+        self.assertEqual(node_json("wrapName", "self.cp.generate", deps=["esc"]), "self.<wbr>cp.<wbr>generate")
 
 
 class PageScriptTest(unittest.TestCase):
@@ -1801,6 +1813,19 @@ class DefinitionsTest(unittest.TestCase):
             os.symlink(universal, link)
             self.assertEqual(prv.universal_ctags(), link)
 
+    def test_debian_ctags_universal_is_found_behind_an_exuberant_ctags(self):
+        # Debian's universal-ctags installs ctags-universal; ctags may still run Exuberant Ctags.
+        exuberant = os.path.join(self.root, ".git", "exuberant")
+        with open(exuberant, "w") as fh:
+            fh.write('#!/bin/sh\necho "Exuberant Ctags 5.8"\n')
+        os.chmod(exuberant, 0o755)
+        universal = prv.universal_ctags()
+        paths = {"ctags": exuberant, "ctags-universal": universal}
+        with mock.patch.object(prv.shutil, "which", side_effect=paths.get):
+            self.assertEqual(prv.universal_ctags(), universal)
+        with mock.patch.object(prv.shutil, "which", side_effect={"ctags": exuberant}.get):
+            self.assertIsNone(prv.universal_ctags())
+
     def test_ctags_rebuilt_in_place_is_found(self):
         # `make install` over an Exuberant Ctags keeps its path.
         path = os.path.join(self.root, ".git", "ctags")
@@ -1956,17 +1981,60 @@ class InstallTest(unittest.TestCase):
         self.assertIn("no curl to install Claude Code with", r.stdout)
         self.assertEqual(os.readlink(self.link), os.path.join(self.home, ".local", "share", "prv", "prv.py"))
 
-    def test_deps_without_a_package_manager_still_installs(self):
-        # Only the optional gh and ctags are missing: no package manager is a warning, not a failed install.
-        fake = self.basic_path()
-        os.makedirs(os.path.join(self.home, ".local", "bin"))
+    def fake_claude(self):
+        os.makedirs(os.path.join(self.home, ".local", "bin"), exist_ok=True)
         with open(os.path.join(self.home, ".local", "bin", "claude"), "w") as fh:
             fh.write("#!/bin/sh\n")
         os.chmod(os.path.join(self.home, ".local", "bin", "claude"), 0o755)
+
+    def test_deps_without_a_package_manager_still_installs(self):
+        # Only the optional gh is missing: no package manager is a warning, not a failed install.
+        fake = self.basic_path()
+        self.write_scripts(fake, {"ctags": 'echo "Universal Ctags 6.0, +json"'})
+        self.fake_claude()
         r = self.install("--deps", env={"PATH": fake})
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("no apt-get, dnf, zypper, pacman or brew; install gh ctags yourself", r.stdout)
+        self.assertIn("no apt-get, dnf, zypper, pacman or brew; install gh yourself", r.stdout)
         self.assertEqual(os.readlink(self.link), os.path.join(self.home, ".local", "share", "prv", "prv.py"))
+
+    def test_debian_ctags_universal_counts_as_installed(self):
+        # ctags runs Exuberant Ctags, ctags-universal is there: nothing to install, no warning.
+        fake = self.basic_path()
+        self.write_scripts(fake, {"ctags": 'echo "Exuberant Ctags 5.9"',
+                                  "ctags-universal": 'echo "Universal Ctags 5.9.0, +json"'})
+        r = self.install(env={"PATH": fake})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("Universal Ctags with JSON output (ctags) is not installed", r.stdout)
+
+    def test_deps_needs_universal_ctags(self):
+        # Go to definition needs Universal Ctags: --deps stops when the package manager cannot provide it.
+        fake = self.basic_path()
+        self.fake_claude()
+        r = self.install("--deps", env={"PATH": fake})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no apt-get, dnf, zypper, pacman or brew; install ctags yourself", r.stderr)
+        self.assertFalse(os.path.lexists(self.link))
+        # Installed, but the package is an Exuberant Ctags without JSON output (RHEL 8).
+        self.write_scripts(fake, {"sudo": 'exec "$@"', "apt-get": 'case " $* " in *" universal-ctags "*) '
+                                  'printf \'#!/bin/sh\\necho "Exuberant Ctags 5.9"\\n\' > "$FAKE/ctags"; '
+                                  'chmod +x "$FAKE/ctags" ;; esac'})
+        r = self.install("--deps", env={"PATH": fake, "FAKE": fake})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("installed no Universal Ctags with JSON output", r.stderr)
+        self.assertFalse(os.path.lexists(self.link))
+
+    def test_deps_installs_git_when_the_release_has_no_universal_ctags(self):
+        # Debian 10 has no universal-ctags: git still installs, and the error names the missing package.
+        fake = self.basic_path()
+        os.remove(os.path.join(fake, "git"))
+        self.fake_claude()
+        self.write_scripts(fake, {"sudo": 'exec "$@"', "apt-get": f'case " $* " in *" universal-ctags "*) exit 100 ;; '
+                                  f'*" git "*) ln -s {shutil.which("git")} "$FAKE/git" ;; esac'})
+        r = self.install("--deps", env={"PATH": fake, "FAKE": fake})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("apt-get could not install universal-ctags", r.stderr)
+        self.assertTrue(os.path.lexists(os.path.join(fake, "git")))
+        self.assertFalse(os.path.lexists(self.link))
 
     def test_deps_installs_nothing_when_the_link_is_in_the_way(self):
         fake = self.basic_path()
