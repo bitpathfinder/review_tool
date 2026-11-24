@@ -257,8 +257,9 @@ A question about a commit, "All changes" or "Changes since" runs Claude in a wor
 (the view's head), under `<git-dir>/prv/wt/`. Grep and Read then see the files as the commit has them,
 so a file renamed by a later commit keeps its old name. The worktree has no submodules. A turn with
 "Allow edits" runs in the checkout itself. prv removes a worktree once no thread uses it. The
-explanations work the same way: the range notes read a worktree of the head, and each commit's line
-notes a worktree of that commit, removed when the run ends.
+explanations, the AI review and the call paths work the same way: a run reads a worktree of the head, or
+of the commit for a commit's notes, removed when the run ends. A run on the commit the checkout is at,
+with no tracked changes, reads the checkout itself and so sees its submodules.
 
 There is no cost cap by default. Pass `--max-budget-usd` to `prv explain`, `prv callpaths` or `prv new_review`
 to set one. `prv new_review` applies the cap to the explanations and to the call paths separately, so the two

@@ -1229,7 +1229,7 @@ def snapshot_dir(git_dir):
 class Snapshots:
     """Detached worktrees of commits. A question about a committed view runs claude in one, so Read, Grep and
     Glob see that commit's files: a file renamed later is still under its old name there. A thread's worktree
-    is <sha12>, kept while a thread uses it; an explain run's is x-<sha12>, removed when the run ends."""
+    is <sha12>, kept while a thread uses it; an explain run's is x-<sha12><tag>, removed when the run ends."""
 
     def __init__(self, repo):
         self.repo = repo
@@ -1240,6 +1240,9 @@ class Snapshots:
     def path(self, sha):
         return os.path.join(self.dir, sha[:12])
 
+    def scratch_path(self, sha, tag=""):
+        return os.path.join(self.dir, "x-" + sha[:12] + tag)
+
     def ensure(self, sha):
         """The worktree of sha, checked out first if missing or not at sha. Raises GitError or OSError."""
         p = self.path(sha)
@@ -1248,14 +1251,14 @@ class Snapshots:
         return p
 
     @contextlib.contextmanager
-    def scratch(self, sha):
+    def scratch(self, sha, tag=""):
         """A worktree of sha for one explain run, removed after it. A file lock keeps a `prv explain` beside
-        the server off the same folder, and the server's prune() off a folder in use. Raises GitError or OSError."""
-        name = "x-" + sha[:12]
+        the server off the same folder, and the server's prune() off a folder in use. tag: one per job slot, so
+        jobs of other slots do not wait for the lock. Raises GitError or OSError."""
+        p = self.scratch_path(sha, tag)
         os.makedirs(self.locks, exist_ok=True)
-        with open(os.path.join(self.locks, name), "a") as lk:
+        with open(os.path.join(self.locks, os.path.basename(p)), "a") as lk:
             fcntl.flock(lk, fcntl.LOCK_EX)
-            p = os.path.join(self.dir, name)
             try:
                 self._check_out(p, sha)
                 yield p
@@ -1637,9 +1640,9 @@ EXPLAIN_SYSTEM = (
     "sentence with 'Concern:' for anything that looks wrong or risky. Skip trivial hunks.\n"
     "Commit messages are the main source for why. Read surrounding code when a hunk is unclear. "
     f"Plain `git` is blocked; run git read commands as `{GIT_CMD} <subcommand> ...`. Your working directory "
-    "is a checkout of the reviewed head, without submodules: Read, Grep and Glob see the files as the head "
-    "has them. Do not modify files. Write plain English in short sentences, no em dashes. Markdown is "
-    "allowed; put identifiers in backticks."
+    "is a checkout of the reviewed head: Read, Grep and Glob see the files as the head has them. Submodules "
+    "may be missing, and untracked files may be present. Do not modify files. Write plain English in short "
+    "sentences, no em dashes. Markdown is allowed; put identifiers in backticks."
 )
 
 
@@ -1668,9 +1671,10 @@ COMMIT_SYSTEM = (
     "includes and formatting.\n"
     "The commit message is the main source for why. Read surrounding code when a change is unclear. "
     f"Plain `git` is blocked; run git read commands as `{GIT_CMD} <subcommand> ...`. Your working directory "
-    "is a checkout of the commit, without submodules: Read, Grep and Glob see the files as the commit has "
-    f"them; `{GIT_CMD} show HEAD^:<path>` shows a file before it. Do not modify files. Write plain English in "
-    "short sentences, no em dashes. Markdown is allowed; put identifiers in backticks."
+    "is a checkout of the commit: Read, Grep and Glob see the files as the commit has them, and "
+    f"`{GIT_CMD} show HEAD^:<path>` shows a file before it. Submodules may be missing, and untracked files "
+    "may be present. Do not modify files. Write plain English in short sentences, no em dashes. Markdown is "
+    "allowed; put identifiers in backticks."
 )
 
 
@@ -2053,6 +2057,8 @@ class Explainer:
     """Review notes for the range, kept in <git-dir>/prv/explain.json, plus at
     most one background job that generates them."""
 
+    SCRATCH = ""  # the tag of this job slot's worktrees, as for Snapshots.scratch()
+
     def __init__(self, repo, claude):
         self.repo = repo
         self.claude = claude
@@ -2337,13 +2343,24 @@ class Explainer:
         return proc.returncode, stopped
 
     def _claude_at(self, sha, *args, **kw):
-        """_claude() in a worktree of sha, so Read and Grep see the files as that commit has them."""
+        """_claude() where Read and Grep see the files as commit sha has them: the reviewer's checkout when it
+        is at sha with no tracked changes, which keeps its submodules, else a worktree of sha."""
+        if self._checkout_is(sha):
+            return self._claude(*args, **kw)
         with contextlib.ExitStack() as stack:
             try:
-                cwd = stack.enter_context(self.snapshots.scratch(sha))
+                cwd = stack.enter_context(self.snapshots.scratch(sha, self.SCRATCH))
             except (GitError, OSError) as e:
                 raise ExplainError(f"cannot check out {sha[:12]} for Claude: {e}") from None
             return self._claude(*args, cwd=cwd, **kw)
+
+    def _checkout_is(self, sha):
+        try:
+            return (git(self.repo.root, "rev-parse", "HEAD").strip() == sha
+                    and not git(self.repo.root, "--no-optional-locks", "status", "--porcelain",
+                                "--untracked-files=no").strip())
+        except GitError:
+            return False
 
     def _claude(self, prompt, model, budget, on_tool, system=EXPLAIN_SYSTEM, schema=EXPLAIN_SCHEMA, *, run, cwd=None):
         """One claude run. Returns (structured output, cost); raises ExplainError.
@@ -2567,9 +2584,10 @@ REVIEW_SYSTEM = (
     "loss, crashes, security holes or wrong results in normal use; medium for edge cases and failure "
     "paths; low for minor defects. `title`: one short sentence. `text`: what goes wrong, the scenario "
     "(inputs or state, then the wrong outcome), and the fix. An empty list is a valid answer.\n"
-    f"Plain `git` is blocked; run git read commands as `{GIT_CMD} <subcommand> ...`. The working tree "
-    f"may differ from the reviewed head; use `{GIT_CMD} show <head>:<path>` for exact versions. Submodules "
-    "are checked out. Do not modify files. Write plain English in short sentences, no em dashes. "
+    f"Plain `git` is blocked; run git read commands as `{GIT_CMD} <subcommand> ...`. Your working "
+    "directory is a checkout of the reviewed head: Read, Grep and Glob see the files as the head has them. "
+    "Submodules may be missing, and untracked files may be present. Do not modify files. Write plain "
+    "English in short sentences, no em dashes. "
     "Markdown is allowed; put identifiers in backticks."
 )
 # Qodo's action_level picks only the color; the card shows Qodo's own level and category.
@@ -2594,9 +2612,9 @@ def _str(v):
     return v if isinstance(v, str) else ""
 
 
-def claude_findings(raw, files, labels):
+def claude_findings(raw, files, labels, roots=()):
     """Claude's findings with their labels turned into path, side and line at head. A finding
-    with no usable label or line is kept without an anchor."""
+    with no usable label or line is kept without an anchor. roots: as for _clean_path()."""
     out = []
     for x in _list(raw, "findings"):
         if not (isinstance(x, dict) and _str(x.get("text")).strip()):
@@ -2609,8 +2627,8 @@ def claude_findings(raw, files, labels):
             # A range ends in the hunk it starts in, as for line notes.
             if b is not None and (b["path"], b["h"]) == (a["path"], a["h"]) and b["o"] > a["o"]:
                 end = label_line(files, b)
-        elif isinstance(x.get("path"), str) and type(x.get("line")) is int and x["line"] > 0:
-            anchor = {"path": x["path"], "side": "new", "line": x["line"]}
+        elif (path := _clean_path(roots, x.get("path"))) and type(x.get("line")) is int and x["line"] > 0:
+            anchor = {"path": path, "side": "new", "line": x["line"]}
         out.append({"severity": x["severity"] if x.get("severity") in SEVERITIES else "medium",
                     "title": _str(x.get("title"))[:500], "text": x["text"], "anchor": anchor, "end": end})
     return out
@@ -2706,6 +2724,8 @@ class Reviewer(Explainer):
     <git-dir>/prv/review-<source>.json. Its own job slot, so a review can run while
     explanations are written."""
 
+    SCRATCH = "-review"
+
     def __init__(self, repo, claude, source, qodo=None, explainer=None):
         super().__init__(repo, claude)
         self.source, self.qodo, self.explainer = source, qodo, explainer
@@ -2734,9 +2754,10 @@ class Reviewer(Explainer):
         except (OSError, ValueError):
             pr = None  # the PR summary is optional context
         prompt, labels = review_prompt(repo.base, head, log, files, pr["summary"] if pr else "")
-        out, cost = self._claude(prompt, model, None, on_tool, REVIEW_SYSTEM, REVIEW_SCHEMA,
-                                 run=("AI review", f"{repo.base[:10]}..{head[:10]}"))
-        doc = self._doc(head, files, _str(out.get("summary")), claude_findings(out, files, labels),
+        out, cost = self._claude_at(head, prompt, model, None, on_tool, REVIEW_SYSTEM, REVIEW_SCHEMA,
+                                    run=("AI review", f"{repo.base[:10]}..{head[:10]}"))
+        found = claude_findings(out, files, labels, (repo.root, self.snapshots.scratch_path(head, self.SCRATCH)))
+        doc = self._doc(head, files, _str(out.get("summary")), found,
                         model=model, cost=cost)
         self.save(doc)
         return doc
@@ -2874,9 +2895,10 @@ CALLPATHS_SYSTEM = (
     "it is defined, `changed` true for the components the change modifies. Edges: `from` uses or calls "
     "`to`; `label` says how in 1-4 words (calls, owns, notifies, reads, writes).\n"
     "- summary: 2-4 sentences on where the change sits in the system and which paths matter most.\n"
-    f"Plain `git` is blocked; run git read commands as `{GIT_CMD} <subcommand> ...`. The working tree "
-    f"may differ from the head; use `{GIT_CMD} show <head>:<path>` for exact versions and line numbers. "
-    "Do not modify files. Write plain English in short sentences, no em dashes."
+    f"Plain `git` is blocked; run git read commands as `{GIT_CMD} <subcommand> ...`. Your working "
+    "directory is a checkout of the head commit: Read, Grep and Glob see the files and line numbers as the "
+    "head has them. Submodules may be missing, and untracked files may be present. Do not modify files. "
+    "Write plain English in short sentences, no em dashes."
 )
 
 
@@ -2892,11 +2914,14 @@ def callpaths_prompt(base, head, log, files, what):
     return prompt, labels
 
 
-def _clean_path(root, p):
-    """A repo-relative path from what claude wrote: Read reports absolute paths."""
+def _clean_path(roots, p):
+    """A repo-relative path from what claude wrote: Read reports absolute paths under the folder claude
+    ran in, one of roots. Longest first: a worktree lies inside the repository."""
     p = _str(p).strip()
-    if p.startswith(root + os.sep):
-        p = p[len(root) + 1:]
+    for r in sorted({x for r in roots for x in (r, os.path.realpath(r))}, key=len, reverse=True):
+        if p.startswith(r + os.sep):
+            p = p[len(r) + 1:]
+            break
     while p.startswith("./"):
         p = p[2:]
     return p
@@ -2915,10 +2940,11 @@ def blob_paths(root, rev, paths):
     return {p for p, info in zip(paths, batch_check(root, rev, paths)) if info and info[1] == "blob"}
 
 
-def build_callpaths(raw, files, labels, root, rev, meta):
+def build_callpaths(raw, files, labels, root, rev, meta, ran_in=()):
     """Normalize claude's call paths into the stored form. Anchors are labels turned into
     {path, h, o, span}, as for line notes; a frame keeps its place in the stack even when its
-    path is not a file at rev, with ok false."""
+    path is not a file at rev, with ok false. ran_in: other folders claude may have run in."""
+    roots = (root, *ran_in)
     paths, frames_all = [], []
     for x in _list(raw, "paths")[:MAX_PATHS]:
         if not isinstance(x, dict):
@@ -2928,7 +2954,7 @@ def build_callpaths(raw, files, labels, root, rev, meta):
             if not isinstance(fr, dict):
                 continue
             line = fr.get("line")
-            frames.append({"path": _clean_path(root, fr.get("path"))[:1000],
+            frames.append({"path": _clean_path(roots, fr.get("path"))[:1000],
                            "line": line if type(line) is int and line > 0 else 1,
                            "function": _str(fr.get("function"))[:300], "note": _str(fr.get("note"))[:500]})
         if not frames:
@@ -2944,7 +2970,7 @@ def build_callpaths(raw, files, labels, root, rev, meta):
         ids[n["id"]] = f"n{len(nodes)}"  # the page builds Mermaid text from these ids only
         line = n.get("line")
         nodes.append({"id": ids[n["id"]], "label": n["label"].strip()[:120],
-                      "path": _clean_path(root, n.get("path"))[:1000], "line": line if type(line) is int and line > 0 else 1,
+                      "path": _clean_path(roots, n.get("path"))[:1000], "line": line if type(line) is int and line > 0 else 1,
                       "changed": n.get("changed") is True})
         frames_all.append(nodes[-1])
     edges = [{"from": ids[e["from"]], "to": ids[e["to"]], "label": _str(e.get("label")).strip()[:60]}
@@ -3007,6 +3033,8 @@ class Callpaths(Explainer):
     """Call stacks that reach the changed code, and a diagram of the components, for the range
     and per commit, kept in <git-dir>/prv/callpaths.json. Its own job slot, as a reviewer."""
 
+    SCRATCH = "-cp"
+
     def __init__(self, repo, claude):
         super().__init__(repo, claude)
         self.path = os.path.join(repo.git_dir, "prv", "callpaths.json")
@@ -3042,9 +3070,10 @@ class Callpaths(Explainer):
         head, files, commits = self._range()
         log = self._range_log(head, len(commits), "%H %s")
         prompt, labels = callpaths_prompt(repo.base, head, log, files, f"the changes {repo.base}..{head}")
-        out, cost = self._claude(prompt, model, budget, on_tool, CALLPATHS_SYSTEM, CALLPATHS_SCHEMA,
-                                 run=("call paths", f"{repo.base[:10]}..{head[:10]}"))
-        entry = build_callpaths(out, files, labels, repo.root, head, {"model": model, "cost": cost, "base": repo.base})
+        out, cost = self._claude_at(head, prompt, model, budget, on_tool, CALLPATHS_SYSTEM, CALLPATHS_SCHEMA,
+                                    run=("call paths", f"{repo.base[:10]}..{head[:10]}"))
+        entry = build_callpaths(out, files, labels, repo.root, head, {"model": model, "cost": cost, "base": repo.base},
+                                (self.snapshots.scratch_path(head, self.SCRATCH),))
         self._store(None, entry)
         return entry
 
@@ -3062,9 +3091,10 @@ class Callpaths(Explainer):
         d = repo.diff(sha)
         subject = d["message"].split("\n", 1)[0]
         prompt, labels = callpaths_prompt(f"{sha}^", sha, f"{sha} {subject}", d["files"], f"commit {sha}")
-        out, cost = self._claude(prompt, model, budget, on_tool, CALLPATHS_SYSTEM, CALLPATHS_SCHEMA,
-                                 run=("call paths", f"{sha[:10]} {subject}"[:300]))
-        entry = build_callpaths(out, d["files"], labels, repo.root, sha, {"model": model, "cost": cost})
+        out, cost = self._claude_at(sha, prompt, model, budget, on_tool, CALLPATHS_SYSTEM, CALLPATHS_SCHEMA,
+                                    run=("call paths", f"{sha[:10]} {subject}"[:300]))
+        entry = build_callpaths(out, d["files"], labels, repo.root, sha, {"model": model, "cost": cost},
+                                (self.snapshots.scratch_path(sha, self.SCRATCH),))
         self._store(pid, entry)
         return entry
 

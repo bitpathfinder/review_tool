@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for prv. Run: python3 -m unittest test_prv.py"""
 import contextlib
+import fcntl
 import io
 import json
 import os
@@ -445,7 +446,7 @@ if "--json-schema" in sys.argv:
         labels = re.findall(r"^(L[0-9]+) ", prompt, re.M)
         res = {"summary": "RS", "findings": [
             {"from": labels[0], "to": labels[-1], "severity": "high", "title": "T1", "text": "on the change"},
-            {"path": "a.txt", "line": 3, "severity": "low", "title": "T2", "text": "on a context line"},
+            {"path": os.getcwd() + "/a.txt", "line": 3, "severity": "low", "title": "T2", "text": "on a context line"},
             {"severity": "bogus", "title": "T3", "text": "no line"},
             {"from": "L999", "severity": "low", "title": "T4", "text": "unknown label"},
             {"severity": "low", "title": "empty"}]}
@@ -3822,11 +3823,18 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(self.explainer.generate_commits("haiku", None)[:3], (2, 2, []))
         calls = self.fake_calls()
         wt = lambda sha: os.path.join(self.repo.git_dir, "prv", "wt", "x-" + sha[:12])
+        # The checkout is at c2 with no tracked changes, so a run on c2 uses it and keeps its submodules.
+        here = sorted(os.listdir(self.root))
         self.assertEqual([(os.path.realpath(c["cwd"]), c["files"]) for c in calls],
-                         [(wt(c2), [".git", "b.txt"]), (wt(c1), [".git", "a.txt"]), (wt(c2), [".git", "b.txt"])])
+                         [(self.root, here), (wt(c1), [".git", "a.txt"]), (self.root, here)])
         system = lambda c: c["argv"][c["argv"].index("--append-system-prompt") + 1]
         self.assertIn("Your working directory is a checkout of the reviewed head", system(calls[0]))
         self.assertIn("Your working directory is a checkout of the commit", system(calls[1]))
+        with open(os.path.join(self.root, "b.txt"), "a") as fh:  # a tracked change: c2 needs its own checkout
+            fh.write("five\n")
+        self.explainer.generate("haiku", None)
+        self.assertEqual((os.path.realpath(self.fake_calls()[-1]["cwd"]), self.fake_calls()[-1]["files"]),
+                         (wt(c2), [".git", "b.txt"]))
         # Removed when each run ends.
         self.assertEqual(os.listdir(os.path.join(self.repo.git_dir, "prv", "wt")), [])
         self.assertNotIn("x-", self.git("worktree", "list"))
@@ -4338,6 +4346,43 @@ class ServerTest(unittest.TestCase):
                          (False, [(None, True), (None, False)]))
         self.assertFalse(self.cp.current())
         self.assertEqual(self.callpaths("wt")["doc"], None)
+
+    def test_callpaths_and_review_read_the_commit_they_are_about(self):
+        # A file renamed by a later commit keeps its old name in the earlier commit's worktree.
+        c1 = self.git("rev-parse", "HEAD")
+        self.git("mv", "a.txt", "b.txt")
+        self.git("commit", "-qm", "rename")
+        head = self.git("rev-parse", "HEAD")
+        wt = lambda sha: os.path.join(self.repo.git_dir, "prv", "wt", "x-" + sha[:12])
+        self.assertEqual(json.loads(self.req("/api/callpaths", {"commit": c1})), {"started": True})
+        c = self.wait_callpaths(c1)["doc"]
+        call = self.fake_calls()[-1]
+        self.assertEqual((os.path.realpath(call["cwd"]), call["files"]), (wt(c1) + "-cp", [".git", "a.txt"]))
+        self.assertIn("Your working directory is a checkout of the head commit",
+                      call["argv"][call["argv"].index("--append-system-prompt") + 1])
+        self.assertEqual(c["paths"][0]["frames"][1]["path"], "a.txt")  # an absolute path in the worktree
+        # The review uses the checkout while it is at the head with no tracked changes, else a worktree.
+        review = lambda: self.reviewers["claude"]._claude_review("haiku", lambda name, detail: None)
+        review()
+        self.assertEqual(os.path.realpath(self.fake_calls()[-1]["cwd"]), os.path.realpath(self.root))
+        with open(os.path.join(self.root, "b.txt"), "a") as fh:
+            fh.write("more\n")
+        # Its own worktree: an explanation run holding the head's worktree does not hold up the review.
+        os.makedirs(self.explainer.snapshots.locks, exist_ok=True)
+        with open(os.path.join(self.explainer.snapshots.locks, os.path.basename(wt(head))), "a") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            got = []
+            th = threading.Thread(target=lambda: got.append(review()), daemon=True)
+            th.start()
+            th.join(timeout=30)
+            self.assertTrue(got, "the review waited for the explanation's worktree")
+        doc = got[0]
+        call = self.fake_calls()[-1]
+        self.assertEqual((os.path.realpath(call["cwd"]), call["files"]), (wt(head) + "-review", [".git", "b.txt"]))
+        self.assertIn("Your working directory is a checkout of the reviewed head",
+                      call["argv"][call["argv"].index("--append-system-prompt") + 1])
+        self.assertEqual(doc["findings"][1]["anchor"], {"path": "a.txt", "side": "new", "line": 3})
+        self.assertEqual(os.listdir(os.path.join(self.repo.git_dir, "prv", "wt")), [])
 
     def test_callpaths_of_a_commit_follow_a_rebase(self):
         # Keyed by patch-id with hunk-relative anchors: a rebase that shifts lines keeps them on the line.
