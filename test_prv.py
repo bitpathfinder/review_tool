@@ -3481,6 +3481,90 @@ class ServerTest(unittest.TestCase):
                          ("race fix", "fix the race", False, "T1", ids[5]))
         self.assertEqual(r["resume"], f"cd {self.root} && {env} claude --resume {ids[4]}")
 
+    def wait_batch(self):
+        for _ in range(300):
+            b = json.loads(self.req("/api/batch"))
+            if not b["running"]:
+                return b
+            time.sleep(0.05)
+        self.fail("the batch did not finish")
+
+    def test_batch_answers_queued_questions_in_order(self):
+        q = lambda body: json.loads(self.req("/api/ask", {"model": "haiku", "queue": True, **body}))["thread"]
+        lines = [json.loads(l) for l in self.req("/api/ask", {"question": "first?", "model": "haiku",
+                                                               "anchor": {"view": "all"}}).splitlines()]
+        old = lines[0]["thread"]["id"]
+        t1 = q({"question": "one?", "anchor": {"view": "all", "path": "a.txt", "start": {"side": "new", "line": 2},
+                                              "end": {"side": "new", "line": 2}}})
+        t2 = q({"question": "two?", "id": old, "edits": True})
+        self.assertLess(t1["queued"], t2["queued"])  # the order the batch asks them in
+        self.assertEqual(len(self.fake_calls()), 1)
+        self.assertEqual(json.loads(self.req("/api/batch"))["queued"], 2)
+        # A queued thread takes no other question until the batch asks it.
+        for body in ({"question": "now?", "id": t1["id"]}, {"question": "again?", "id": t1["id"], "queue": True}):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                self.req("/api/ask", {"model": "haiku", **body})
+            self.assertEqual(cm.exception.code, 409)
+        # Saved: a restart keeps the queue.
+        self.assertTrue(prv.Store(self.repo.git_dir).threads[t1["id"]]["queued"])
+        self.req("/api/batch/run", {})
+        self.assertEqual((self.wait_batch()["queued"], self.wait_batch()["error"]), (0, None))
+        calls = self.fake_calls()[1:]
+        self.assertEqual([c["prompt"].rsplit("\n", 1)[-1] for c in calls], ["one?", "two?"])
+        self.assertNotIn("--resume", calls[0]["argv"])
+        self.assertEqual(calls[1]["argv"][calls[1]["argv"].index("--resume") + 1], "SESS")
+        self.assertEqual(calls[1]["argv"][calls[1]["argv"].index("--permission-mode") + 1], "acceptEdits")
+        threads = {t["id"]: t for t in json.loads(self.req("/api/threads"))}
+        for tid in (t1["id"], old):
+            self.assertFalse(threads[tid].get("queued"))
+            self.assertEqual(threads[tid]["messages"][-1]["role"], "assistant")
+            self.assertEqual(threads[tid]["messages"][-1]["text"], "answer")
+
+    def test_stopped_batch_keeps_the_rest_queued(self):
+        for n in range(2):
+            self.req("/api/ask", {"question": f"q{n}?", "model": "haiku", "queue": True, "anchor": {"view": "all"}})
+        self.runner.batch["stop"] = True  # as if Stop came before the first question started
+        self.runner._batch(lambda: False)
+        self.assertEqual((self.fake_calls(), self.runner.batch_state()["queued"]), ([], 2))
+        # A pull stops the batch before the next question.
+        self.runner.batch["stop"] = False
+        self.runner._batch(lambda: True)
+        self.assertEqual((self.runner.batch["error"], self.runner.batch_state()["queued"]), (prv.PULLING, 2))
+        # Between two questions no thread is current, so a Stop batch there stops no new turn of the user's.
+        seen = []
+        self.runner._batch(lambda: seen.append(self.runner.batch["current"]) or False)
+        self.assertEqual((seen, self.runner.batch_state()["queued"]), ([None, None, None], 0))
+
+    def test_batch_edits_question_waits_for_the_edit_lock(self):
+        self.req("/api/ask", {"question": "edit?", "model": "haiku", "queue": True, "edits": True,
+                              "anchor": {"view": "all"}})
+        self.runner.edit_lock.acquire()  # an interactive edits turn, or a push
+        try:
+            self.req("/api/batch/run", {})
+            time.sleep(0.5)
+            b = json.loads(self.req("/api/batch"))
+            self.assertEqual((b["running"], b["queued"], self.fake_calls()), (True, 1, []))
+        finally:
+            self.runner.edit_lock.release()
+        b = self.wait_batch()
+        self.assertEqual((b["queued"], b["error"], len(self.fake_calls())), (0, None, 1))
+
+    def test_queued_thread_with_an_unknown_model_keeps_its_history(self):
+        os.makedirs(os.path.join(self.repo.git_dir, "prv"), exist_ok=True)
+        with open(os.path.join(self.repo.git_dir, "prv", "threads.json"), "w") as fh:
+            json.dump([{"id": "t", "created": 5, "anchor": {"view": "all"}, "session_id": None, "running": False,
+                        "queued": 7, "messages": [{"role": "user", "text": "q", "model": "gone"}]}], fh)
+        t = prv.Store(self.repo.git_dir).threads["t"]
+        self.assertEqual((t.get("queued"), t["messages"][0]["text"]), (None, "q"))
+
+    def test_bad_queued_thread_is_set_aside(self):
+        os.makedirs(os.path.join(self.repo.git_dir, "prv"), exist_ok=True)
+        with open(os.path.join(self.repo.git_dir, "prv", "threads.json"), "w") as fh:
+            json.dump([{"id": "t", "created": 5, "anchor": {"view": "all"}, "session_id": None, "running": False,
+                        "queued": True, "messages": [{"role": "assistant", "text": "a"}]}], fh)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(prv.Store(self.repo.git_dir).threads, {})
+
     def test_question_reads_the_commit_it_is_about(self):
         # A file renamed by a later commit keeps its old name in the earlier commit's worktree.
         c1 = self.git("rev-parse", "HEAD")

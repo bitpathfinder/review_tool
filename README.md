@@ -9,6 +9,10 @@ to answer.
 - **Ask about lines.** Click a line number (shift-click for a range), type a question. The answer
   streams in, and the thread is saved in `<git-dir>/prv/threads.json`. **hide** on a thread shrinks
   it to a one-line header; **Hide threads** in the header shrinks every thread in the view.
+- **Batch questions.** **Add to batch** in the question box saves the question instead of asking it. When
+  you are done, **Process N questions** in the header asks them one at a time, in the order you added them;
+  press it again to stop. An "Allow edits" question waits while another thread edits the working tree.
+  The queue survives a restart.
 - **Chat about the PR.** In "All changes", **Chat about this PR** starts a thread about the whole PR;
   Claude also gets the PR title, description and Jira keys. In a commit view the same button asks
   about that commit.

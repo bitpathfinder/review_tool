@@ -54,6 +54,7 @@ WHOLE_FILE_CONTEXT = 10_000_000  # -U for "Whole file": more lines than any file
 MAX_BODY = 1 << 20
 SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 SINCE = "since:"  # view prefix: the changes since an earlier tip of the branch
+PULLING = "a pull is moving the working tree; try again when it ends"
 MAX_TIPS = 20
 RANGE_DIFF_TIMEOUT = 120  # seconds; a pair of ranges near MAX_COMMITS each can run far longer
 MAX_RANGE_DIFF = 400_000  # chars of range-diff patches; a rewrite of a large PR can produce megabytes
@@ -783,6 +784,8 @@ class Store:
                     msgs[-1]["error"] = "interrupted: prv stopped before the answer finished"
                 t["running"] = False
                 t.pop("stopping", None)  # another thread's save can persist a pending stop
+                if t.get("queued") and msgs[-1].get("model") not in MODELS:
+                    t.pop("queued")  # a model this prv no longer has; the thread keeps its history
                 self.threads[t["id"]] = t
             except (KeyError, TypeError, AttributeError, ValueError) as e:
                 bad = e
@@ -801,6 +804,10 @@ class Store:
               # Names a folder: Snapshots.path() joins it.
               and (t.get("tree") is None
                    or isinstance(t["tree"], str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", t["tree"]))
+              # A queued thread's last message is the question the batch asks; queued is when it was queued.
+              and (not t.get("queued") or (isinstance(t["queued"], (int, float)) and t["messages"]
+                                           and t["messages"][-1].get("role") == "user"
+                                           and isinstance(t["messages"][-1].get("text"), str)))
               and (not a.get("path") or (isinstance(a["path"], str) and isinstance(a.get("start"), dict)
                                          and isinstance(a.get("end"), dict))))
         if not ok:
@@ -1312,6 +1319,8 @@ class Runner:
         self.claude = claude
         self.edit_lock = threading.Lock()
         self.snapshots = Snapshots(repo) if repo else None
+        # The queued questions' worker; its fields change under store.lock.
+        self.batch = {"running": False, "stop": False, "current": None, "error": None}
 
     def prune_snapshots(self):
         """Removes the worktrees no thread reads from."""
@@ -1485,6 +1494,64 @@ class Runner:
             t.pop("stopping", None)  # a Stop for a turn that ended before starting claude
             st.save_locked()
 
+    def start_batch(self, pulling):
+        """Answers the queued questions one at a time, in the order they were queued, in a thread. False when it
+        runs already."""
+        with self.store.lock:
+            if self.batch["running"]:
+                return False
+            self.batch.update(running=True, stop=False, current=None, error=None)
+        threading.Thread(target=self._batch, args=(pulling,), daemon=True).start()
+        return True
+
+    def _batch(self, pulling):
+        st = self.store
+        try:
+            while True:
+                with st.lock:
+                    # Under store.lock, as in /api/ask: either a pull's busy() sees the turn running, or this sees the pull.
+                    if self.batch["stop"]:
+                        break
+                    if pulling():
+                        self.batch["error"] = PULLING
+                        break
+                    queued = sorted((t for t in st.threads.values() if t.get("queued") and not t["running"]),
+                                    key=lambda t: t["queued"])
+                    if not queued:
+                        break
+                    t = queued[0]
+                    ask = t["messages"][-1]
+                    # run() refuses an edits question while a thread or a push holds edit_lock; it waits queued.
+                    wait = bool(ask.get("edits")) and self.edit_lock.locked()
+                    if not wait:
+                        t["queued"], t["running"] = False, True
+                        self.batch["current"] = t["id"]
+                if wait:
+                    time.sleep(0.2)
+                    continue
+                try:
+                    self.run(t["id"], ask["text"], ask["model"], bool(ask.get("edits")), lambda ev: None)
+                except Exception as e:  # run() recorded the error in the thread; go on with the next question
+                    print(f"prv: batch: {e}", file=sys.stderr)
+                # Cleared, or a Stop batch between two questions stops a new turn the user started on this thread.
+                with st.lock:
+                    self.batch["current"] = None
+        finally:
+            with st.lock:
+                self.batch.update(running=False, current=None)
+
+    def stop_batch(self):
+        """No further queued question starts; the one being answered stops."""
+        with self.store.lock:
+            self.batch["stop"] = True
+            cur = self.batch["current"]
+        if cur:
+            self.stop(cur)
+
+    def batch_state(self):
+        with self.store.lock:
+            return {**self.batch, "queued": sum(bool(t.get("queued")) for t in self.store.threads.values())}
+
     def stop(self, thread_id):
         with self.store.lock:
             t = self.store.threads.get(thread_id)
@@ -1506,6 +1573,8 @@ class Runner:
         """Stop every turn and wait for each to record its end, so the saved
         threads keep partial answers and edits mode leaves no claude behind."""
         end = time.monotonic() + timeout
+        with self.store.lock:
+            self.batch["stop"] = True  # before the turns stop, or the batch starts the next question
         while True:
             with self.store.lock:
                 # Running turns without a claude yet are marked too, so claude is killed as it starts.
@@ -3074,8 +3143,6 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
             return "the call paths job"
         return None
 
-    PULLING = "a pull is moving the working tree; try again when it ends"
-
     def pulling():
         return bool(changes and changes.pulling.is_set())
 
@@ -3161,6 +3228,8 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                     return self._json({"tips": repo.since_tips(github.head_sha() if github else None)})
                 if u.path == "/api/threads":
                     return self._json(store.snapshot())
+                if u.path == "/api/batch":
+                    return self._json(runner.batch_state())
                 if u.path == "/api/sessions":
                     return self._json(sessions.snapshot() if sessions else {"disabled": True})
                 if u.path == "/api/explain":
@@ -3221,6 +3290,14 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                 return self._ask(body)
             if u.path == "/api/stop":
                 return self._json({"stopped": runner.stop(str(body.get("id", "")))})
+            if u.path == "/api/batch/run":
+                if pulling():
+                    return self._json({"error": PULLING}, 409)
+                runner.start_batch(pulling)
+                return self._json(runner.batch_state())
+            if u.path == "/api/batch/stop":
+                runner.stop_batch()
+                return self._json(runner.batch_state())
             if u.path == "/api/explain":
                 model = str(body.get("model", MODELS[0]))
                 if model not in MODELS:
@@ -3321,6 +3398,7 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
             question = str(body.get("question", "")).strip()
             model = str(body.get("model", MODELS[0]))
             edits = bool(body.get("edits"))
+            queue = bool(body.get("queue"))  # for the batch: saved, answered by /api/batch/run
             if not question:
                 return self._json({"error": "empty question"}, 400)
             if model not in MODELS:
@@ -3361,6 +3439,8 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                         return self._json({"error": "no such thread"}, 404)
                     if t["running"]:
                         return self._json({"error": "thread is busy"}, 409)
+                    if t.get("queued"):
+                        return self._json({"error": "the thread has a queued question; process the batch first"}, 409)
                 # Under store.lock: either pull's busy() sees the thread running, or the request sees the pull.
                 if pulling():
                     return self._json({"error": PULLING}, 409)
@@ -3368,9 +3448,15 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                     t = {"id": uuid.uuid4().hex[:12], "created": time.time(), "anchor": anchor,
                          "session_id": None, "messages": [], "running": False, "tree": tree}
                     store.threads[t["id"]] = t
-                t["running"] = True
                 t["messages"].append({"role": "user", "text": question, "model": model, "edits": edits})
+                if queue:
+                    t["queued"] = time.time()  # the batch asks in this order
+                    store.save_locked()
+                else:
+                    t["running"] = True
                 snapshot = json.loads(json.dumps(t))
+            if queue:  # written after store.lock: a slow client must not stall the running turns
+                return self._json({"thread": snapshot})
 
             alive = [True]
             try:
@@ -4805,6 +4891,7 @@ tr.trow>td{padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",san
 .thread.folded .thead{border-bottom:0}
 .thread.folded .msgs,.thread.folded .composer,.thread.folded .thead .sp{display:none}
 .thread.folded .thead .tq{display:block}
+span.queued{color:var(--accent)}
 .thead .trun{display:none}.thread.folded.running .thead .trun{display:inline}
 .m{padding:8px 12px;border-bottom:1px solid var(--border);background:var(--bg)}
 .m.user{white-space:pre-wrap;background:var(--thread)}
@@ -4921,6 +5008,7 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <button id="split" title="Switch between unified and side-by-side diff">Split</button>
 <select id="theme" title="Color theme"></select>
 <button id="askview" title="Start a thread about the whole view">Ask about this view</button>
+<button id="batch" hidden title="Ask Claude the questions added with 'Add to batch', one at a time"></button>
 <button id="push" hidden title="Push HEAD to the pull request's branch on GitHub">Push</button>
 <button id="pull" hidden title="Bring this checkout to the PR's latest head on GitHub, as prv new_review does">Pull</button>
 <button id="refresh" title="Reload commits and diff">Refresh</button></header>
@@ -5048,7 +5136,7 @@ function renderSide(){
   for (const t of ts) {
     const a = t.anchor, q = firstQuestion(t);
     const where = a.path ? `${a.path.split('/').pop()}:${a.end?.line ?? ''}` : viewLabel(a.view);
-    h += `<a class="item" data-thread="${t.id}" title="${esc(viewLabel(a.view))}\n${esc(q)}">${t.running?'<span class="spin"></span> ':''}<span class="sha">${esc(where)}</span> ${esc(q.slice(0,80))}</a>`;
+    h += `<a class="item" data-thread="${t.id}" title="${esc(viewLabel(a.view))}\n${esc(q)}">${t.running?'<span class="spin"></span> ':t.queued?'<span class="queued" title="Queued for the batch">⏸</span> ':''}<span class="sha">${esc(where)}</span> ${esc(q.slice(0,80))}</a>`;
   }
   h += '<h3>Claude sessions</h3>';
   h += `<a class="item" data-sessions title="Claude Code sessions to resume: prv's own runs, and the other sessions started in this checkout">${S.sess ? 'Hide sessions' : 'Show sessions…'}</a>`;
@@ -5483,7 +5571,7 @@ function modelSelect(){
 function composerHtml(running){
   return `<div class="composer"><textarea placeholder="Ask Claude… (Ctrl+Enter to send)"></textarea>
     <div class="row">${modelSelect()}<label title="Let Claude edit files in the working tree (no commits)"><input type="checkbox" class="edits"> Allow edits</label>
-    <span class="sp"></span><button class="cancel">Cancel</button><button class="stop" ${running ? '' : 'hidden'}>Stop</button><button class="primary ask" ${running ? 'disabled' : ''}>Ask</button></div></div>`;
+    <span class="sp"></span><button class="cancel">Cancel</button><button class="stop" ${running ? '' : 'hidden'}>Stop</button><button class="queue" ${running ? 'disabled' : ''} title="Save the question; 'Process questions' in the header asks them all, one at a time">Add to batch</button><button class="primary ask" ${running ? 'disabled' : ''}>Ask</button></div></div>`;
 }
 
 function renderMd(text){
@@ -5496,7 +5584,7 @@ function renderMd(text){
   return `<div class="plain">${esc(text)}</div>`;
 }
 function msgHtml(m, running){
-  if (m.role === 'user') return `<div class="m user"><div class="who">You${m.edits ? ' · edits allowed' : ''}</div>${esc(m.text)}</div>`;
+  if (m.role === 'user') return `<div class="m user"><div class="who">You${m.edits ? ' · edits allowed' : ''}${m.queued ? ' · <span class="queued">queued for the batch</span>' : ''}</div>${esc(m.text)}</div>`;
   let h = '<div class="m asst">';
   h += `<div class="who">Claude · ${esc(m.model || '')}${running ? ' <span class="spin"></span>' : ''}</div>`;
   if (m.tools?.length) h += `<div class="tools">${m.tools.map(t => '→ ' + esc(t.name) + (t.detail ? ' ' + esc(t.detail) : '')).join('<br>')}</div>`;
@@ -5505,21 +5593,25 @@ function msgHtml(m, running){
   if (!running && m.cost != null) h += `<div class="foot">$${Number(m.cost).toFixed(4)}</div>`;
   return h + '</div>';
 }
-function msgsHtml(t){ return t.messages.map((m, i) => msgHtml(m, t.running && i === t.messages.length - 1)).join(''); }
+function msgsHtml(t){
+  const last = t.messages.length - 1;
+  return t.messages.map((m, i) => msgHtml(i === last && t.queued ? {...m, queued: true} : m, t.running && i === last)).join('');
+}
 function firstQuestion(t){ return t.messages.find(x => x.role === 'user')?.text || ''; }
 function threadHtml(t, detached){
   const folded = S.fold.has(t.id), q = firstQuestion(t);
-  return `<div class="thread${folded ? ' folded' : ''}${t.running ? ' running' : ''}" id="t-${t.id}" data-id="${t.id}">
+  return `<div class="thread${folded ? ' folded' : ''}${t.running ? ' running' : ''}${t.queued ? ' queued' : ''}" id="t-${t.id}" data-id="${t.id}">
     <div class="thead"><span>${anchorLabel(t.anchor, detached)}</span><span class="tq" title="${esc(q)}">${esc(q.slice(0, 200))}</span><span class="trun spin" title="Claude is answering"></span><span class="sp"></span><a class="fold" title="${folded ? FOLD_SHOW : FOLD_HIDE}">${folded ? 'show' : 'hide'}</a><a class="del" title="Delete thread">delete</a></div>
-    <div class="msgs">${msgsHtml(t)}</div>${composerHtml(t.running).replace('<button class="cancel">Cancel</button>', '')}</div>`;
+    <div class="msgs">${msgsHtml(t)}</div>${composerHtml(t.running || t.queued).replace('<button class="cancel">Cancel</button>', '')}</div>`;
 }
 function rerenderThread(t){
   // Leaves the composer in place, so its draft, focus and options survive streaming.
   const el = document.getElementById('t-' + t.id); if (!el) return;
   $('.msgs', el).innerHTML = msgsHtml(t);
-  $('.ask', el).disabled = t.running;
+  $('.ask', el).disabled = $('.queue', el).disabled = !!(t.running || t.queued);
   $('.stop', el).hidden = !t.running;
   el.classList.toggle('running', !!t.running);
+  el.classList.toggle('queued', !!t.queued);
 }
 // Hidden threads, by id, kept per browser and repository: --port can serve two repositories on one origin.
 // loadThreads() drops the ids of deleted threads; S.threads may miss threads another tab made since.
@@ -5605,6 +5697,7 @@ $('#main').addEventListener('click', e => {
   if (e.target.closest('.stop')) return oncePerSecond('stop:' + th.dataset.id) && api('/api/stop', {method:'POST', body:JSON.stringify({id:th.dataset.id})}).catch(err => alert(err.message));
   if (e.target.closest('.cancel')) { clearSel(); return; }
   if (e.target.closest('.ask')) return submit(th);
+  if (e.target.closest('.queue')) return queueQuestion(th);
 });
 $('#main').addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target.tagName === 'TEXTAREA') { e.preventDefault(); submit(e.target.closest('.thread')); }
@@ -6546,7 +6639,57 @@ async function deleteThread(id){
   removeThreadEl(id);
   setFold([id], false);
   renderSide();
+  loadBatch();
 }
+
+function adoptNewThread(th, t){
+  // The new-line composer th becomes the saved thread t.
+  const wrap = th.closest('.trow');
+  if (wrap) { wrap.classList.remove('new'); wrap.dataset.thread = t.id; }
+  th.outerHTML = threadHtml(t);
+  document.querySelectorAll('td.sel').forEach(r => r.classList.remove('sel'));
+  S.sel = null;
+  foldLabel();
+}
+async function queueQuestion(th){
+  const ta = $('textarea', th), question = ta.value.trim();
+  if (!question || $('.queue', th).disabled) return;
+  const body = {question, model: $('.model', th).value, edits: $('.edits', th).checked, queue: true};
+  const isNew = th.classList.contains('new');
+  if (isNew) body.anchor = th._anchor; else body.id = th.dataset.id;
+  $('.queue', th).disabled = true;
+  let t;
+  try { t = (await api('/api/ask', {method:'POST', body:JSON.stringify(body)})).thread; }
+  catch(e){ $('.queue', th).disabled = false; return alert(e.message); }
+  S.threads[t.id] = t;
+  if (isNew) adoptNewThread(th, t);
+  else { ta.value = ''; rerenderThread(t); }
+  renderSide();
+  loadBatch();
+}
+async function loadBatch(){
+  const was = S.batch?.running;
+  try { S.batch = await api('/api/batch'); } catch(e){ return; }
+  const b = $('#batch'), x = S.batch;
+  if (was && !x.running) {
+    loadMeta().then(renderSide).catch(() => {});  // a question with edits may have changed the tree, as submit() reloads
+    if (x.error) alert('The batch stopped: ' + x.error);
+  }
+  b.hidden = !x.running && !x.queued;
+  b.textContent = x.running ? `Stop batch (${x.queued} left)` : `Process ${x.queued} question${x.queued === 1 ? '' : 's'}`;
+  b.title = x.running ? 'Answer no more queued questions, and stop the one being answered'
+    : "Ask Claude the questions added with 'Add to batch', one at a time, oldest first";
+}
+$('#batch').addEventListener('click', async () => {
+  const run = !S.batch?.running;
+  if (run && !confirm(`Ask Claude ${S.batch.queued} queued question${S.batch.queued === 1 ? '' : 's'}, one at a time?`)) return;
+  try { S.batch = await api(run ? '/api/batch/run' : '/api/batch/stop', {method:'POST', body:'{}'}); }
+  catch(e){ return alert(e.message); }
+  await loadThreads();
+  for (const t of Object.values(S.threads)) rerenderThread(t);
+  renderSide();
+  loadBatch();
+});
 
 async function submit(th){
   if (!th) return;
@@ -6577,14 +6720,8 @@ async function submit(th){
         if (ev.type === 'thread') {
           t = ev.thread; S.threads[t.id] = t; S.live[t.id] = true;
           t.messages.push({role:'assistant', text:'', tools:[], model, edits});
-          if (isNew) {
-            const wrap = th.closest('.trow');
-            if (wrap) { wrap.classList.remove('new'); wrap.dataset.thread = t.id; }
-            th.outerHTML = threadHtml(t);
-            document.querySelectorAll('td.sel').forEach(r => r.classList.remove('sel'));
-            S.sel = null;
-            foldLabel();
-          } else {
+          if (isNew) adoptNewThread(th, t);
+          else {
             // The question is accepted; clear it unless a new draft replaced it already.
             const cur = $(`#t-${t.id} textarea`);
             if (cur && cur.value.trim() === question) cur.value = '';
@@ -6622,7 +6759,7 @@ function viewOk(v){
 }
 
 async function reloadAll(pulled){
-  await loadMeta(); await loadThreads();
+  await loadMeta(); await loadThreads(); loadBatch();
   // A pull can take the viewed commit out of the range, or clean the tree.
   const v = S.view;
   setView(pulled && !viewOk(v) ? 'all' : v);
@@ -6661,7 +6798,10 @@ $('#pullcard').addEventListener('click', e => {
 
 // Pick up answers that are still running after a page reload.
 setInterval(async () => {
-  if (!Object.values(S.threads).some(t => t.running && !S.live[t.id])) return;
+  // A batch moves from one queued question to the next between two polls; keep polling until it ends.
+  const batch = S.batch?.running;
+  if (batch) await loadBatch();
+  if (!batch && !Object.values(S.threads).some(t => t.running && !S.live[t.id])) return;
   const before = {};
   for (const t of Object.values(S.threads)) if (!S.live[t.id]) before[t.id] = JSON.stringify(t);
   await loadThreads().catch(() => {});
@@ -6679,6 +6819,7 @@ setInterval(async () => {
 (async () => {
   try { await loadMeta(); await loadThreads(); }
   catch(e){ $('#main').innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
+  loadBatch();
   const hv = new URLSearchParams(location.hash.slice(1)).get('view');
   setView(hv && viewOk(hv) ? hv : (!S.meta.commits.length && S.meta.dirty ? 'wt' : 'all'));
 })();
