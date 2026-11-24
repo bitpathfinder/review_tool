@@ -3290,6 +3290,20 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                 return self._ask(body)
             if u.path == "/api/stop":
                 return self._json({"stopped": runner.stop(str(body.get("id", "")))})
+            if u.path in ("/api/gh/draft", "/api/gh/submit"):
+                if github is None:
+                    return self._json({"error": "GitHub is off: no gh, or --no-github"}, 400)
+                try:
+                    if u.path == "/api/gh/submit":
+                        return self._json(github.submit(str(body.get("event", "")), str(body.get("body") or "")))
+                    if body.get("delete"):
+                        return self._json({"deleted": github.delete_draft(str(body.get("id", "")))})
+                    return self._json({"draft": github.save_draft(str(body.get("body") or ""), body.get("anchor"),
+                                                                  body.get("reply_to"), str(body.get("id") or ""))})
+                except ChangeError as e:
+                    return self._json({"error": str(e)}, e.status)
+                except (OSError, GitError) as e:
+                    return self._json({"error": str(e)}, 500)
             if u.path == "/api/batch/run":
                 if pulling():
                     return self._json({"error": PULLING}, 409)
@@ -3534,13 +3548,34 @@ def gh_api(gh, path, cwd, paginate=False):
     return [_loads(x) for x in text.splitlines() if x.strip()] if paginate else _loads(text)
 
 
+class GhTimeout(OSError):
+    """gh api gave no answer in time: GitHub may have taken the request."""
+
+
+def gh_post(gh, path, cwd, data):
+    """A GitHub REST POST of the JSON object data through `gh api`. Returns the reply; raises OSError. A
+    timeout leaves it unknown whether GitHub took the request, and the error says so."""
+    try:
+        r = subprocess.run([gh, "api", "-X", "POST", path, "--input", "-"], cwd=cwd, capture_output=True,
+                           input=json.dumps(data).encode(), timeout=60)
+    except subprocess.TimeoutExpired:
+        raise GhTimeout(f"gh api {path}: timed out; GitHub may have taken it, so check the PR before trying again")
+    if r.returncode != 0:
+        raise OSError(f"gh api {path}: {(r.stdout + r.stderr).decode('utf-8', 'replace').strip()[-1000:]}")
+    try:
+        return _loads(r.stdout.decode("utf-8", "replace") or "{}")
+    except ValueError:  # posted already: an error here would keep the draft and post it again
+        return {}
+
+
 def gh_threads(comments):
     """Inline review comments grouped into threads (GitHub links a reply to the thread's first comment)."""
     roots, out = {}, []
     for c in sorted(comments, key=lambda c: c["created"]):
         t = roots.get(c["reply_to"]) if c["reply_to"] else None
         if t is None:
-            t = roots[c["id"]] = {**{k: c[k] for k in ("path", "side", "line", "original_line", "hunk")}, "comments": []}
+            t = roots[c["id"]] = {**{k: c[k] for k in ("id", "path", "side", "line", "original_line", "hunk")},
+                                  "comments": []}
             out.append(t)
         t["comments"].append({k: c[k] for k in ("user", "body", "created", "url")})
     return out
@@ -3601,7 +3636,7 @@ def check_gh_data(d):
                               and type(pr.get("number")) is int))
           and isinstance(d.get("threads", []), list) and isinstance(d.get("conversation", []), list)
           and all(strs(t, ("path", "side", "hunk")) and line(t.get("line")) and line(t.get("original_line"))
-                  and isinstance(t.get("comments"), list)
+                  and isinstance(t.get("comments"), list) and (t.get("id") is None or type(t["id"]) is int)
                   and all(strs(c, ("user", "body", "created", "url")) for c in t["comments"])
                   for t in d.get("threads", []))
           and all(strs(c, ("user", "body", "created", "url", "kind")) for c in d.get("conversation", [])))
@@ -3610,6 +3645,39 @@ def check_gh_data(d):
 
 
 SINCE_NEAR = 20  # lines a changed line may move in a since view and still carry its review thread
+MAX_GH_BODY = 65536  # GitHub's limit for a comment body
+
+
+def check_gh_draft(d):
+    """A draft from github-drafts.json, as GitHub.save_draft() writes it."""
+    pos = lambda p: isinstance(p, dict) and p.get("side") in ("old", "new") and type(p.get("line")) is int
+    if not (isinstance(d, dict) and isinstance(d.get("id"), str) and isinstance(d.get("body"), str)
+            and isinstance(d.get("created"), (int, float))):
+        return False
+    if "reply_to" in d:
+        return type(d["reply_to"]) is int
+    return isinstance(d.get("path"), str) and pos(d.get("start")) and pos(d.get("end")) and isinstance(d.get("head"), str)
+
+
+def gh_range(files, path, start, end):
+    """Lines start and end ({side, line}) of path as GitHub takes them: in one hunk of the -U3 diff files, and
+    a range that ends on a removed line all on the old side. None when GitHub would refuse them."""
+    def find(h, p):
+        if p["side"] == "old":
+            return next((ln for ln in h["lines"] if ln["t"] != "+" and ln["o"] == p["line"]), None)  # LEFT has context
+        return next((ln for ln in h["lines"] if ln["t"] != "-" and ln["n"] == p["line"]), None)
+    for f in files:
+        if file_path(f) != path:
+            continue
+        for h in f["hunks"]:
+            a, b = find(h, start), find(h, end)
+            if a and b:
+                if start["side"] == "new" and end["side"] == "old":  # a context line has an old number too
+                    return ({"side": "old", "line": a["o"]}, end) if a["t"] == " " else None
+                return start, end
+    return None
+
+
 PR_BODY_CHARS = 8000  # a long description should not crowd out the question
 
 
@@ -3634,6 +3702,162 @@ class GitHub:
             check_gh_data(self.data)
         except (OSError, ValueError):
             self.data = {}  # a cache only; the first fetch rewrites it
+        # Comments and replies for the next review, posted together by submit().
+        self.dpath = os.path.join(repo.git_dir, "prv", "github-drafts.json")
+        self.dlock = threading.Lock()
+        self.submitting = threading.Lock()
+        try:
+            with open(self.dpath) as fh:
+                self._drafts = _load_json(fh, parse_constant=_reject_constant, parse_float=_finite_float)
+            if not (isinstance(self._drafts, list) and all(map(check_gh_draft, self._drafts))):
+                raise ValueError("not a list of drafts")
+        except FileNotFoundError:
+            self._drafts = []
+        except (OSError, ValueError) as e:
+            set_aside(self.dpath, str(e))
+            self._drafts = []
+
+    def drafts(self):
+        with self.dlock:
+            return json.loads(json.dumps(self._drafts))
+
+    def _save_drafts_locked(self):
+        os.makedirs(os.path.dirname(self.dpath), exist_ok=True)
+        with open(self.dpath + ".tmp", "w") as fh:
+            json.dump(self._drafts, fh)
+        os.replace(self.dpath + ".tmp", self.dpath)
+
+    def save_draft(self, body, anchor=None, reply_to=None, did=None):
+        """Adds a draft, or changes the body of draft did. anchor: lines of the "All changes" view, with the
+        head the page drew them from, for a new comment; reply_to: the id of a thread's first comment, for a reply. Raises ChangeError or OSError."""
+        body = body.strip()
+        if not body or len(body) > MAX_GH_BODY:
+            raise ChangeError(f"a comment needs 1 to {MAX_GH_BODY} characters")
+        if not did and reply_to is None:
+            # Checked before dlock: the diff of a large PR takes seconds, and every /api/github reads the drafts.
+            anchor = anchor if isinstance(anchor, dict) else {}
+            start, end = _pos(anchor.get("start")), _pos(anchor.get("end"))
+            if anchor.get("view") != "all" or not isinstance(anchor.get("path"), str) or not (start and end):
+                raise ChangeError("a GitHub comment goes on lines of the \"All changes\" view")
+            # GitHub numbers lines as the PR head has them: submit() checks that HEAD is still this one.
+            if anchor.get("head") != self.repo.head_sha():
+                raise ChangeError("HEAD moved since the page drew these lines; reload the page", 409)
+            # GitHub refuses the whole review over one line outside its diff, such as a "Whole file" line.
+            span = gh_range(self.repo.diff("all")["files"], anchor["path"], start, end)
+            if not span:
+                raise ChangeError("GitHub takes comments only on lines of one hunk of the PR's diff, "
+                                  "and a range that ends on a removed line cannot start on an added one")
+            start, end = span
+        with self.dlock:
+            if did and self.submitting.locked():
+                raise ChangeError("a review is being posted; edit the comment when it ends", 409)
+            if did:
+                d = next((d for d in self._drafts if d["id"] == did), None)
+                if d is None:
+                    raise ChangeError("no such draft", 404)
+                d["body"] = body
+            elif reply_to is not None:
+                threads = self.data.get("threads") or []
+                if type(reply_to) is not int or not any(t.get("id") == reply_to for t in threads):
+                    raise ChangeError("no such GitHub thread; refresh GitHub", 404)
+                d = {"id": uuid.uuid4().hex[:12], "created": time.time(), "body": body, "reply_to": reply_to}
+                self._drafts.append(d)
+            else:
+                d = {"id": uuid.uuid4().hex[:12], "created": time.time(), "body": body, "path": anchor["path"],
+                     "start": start, "end": end, "head": anchor["head"]}
+                self._drafts.append(d)
+            self._save_drafts_locked()
+            return dict(d)
+
+    def delete_draft(self, did):
+        with self.dlock:
+            if self.submitting.locked():  # submit() may be posting this draft
+                raise ChangeError("a review is being posted; delete the comment when it ends", 409)
+            before = len(self._drafts)
+            self._drafts = [d for d in self._drafts if d["id"] != did]
+            if len(self._drafts) == before:
+                return False
+            self._save_drafts_locked()
+            return True
+
+    def submit(self, event, body):
+        """Posts the drafts: the new comments as one review with event and body, then each reply. A posted
+        draft is removed at once, so a failure part way and a retry post nothing twice. Returns
+        {"review": url or None, "replies": n, "errors": [...]}; raises ChangeError when nothing was posted."""
+        if event not in ("COMMENT", "APPROVE", "REQUEST_CHANGES"):
+            raise ChangeError("unknown review event")
+        if len(body) > MAX_GH_BODY:
+            raise ChangeError(f"the review summary is over {MAX_GH_BODY} characters")
+        if not self.submitting.acquire(blocking=False):
+            raise ChangeError("a review is being posted", 409)
+        try:
+            with self.lock:
+                pr = self.data.get("pr") if self.fresh else None
+            target = gh_remote(self.repo.root, "upstream") or gh_remote(self.repo.root, "origin")
+            if not pr or not target:
+                raise ChangeError("no pull request read from GitHub in this run; press Refresh in the GitHub card")
+            path = f"repos/{target[0]}/{target[1]}/pulls/{pr['number']}"
+            drafts = self.drafts()
+            lines = [d for d in drafts if "path" in d]
+            replies = [d for d in drafts if "reply_to" in d]
+            out = {"review": None, "replies": 0, "errors": []}
+            review = bool(lines or body.strip() or event != "COMMENT")
+            if not review and not replies:
+                raise ChangeError("nothing to post: write a comment or a summary, or pick Approve or Request changes")
+            # GitHub refuses an empty Request changes; refused here with a clear message, before anything posts.
+            if event == "REQUEST_CHANGES" and not lines and not body.strip():
+                raise ChangeError("Request changes needs a summary or a line comment")
+            if review:
+                try:
+                    head = self._api(path)["head"]["sha"]
+                except (OSError, ValueError, KeyError, TypeError) as e:
+                    raise ChangeError(f"cannot read the PR from GitHub: {e}")
+                local = self.repo.head_sha()
+                if local != head:
+                    raise ChangeError(f"HEAD {local[:10]} is not the PR head {head[:10]} on GitHub, so line numbers "
+                                      "would not match; pull, or push, first")
+                stale = [d for d in lines if d["head"] != head]
+                if stale:
+                    raise ChangeError(f"{len(stale)} comment(s) were written on another HEAD; delete them or write them "
+                                      "again on this one")
+                side = lambda s: "LEFT" if s == "old" else "RIGHT"
+                comments = []
+                for d in lines:
+                    c = {"path": d["path"], "body": d["body"], "line": d["end"]["line"], "side": side(d["end"]["side"])}
+                    if d["start"] != d["end"]:
+                        c.update(start_line=d["start"]["line"], start_side=side(d["start"]["side"]))
+                    comments.append(c)
+                try:
+                    r = gh_post(self.gh, f"{path}/reviews", self.repo.root,
+                                {"commit_id": head, "event": event, "body": body, "comments": comments})
+                except GhTimeout as e:  # the drafts stay; the message tells to check the PR before a retry
+                    raise ChangeError(f"no answer from GitHub about the review: {e}")
+                except OSError as e:
+                    raise ChangeError(f"GitHub refused the review, nothing was posted: {e}")
+                out["review"] = str(r.get("html_url") or "") if isinstance(r, dict) else ""
+                self._forget({d["id"] for d in lines})
+            for d in replies:
+                try:
+                    gh_post(self.gh, f"{path}/comments/{d['reply_to']}/replies", self.repo.root, {"body": d["body"]})
+                except OSError as e:
+                    out["errors"].append(str(e))
+                    continue
+                self._forget({d["id"]})
+                out["replies"] += 1
+            if out["review"] is None and not out["replies"] and out["errors"]:
+                raise ChangeError("; ".join(out["errors"]))
+            return out
+        finally:
+            self.submitting.release()
+            self.start()  # show what GitHub has now
+
+    def _forget(self, ids):
+        with self.dlock:
+            self._drafts = [d for d in self._drafts if d["id"] not in ids]
+            try:
+                self._save_drafts_locked()
+            except OSError as e:  # posted already: a stale draft file would post it again on the next submit
+                print(f"prv: cannot save {self.dpath}: {e}; delete the posted drafts by hand", file=sys.stderr)
 
     def _api(self, path, paginate=False):
         return gh_api(self.gh, path, self.repo.root, paginate)
@@ -3780,7 +4004,7 @@ class GitHub:
         out = {"fetching": fetching, "fetched": d.get("fetched"), "error": d.get("error"), "pr": pr,
                "own": bool(self.login and pr and pr.get("user") == self.login),
                "jira": [{"key": k, "url": self.jira_url + k} for k in d.get("jira") or [] if isinstance(k, str)],
-               "threads": [], "conversation": d.get("conversation") or []}
+               "threads": [], "conversation": d.get("conversation") or [], "drafts": self.drafts()}
         since, commit = view.startswith(SINCE), bool(SHA_RE.match(view))
         if (view == "all" or since or commit) and d.get("threads"):
             try:
@@ -4842,6 +5066,14 @@ header .ghlinks:empty,header .prtitle:empty{display:none}
 .ghhunk{margin:0;padding:6px 10px;background:var(--bg2);font-size:12px;overflow:auto;border-bottom:1px solid var(--border)}
 .thread.gh{border-left:3px solid var(--muted)}
 .thread.gh .thead a{cursor:pointer}
+.thread.gh.draft{border-left-color:var(--accent)}
+.m.gh.draft{background:var(--bg2)}
+.m.gh a[data-ghedit],.m.gh a[data-ghdel],.ghact a,#reviewcard a[data-ghdel]{cursor:pointer;color:var(--accent)}
+.ghact{padding:4px 10px;font-size:12px}
+.ghcomposer{padding:6px 10px;display:flex;flex-direction:column;gap:6px}
+.ghcomposer .row{display:flex;gap:8px}.ghcomposer .sp{flex:1}
+.ghcomposer textarea,#reviewcard textarea{width:100%;min-height:64px;font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--border);border-radius:6px;padding:6px}
+#reviewcard ul{margin:6px 0;padding-left:18px}#reviewcard label{display:inline-flex;gap:4px;align-items:center}
 button{font:inherit;font-size:13px;padding:4px 10px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer}
 button:hover{background:var(--bg2)}
 button.primary{background:#1f883d;border-color:#1f883d;color:#fff}
@@ -5011,9 +5243,11 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <button id="batch" hidden title="Ask Claude the questions added with 'Add to batch', one at a time"></button>
 <button id="push" hidden title="Push HEAD to the pull request's branch on GitHub">Push</button>
 <button id="pull" hidden title="Bring this checkout to the PR's latest head on GitHub, as prv new_review does">Pull</button>
+<button id="ghreview" hidden title="Post your pending GitHub comments and replies as one review">Review</button>
 <button id="refresh" title="Reload commits and diff">Refresh</button></header>
 <div class="pushcard" id="pushcard" hidden></div>
 <div class="pushcard" id="pullcard" hidden></div>
+<div class="pushcard" id="reviewcard" hidden></div>
 <div class="defpop" id="defpop" hidden></div>
 <div class="srcpop" id="srcpop" hidden></div>
 <div class="layout"><aside id="side"></aside><div class="vgrip" id="sidegrip" title="Drag to resize the side panel; double-click for its default width"></div><main id="main"><div class="empty">Loading…</div></main></div>
@@ -5558,20 +5792,25 @@ function lowestRow(fi, a, b){
 }
 
 function lineRef(p){ return `${p.side === 'old' ? 'L-' : 'L'}${p.line}`; }
+function rangeRef(a){
+  return a.start.side === a.end.side && a.start.line === a.end.line ? lineRef(a.end) : `${lineRef(a.start)}–${lineRef(a.end)}`;
+}
 function anchorLabel(a, detached){
   if (!a.path) return esc(viewLabel(a.view));
-  const r = (a.start.side === a.end.side && a.start.line === a.end.line) ? lineRef(a.end) : `${lineRef(a.start)}–${lineRef(a.end)}`;
-  return `${esc(a.path)}:${r}${detached ? ` (${detached})` : ''}`;
+  return `${esc(a.path)}:${rangeRef(a)}${detached ? ` (${detached})` : ''}`;
 }
 
 function modelSelect(){
   const cur = ls.get('prv:model') || S.meta.models[0];
   return `<select class="model">${S.meta.models.map(m => `<option ${m===cur?'selected':''}>${m}</option>`).join('')}</select>`;
 }
-function composerHtml(running){
+function composerHtml(running, gh, queued){
+  // gh: lines of "All changes" in a PR, where the text can also become a pending GitHub comment.
+  // queued: the thread waits for the batch; it takes no question, and has nothing to stop.
+  const busy = running || queued;
   return `<div class="composer"><textarea placeholder="Ask Claude… (Ctrl+Enter to send)"></textarea>
     <div class="row">${modelSelect()}<label title="Let Claude edit files in the working tree (no commits)"><input type="checkbox" class="edits"> Allow edits</label>
-    <span class="sp"></span><button class="cancel">Cancel</button><button class="stop" ${running ? '' : 'hidden'}>Stop</button><button class="queue" ${running ? 'disabled' : ''} title="Save the question; 'Process questions' in the header asks them all, one at a time">Add to batch</button><button class="primary ask" ${running ? 'disabled' : ''}>Ask</button></div></div>`;
+    <span class="sp"></span><button class="cancel">Cancel</button><button class="stop" ${running ? '' : 'hidden'}>Stop</button>${gh ? '<button class="ghadd" title="Save the text as a pending GitHub comment on these lines; Review in the header posts it">GitHub comment</button>' : ''}<button class="queue" ${busy ? 'disabled' : ''} title="Save the question; 'Process N questions' in the header asks them all, one at a time">Add to batch</button><button class="primary ask" ${busy ? 'disabled' : ''}>Ask</button></div></div>`;
 }
 
 function renderMd(text){
@@ -5602,7 +5841,7 @@ function threadHtml(t, detached){
   const folded = S.fold.has(t.id), q = firstQuestion(t);
   return `<div class="thread${folded ? ' folded' : ''}${t.running ? ' running' : ''}${t.queued ? ' queued' : ''}" id="t-${t.id}" data-id="${t.id}">
     <div class="thead"><span>${anchorLabel(t.anchor, detached)}</span><span class="tq" title="${esc(q)}">${esc(q.slice(0, 200))}</span><span class="trun spin" title="Claude is answering"></span><span class="sp"></span><a class="fold" title="${folded ? FOLD_SHOW : FOLD_HIDE}">${folded ? 'show' : 'hide'}</a><a class="del" title="Delete thread">delete</a></div>
-    <div class="msgs">${msgsHtml(t)}</div>${composerHtml(t.running || t.queued).replace('<button class="cancel">Cancel</button>', '')}</div>`;
+    <div class="msgs">${msgsHtml(t)}</div>${composerHtml(t.running, false, t.queued).replace('<button class="cancel">Cancel</button>', '')}</div>`;
 }
 function rerenderThread(t){
   // Leaves the composer in place, so its draft, focus and options survive streaming.
@@ -5698,9 +5937,14 @@ $('#main').addEventListener('click', e => {
   if (e.target.closest('.cancel')) { clearSel(); return; }
   if (e.target.closest('.ask')) return submit(th);
   if (e.target.closest('.queue')) return queueQuestion(th);
+  if (e.target.closest('.ghadd')) return addGhDraft(th);
 });
 $('#main').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target.tagName === 'TEXTAREA') { e.preventDefault(); submit(e.target.closest('.thread')); }
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target.tagName === 'TEXTAREA') {
+    e.preventDefault();
+    if (e.target.classList.contains('ghta')) $('[data-ghsave]', e.target.closest('.ghcomposer'))?.click();
+    else submit(e.target.closest('.thread'));
+  }
   if (e.key === 'Escape' && e.target.closest('.thread.new')) clearSel();
 });
 $('#main').addEventListener('change', e => { if (e.target.classList.contains('model')) ls.set('prv:model', e.target.value); });
@@ -5724,7 +5968,7 @@ function selectLine(fi, k, extend){
   const anchor = {view:S.view, path:filePath(f), start:{side:lineSide(la), line:lineNo(la)}, end:{side:lineSide(lb), line:lineNo(lb)},
     text: f.flat.slice(a, b + 1).map(l => l.t + l.s).join('\n')};
   row.insertAdjacentHTML('afterend', `<tr class="trow new"><td colspan="${colCount(row)}"><div class="thread new">
-    <div class="thead"><span>${anchorLabel(anchor)}</span></div>${composerHtml(false)}</div></td></tr>`);
+    <div class="thead"><span>${anchorLabel(anchor)}</span></div>${composerHtml(false, S.view === 'all' && !!S.gh?.pr)}</div></td></tr>`);
   const th = $('.thread.new'); th._anchor = anchor;
   const ta = $('textarea', th); ta.value = draft; ta.focus();
 }
@@ -5793,7 +6037,7 @@ $('#pushcard').addEventListener('click', async e => {
 async function loadGitHub(){
   const v = S.view, seq = S.seq;
   let g;
-  try { g = await api('/api/github?view=' + encodeURIComponent(v)); } catch(e){ g = {error: e.message, pr: S.gh?.pr, jira: S.gh?.jira}; }
+  try { g = await api('/api/github?view=' + encodeURIComponent(v)); } catch(e){ g = {error: e.message, pr: S.gh?.pr, jira: S.gh?.jira, drafts: S.gh?.drafts}; }
   if (S.seq !== seq) return;
   S.gh = g;
   renderGitHub();
@@ -5813,11 +6057,29 @@ function lineK(a){
   return null;
 }
 function renderGitHub(){
+  // Expanding a file or a GitHub poll rebuilds the rows; an open reply or edit keeps its text.
+  // The composer being typed in keeps its focus and caret too.
+  const open = [...document.querySelectorAll('.ghcomposer')].map(c => {
+    const ta = $('textarea', c);
+    return [c.dataset.edit ? 'ghedit' : 'ghreply', c.dataset.edit || c.dataset.reply, ta.value,
+      ta === document.activeElement && [ta.selectionStart, ta.selectionEnd]];
+  });
+  drawGitHub();
+  for (const [k, id, text, caret] of open) {
+    const a = document.querySelector(`[data-${k}="${CSS.escape(id)}"]`);
+    const c = a && openGhComposer(a, text);
+    if (c && caret) { const ta = $('textarea', c); ta.focus(); ta.setSelectionRange(...caret); }
+  }
+}
+function drawGitHub(){
   const g = S.gh;
   $('#ghpr').innerHTML = g?.pr ? `<a ${ext(g.pr.url)}>PR #${g.pr.number}</a>` : '';
   $('#prtitle').textContent = $('#prtitle').title = g?.pr?.title || '';
   $('#ghlinks').innerHTML = (g?.jira || []).map(j => `<a ${ext(j.url)}>${esc(j.key)}</a>`).join('');
   $('#push').hidden = !(S.meta?.push && g?.own && g.pr.state === 'open');
+  const nd = (g?.drafts || []).length;
+  $('#ghreview').hidden = !g?.pr;
+  $('#ghreview').textContent = nd ? `Review (${nd})` : 'Review';
   const prChat = S.view === 'all' && g?.pr;
   $('#askview').textContent = prChat ? 'Chat about this PR' : 'Ask about this view';
   $('#askview').title = prChat ? 'Start a thread about the whole PR; Claude also gets its description'
@@ -5832,8 +6094,17 @@ function renderGitHub(){
     const at = t.anchor && lineK(t.anchor);
     if (!at) { loose.push(ti); return; }
     const row = lowestRow(at[0], at[1], at[1]);
-    row.insertAdjacentHTML('afterend', `<tr class="trow ghrow" data-gh="${ti}"><td colspan="${colCount(row)}"><div class="thread gh"><div class="thead"><span>GitHub · ${esc(t.path.split('/').pop())}:${lineRef(t.anchor)}</span><span class="sp"></span><a data-ghask="${ti}">Discuss with Claude</a></div>${ghComments(t.comments)}</div></td></tr>`);
+    row.insertAdjacentHTML('afterend', `<tr class="trow ghrow" data-gh="${ti}"><td colspan="${colCount(row)}"><div class="thread gh"><div class="thead"><span>GitHub · ${esc(t.path.split('/').pop())}:${lineRef(t.anchor)}</span><span class="sp"></span><a data-ghask="${ti}">Discuss with Claude</a></div>${ghComments(t.comments)}${ghReplies(t)}</div></td></tr>`);
   });
+  // GitHub numbers lines as the PR head has them, which is what "All changes" shows.
+  // A draft written on another HEAD would land on whatever line has its number now; the Review card lists it.
+  const head = S.meta?.commits.at(-1)?.sha;
+  if (S.view === 'all') for (const d of (g.drafts || []).filter(d => d.path && d.head === head)) {
+    const at = lineK({path: d.path, side: d.end.side, line: d.end.line});
+    if (!at) continue;
+    const row = lowestRow(at[0], at[1], at[1]);
+    row.insertAdjacentHTML('afterend', `<tr class="trow ghrow"><td colspan="${colCount(row)}"><div class="thread gh draft"><div class="thead"><span>GitHub · ${esc(d.path.split('/').pop())}:${rangeRef(d)}</span></div>${ghDraftHtml(d)}</div></td></tr>`);
+  }
   // A commit view gets only the threads on its own lines, inline; the card belongs to the PR's views.
   if (S.view !== 'all' && !S.view.startsWith(SINCE)) { el.hidden = true; return; }
   let h = '';
@@ -5847,13 +6118,120 @@ function renderGitHub(){
   h += `<div class="xmeta"><span>${parts.join(' · ')}</span><span class="sp"></span>${g.fetching ? '' : '<button data-ghrefresh>Refresh</button>'}</div>`;
   if (loose.length) h += `<details ${S.view === 'all' ? 'open' : ''}><summary>Review threads not beside the diff (${loose.length}): outdated, or on lines this diff does not show</summary>${loose.map(ti => {
     const t = threads[ti];
-    return `<div class="thread gh"><div class="thead"><span>${esc(t.path)}:${t.line ?? t.original_line ?? ''}${t.line == null ? ' · outdated' : ''}</span><span class="sp"></span><a data-ghask="${ti}">Discuss with Claude</a></div><pre class="ghhunk">${esc(t.hunk.split('\n').slice(-6).join('\n'))}</pre>${ghComments(t.comments)}</div>`;
+    return `<div class="thread gh"><div class="thead"><span>${esc(t.path)}:${t.line ?? t.original_line ?? ''}${t.line == null ? ' · outdated' : ''}</span><span class="sp"></span><a data-ghask="${ti}">Discuss with Claude</a></div><pre class="ghhunk">${esc(t.hunk.split('\n').slice(-6).join('\n'))}</pre>${ghComments(t.comments)}${ghReplies(t)}</div>`;
   }).join('')}</details>`;
   if (conv.length) h += `<details><summary>Conversation (${conv.length})</summary>${conv.map((c, ci) => `<div class="thread gh"><div class="thead"><span>@${esc(c.user)}</span><span class="sp"></span><a data-ghconv="${ci}">Discuss with Claude</a></div>${ghComments([c])}</div>`).join('')}</details>`;
   // Polls rebuild the same card; skip the write so open <details> and a text selection survive.
   if (el._html !== h) { el.innerHTML = h; el._html = h; }
   el.hidden = false;
 }
+function ghDraftHtml(d){
+  return `<div class="m gh draft" data-draft="${esc(d.id)}"><div class="who">Pending ${d.reply_to != null ? 'reply' : 'comment'}, posted with your review · <a data-ghedit="${esc(d.id)}">edit</a> · <a data-ghdel="${esc(d.id)}">delete</a></div><div class="dbody">${renderMd(d.body)}</div></div>`;
+}
+function ghReplies(t){
+  // Threads read before prv kept their first comment's id cannot take a reply until GitHub is read again.
+  if (t.id == null) return '';
+  return (S.gh?.drafts || []).filter(d => d.reply_to === t.id).map(ghDraftHtml).join('')
+    + `<div class="ghact"><a data-ghreply="${t.id}">Reply</a></div>`;
+}
+function ghComposer(attr, text){
+  return `<div class="ghcomposer" ${attr}><textarea class="ghta" placeholder="Write on GitHub… (Ctrl+Enter to save; Review in the header posts it)">${esc(text || '')}</textarea>
+    <div class="row"><span class="sp"></span><button data-ghcancel>Cancel</button><button class="primary" data-ghsave>Save to review</button></div></div>`;
+}
+function openGhComposer(a, text){
+  // a: an edit link of a pending comment, or a Reply link of a GitHub thread.
+  let at;
+  if (a.dataset.ghedit) {
+    const m = a.closest('.m.draft'), d = (S.gh?.drafts || []).find(x => x.id === a.dataset.ghedit);
+    if (!m || !d || $('.ghcomposer', m)) return;
+    at = $('.dbody', m);
+    at.insertAdjacentHTML('afterend', ghComposer(`data-edit="${esc(d.id)}"`, text ?? d.body));
+  } else {
+    at = a.closest('.ghact');
+    at.insertAdjacentHTML('afterend', ghComposer(`data-reply="${esc(a.dataset.ghreply)}"`, text));
+  }
+  const c = at.nextElementSibling, card = at.closest('#ghcard');
+  at.remove();
+  if (card) card._html = null;  // the card now differs from its html: the next draw rewrites it
+  if (text == null) $('textarea', c).focus();
+  return c;
+}
+async function addGhDraft(th){
+  const body = $('textarea', th).value.trim(), b = $('.ghadd', th);
+  if (!body || b.disabled) return;  // a second click while the first saves would save the comment twice
+  const anchor = {...th._anchor, head: S.meta.commits.at(-1)?.sha};  // the head this diff was drawn from
+  b.disabled = true;
+  try { await api('/api/gh/draft', {method:'POST', body:JSON.stringify({body, anchor})}); }
+  catch(e){ b.disabled = false; return alert(e.message); }
+  clearSel();
+  await loadGitHub();
+}
+function openReview(keep){
+  const c = $('#reviewcard'), g = S.gh, ds = g?.drafts || [];
+  if (!g?.pr) return;
+  const body = keep ? $('.rbody', c)?.value || '' : '', ev = keep ? $('input[name=rev]:checked', c)?.value : 'COMMENT';
+  const where = d => d.path ? `${esc(d.path)}:${rangeRef(d)}` : `reply on ${esc((g.threads || []).find(t => t.id === d.reply_to)?.path || 'a thread')}`;
+  $('#pushcard').hidden = $('#pullcard').hidden = true;
+  c.innerHTML = `<div><b>Review of PR #${g.pr.number}</b> ${esc(g.pr.title)}</div>`
+    + (ds.length ? `<ul>${ds.map(d => `<li>${where(d)}: ${esc(d.body.split('\n')[0].slice(0, 120))} <a data-ghdel="${esc(d.id)}">delete</a></li>`).join('')}</ul>`
+      : `<div class="muted">No pending comments. You can still ${g.own ? 'comment on' : 'comment on, approve or request changes to'} the PR as a whole.</div>`)
+    + `<textarea class="rbody" placeholder="Summary (optional when there are line comments)">${esc(body)}</textarea>`
+    // GitHub refuses Approve and Request changes from the PR's author.
+    + `<div class="row">${[['COMMENT', 'Comment'], ...(g.own ? [] : [['APPROVE', 'Approve'], ['REQUEST_CHANGES', 'Request changes']])].map(([v, l]) => `<label><input type="radio" name="rev" value="${v}" ${v === ev ? 'checked' : ''}> ${l}</label>`).join('')}`
+    + `<span class="sp"></span><button data-rclose>Close</button><button class="primary" data-rsubmit>Submit review</button></div><div class="rout"></div>`;
+  c.hidden = false;
+}
+$('#ghreview').addEventListener('click', () => { const c = $('#reviewcard'); if (c.hidden) openReview(false); else c.hidden = true; });
+async function submitReview(b){
+  const c = $('#reviewcard'), ev = $('input[name=rev]:checked', c).value, body = $('.rbody', c).value, g = S.gh;
+  const ds = g?.drafts || [], nl = ds.filter(d => d.path).length, nr = ds.length - nl;
+  const what = [nl && `${nl} line comment${nl === 1 ? '' : 's'}`, nr && `${nr} repl${nr === 1 ? 'y' : 'ies'}`, body.trim() && 'the summary']
+    .filter(Boolean).join(', ') || 'no text';
+  const label = {COMMENT: 'Comment', APPROVE: 'Approve', REQUEST_CHANGES: 'Request changes'}[ev];
+  if (!confirm(`Post to GitHub PR #${g.pr.number} as "${label}": ${what}?`)) return;
+  b.disabled = true;
+  const out = $('.rout', c);
+  out.innerHTML = '<span class="spin">Posting to GitHub</span>';
+  let posted = false;  // the review, with its summary and event
+  try {
+    const r = await api('/api/gh/submit', {method:'POST', body:JSON.stringify({event: ev, body})});
+    const done = [r.review != null && (r.review ? `the review (<a ${ext(r.review)}>GitHub ↗</a>)` : 'the review'), r.replies && `${r.replies} repl${r.replies === 1 ? 'y' : 'ies'}`].filter(Boolean);
+    out.innerHTML = `<div>Posted ${done.join(' and ')}.</div>` + r.errors.map(x => `<div class="warn">Still pending: ${esc(x)}</div>`).join('');
+    posted = r.review != null;
+  } catch(e){ out.innerHTML = `<div class="warn">${esc(e.message)}</div>`; }
+  b.disabled = false;
+  await loadGitHub();
+  // Posted drafts leave the list; a posted review's summary and event reset, so Submit cannot repeat them.
+  const res = out.innerHTML;
+  if (!c.hidden) { openReview(!posted); $('.rout', c).innerHTML = res; }
+}
+document.addEventListener('click', async e => {
+  const del = e.target.closest('[data-ghdel]'), edit = e.target.closest('[data-ghedit]'), reply = e.target.closest('[data-ghreply]');
+  if (del) {
+    if (!confirm('Delete this pending GitHub comment?')) return;
+    try { await api('/api/gh/draft', {method:'POST', body:JSON.stringify({id: del.dataset.ghdel, delete: true})}); } catch(err){ return alert(err.message); }
+    await loadGitHub();
+    if (!$('#reviewcard').hidden) openReview(true);
+    return;
+  }
+  if (edit || reply) return openGhComposer(edit || reply);
+  const comp = e.target.closest('.ghcomposer');
+  if (comp && e.target.closest('[data-ghcancel]')) { comp.remove(); return renderGitHub(); }
+  const save = comp && e.target.closest('[data-ghsave]');
+  if (save) {
+    const body = $('textarea', comp).value.trim();
+    if (!body || save.disabled) return;  // a second click while the first saves would add the reply twice
+    const req = comp.dataset.edit ? {id: comp.dataset.edit, body} : {reply_to: +comp.dataset.reply, body};
+    save.disabled = true;
+    try { await api('/api/gh/draft', {method:'POST', body:JSON.stringify(req)}); } catch(err){ save.disabled = false; return alert(err.message); }
+    comp.remove();  // else renderGitHub keeps it open
+    return loadGitHub();
+  }
+  if (e.target.closest('#reviewcard [data-rclose]')) { $('#reviewcard').hidden = true; return; }
+  const sb = e.target.closest('#reviewcard [data-rsubmit]');
+  if (sb && !sb.disabled) return submitReview(sb);
+});
+
 function ghDiscuss(t, c){
   // A thread on a shown line opens a composer on that line; anything else asks about the view.
   // The comments go to Claude as quoted context.

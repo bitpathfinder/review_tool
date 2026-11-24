@@ -721,8 +721,13 @@ class FetchTest(unittest.TestCase):
 
 FAKE_GH = r"""#!/usr/bin/env python3
 import json, os, sys
-# argv: api PATH [--paginate --jq .[]]; FAKE_GH maps a path prefix to a response, "!" = fail.
+# argv: api PATH [--paginate --jq .[]], or api -X POST PATH --input - with the JSON body on stdin.
+# FAKE_GH maps a path prefix ("POST PATH" for a post) to a response, "!" = fail, {"!raw": text} = text as is.
 path = sys.argv[2]
+if path == "-X":
+    path = "POST " + sys.argv[4]
+    with open(os.environ["FAKE_GH_LOG"] + ".post", "a") as fh:
+        fh.write(json.dumps({"path": sys.argv[4], "body": json.load(sys.stdin)}) + "\n")
 with open(os.environ["FAKE_GH_LOG"], "a") as fh:
     fh.write(path + "\n")
 for prefix, res in json.loads(os.environ["FAKE_GH"]).items():
@@ -730,7 +735,9 @@ for prefix, res in json.loads(os.environ["FAKE_GH"]).items():
         if res == "!":
             print("HTTP 404: Not Found", file=sys.stderr)
             sys.exit(1)
-        if "--paginate" in sys.argv:
+        if isinstance(res, dict) and "!raw" in res:
+            print(res["!raw"])
+        elif "--paginate" in sys.argv:
             for x in res:
                 print(json.dumps(x))
         else:
@@ -830,6 +837,134 @@ class GitHubTest(unittest.TestCase):
 
     def git_head(self):
         return prv.git(self.root, "rev-parse", "HEAD").strip()
+
+    def posts(self):
+        try:
+            with open(self.log + ".post") as fh:
+                return [json.loads(l) for l in fh]
+        except FileNotFoundError:
+            return []
+
+    def review_pr(self, head, **extra):
+        gh = self.fetch({"repos/scylla/db/pulls/55/comments": [self.comment(1, 7, "+new five", body="why?")],
+                         "repos/scylla/db/pulls/55/": [], "repos/scylla/db/issues/55/": [],
+                         "repos/scylla/db/pulls/55": {"number": 55, "title": "T", "state": "open",
+                                                      "user": {"login": "me"}, "head": {"sha": head}}, **extra}, pr=55)
+        gh.start = mock.Mock()  # submit() refreshes in the background, past the test's checkout
+        return gh
+
+    def test_review_posts_comments_then_replies(self):
+        head = self.git_head()
+        gh = self.review_pr(head, **{"POST repos/scylla/db/pulls/55/reviews": {"html_url": "https://github.com/r"},
+                                     "POST repos/scylla/db/pulls/55/comments/1/replies": {"id": 9}})
+        one = {"view": "all", "path": "a.txt", "start": {"side": "new", "line": 6}, "end": {"side": "new", "line": 6}, "head": self.git_head()}
+        two = {**one, "start": {"side": "old", "line": 5}, "end": {"side": "new", "line": 7}}
+        d1 = gh.save_draft(" first ", one)
+        gh.save_draft("second", two)
+        gh.save_draft("a reply", reply_to=1)
+        self.assertEqual(gh.save_draft("first, edited", did=d1["id"])["body"], "first, edited")
+        self.assertEqual(len(gh.for_view("all")["drafts"]), 3)
+        self.assertEqual(len(prv.GitHub(self.repo, self.gh).drafts()), 3)  # saved
+        for bad in ({"anchor": {**one, "view": head}}, {"anchor": one, "body": " "}, {"reply_to": 2},
+                    {"anchor": {**one, "head": "c" * 40}}, {"anchor": "x"},
+                    # Line 1 is outside the PR diff's hunk: GitHub would refuse the whole review.
+                    {"anchor": {**one, "start": {"side": "new", "line": 1}, "end": {"side": "new", "line": 1}}}):
+            with self.assertRaises(prv.ChangeError):
+                gh.save_draft(bad.get("body", "x"), bad.get("anchor"), bad.get("reply_to"))
+        r = gh.submit("REQUEST_CHANGES", "please fix")
+        self.assertEqual(r, {"review": "https://github.com/r", "replies": 1, "errors": []})
+        review, reply = self.posts()
+        self.assertEqual(review["path"], "repos/scylla/db/pulls/55/reviews")
+        self.assertEqual(review["body"], {"commit_id": head, "event": "REQUEST_CHANGES", "body": "please fix", "comments": [
+            {"path": "a.txt", "body": "first, edited", "line": 6, "side": "RIGHT"},
+            {"path": "a.txt", "body": "second", "line": 7, "side": "RIGHT", "start_line": 5, "start_side": "LEFT"}]})
+        self.assertEqual(reply, {"path": "repos/scylla/db/pulls/55/comments/1/replies", "body": {"body": "a reply"}})
+        self.assertEqual(gh.drafts(), [])
+
+    def test_review_refused_unless_head_is_the_prs(self):
+        gh = self.review_pr("b" * 40, **{"POST repos/scylla/db/pulls/55/reviews": "!",
+                                         "POST repos/scylla/db/pulls/55/comments/1/replies": "!"})
+        one = {"view": "all", "path": "a.txt", "start": {"side": "new", "line": 6}, "end": {"side": "new", "line": 6}, "head": self.git_head()}
+        gh.save_draft("c", one)
+        with self.assertRaises(prv.ChangeError) as cm:
+            gh.submit("COMMENT", "")
+        self.assertIn("is not the PR head", str(cm.exception))
+        self.assertEqual((self.posts(), len(gh.drafts())), ([], 1))
+        # GitHub refusing the review posts nothing and keeps every draft.
+        gh = self.review_pr(self.git_head(), **{"POST repos/scylla/db/pulls/55/reviews": "!",
+                                                "POST repos/scylla/db/pulls/55/comments/1/replies": "!"})
+        with self.assertRaises(prv.ChangeError) as cm:
+            gh.submit("COMMENT", "")
+        self.assertIn("nothing was posted", str(cm.exception))
+        self.assertEqual(len(gh.drafts()), 1)
+        # A reply GitHub refuses stays a draft; replies alone need no review and no HEAD check.
+        gh.delete_draft(gh.drafts()[0]["id"])
+        gh.save_draft("r", reply_to=1)
+        with self.assertRaises(prv.ChangeError):
+            gh.submit("COMMENT", "")
+        self.assertEqual([p["path"] for p in self.posts()][-1], "repos/scylla/db/pulls/55/comments/1/replies")
+        self.assertEqual([d["body"] for d in gh.drafts()], ["r"])
+        with self.assertRaises(prv.ChangeError):
+            gh.submit("MERGE", "")
+        gh.delete_draft(gh.drafts()[0]["id"])
+        n = len(self.posts())
+        with self.assertRaises(prv.ChangeError) as cm:
+            gh.submit("COMMENT", " ")
+        self.assertIn("nothing to post", str(cm.exception))
+        self.assertEqual(len(self.posts()), n)
+        # GitHub refuses an empty Request changes: refused before anything posts, the reply stays.
+        gh.save_draft("r2", reply_to=1)
+        with self.assertRaises(prv.ChangeError) as cm:
+            gh.submit("REQUEST_CHANGES", " ")
+        self.assertIn("needs a summary", str(cm.exception))
+        self.assertEqual((len(self.posts()), len(gh.drafts())), (n, 1))
+
+    def test_gh_range(self):
+        files = prv.parse_diff("diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n")
+        r = lambda s, ls, e, le: prv.gh_range(files, "f", {"side": s, "line": ls}, {"side": e, "line": le})
+        # A context line down to a removed line goes all on the old side, the way GitHub takes it.
+        self.assertEqual(r("new", 1, "old", 2), ({"side": "old", "line": 1}, {"side": "old", "line": 2}))
+        self.assertEqual(r("old", 2, "new", 2), ({"side": "old", "line": 2}, {"side": "new", "line": 2}))
+        self.assertIsNone(r("new", 2, "old", 2))  # an added line has no old number
+        self.assertIsNone(r("new", 1, "new", 9))  # outside the hunk
+        self.assertIsNone(prv.gh_range(files, "g", {"side": "new", "line": 1}, {"side": "new", "line": 1}))
+
+    def test_review_timeout_does_not_claim_nothing_was_posted(self):
+        # GitHub may have taken the review; the drafts stay, and the message says to check the PR.
+        gh = self.review_pr(self.git_head())
+        gh.save_draft("c", {"view": "all", "path": "a.txt", "start": {"side": "new", "line": 6},
+                            "end": {"side": "new", "line": 6}, "head": self.git_head()})
+        with mock.patch.object(prv, "gh_post", side_effect=prv.GhTimeout("gh api x: timed out; check the PR")):
+            with self.assertRaises(prv.ChangeError) as cm:
+                gh.submit("COMMENT", "")
+        self.assertNotIn("nothing was posted", str(cm.exception))
+        self.assertIn("check the PR", str(cm.exception))
+        self.assertEqual(len(gh.drafts()), 1)
+
+    def test_drafts_stay_while_a_review_posts(self):
+        gh = self.review_pr(self.git_head())
+        d = gh.save_draft("r", reply_to=1)
+        with gh.submitting:  # submit() posts a snapshot of the drafts: an edit or a delete would be lost
+            for call in (lambda: gh.save_draft("edited", did=d["id"]), lambda: gh.delete_draft(d["id"])):
+                with self.assertRaises(prv.ChangeError) as cm:
+                    call()
+                self.assertEqual(cm.exception.status, 409)
+        self.assertEqual([x["body"] for x in gh.drafts()], ["r"])
+
+    def test_posted_reply_with_unreadable_answer_is_not_kept(self):
+        # gh exited 0, so GitHub took the reply; keeping the draft would post it twice.
+        gh = self.review_pr(self.git_head(), **{"POST repos/scylla/db/pulls/55/comments/1/replies": {"!raw": "not json"}})
+        gh.save_draft("r", reply_to=1)
+        self.assertEqual(gh.submit("COMMENT", "")["replies"], 1)
+        self.assertEqual(gh.drafts(), [])
+
+    def test_bad_drafts_file_is_set_aside(self):
+        path = os.path.join(self.repo.git_dir, "prv", "github-drafts.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump([{"id": "x", "body": "b", "created": 1, "reply_to": "1"}], fh)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(prv.GitHub(self.repo, self.gh).drafts(), [])
 
     def test_head_sha_comes_from_this_run(self):
         # The cache may be an earlier run's, on another branch: its head is not offered as an earlier tip.

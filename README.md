@@ -29,7 +29,8 @@ to answer.
 - **Qodo review.** Runs `qodo review` and shows its findings the same way, when the
   [qodo CLI](https://www.qodo.ai/) is installed.
 - **GitHub.** Links to the PR and its Jira issues, and the PR's review comments under their lines,
-  read with `gh`. prv writes to GitHub only through Push (below). Jira links point to `scylladb.atlassian.net`;
+  read with `gh`, in "All changes" and in each commit. Your own comments and replies go to GitHub as
+  one review (below). Jira links point to `scylladb.atlassian.net`;
   `prv --jira-url https://<site>.atlassian.net/browse/` points them to another site.
 - **Changes since an earlier version.** After a rebase, an amend or a force-push, **Changes since…**
   shows what the author changed since a tip you pick, without the changes that came with the new base,
@@ -201,6 +202,20 @@ A sha typed into the box works too. The view has two parts:
 GitHub review threads show beside the lines they were written on, including lines the author has
 since changed, unless the new base moved that line more than 20 lines.
 
+## GitHub review
+
+In "All changes" of a PR, select lines and press **GitHub comment** in the question box, or press
+**Reply** under a GitHub thread. prv saves the text as a pending comment in
+`<git-dir>/prv/github-drafts.json` and shows it under its line, with edit and delete. **Review** in the
+header lists the pending comments and posts them, with an optional summary, as one GitHub review:
+Comment, Approve or Request changes. Replies go to their threads in the same step. prv asks before it
+posts. A comment or reply that GitHub refuses stays pending. A comment goes on lines of one hunk of the
+PR's diff, as GitHub requires, so lines that only "Whole file" shows take none.
+
+Review is refused when HEAD is not the PR head GitHub reports, or when a pending line comment was written
+on an older head, since GitHub places a comment by its line number in the PR head. Pull, or delete the
+stale comment and write it again.
+
 ## Claude sessions
 
 **Show sessions…** at the bottom of the side panel lists two groups:
@@ -252,7 +267,8 @@ together can cost twice the cap. `prv callpaths --commits` applies it to each co
 ## Files
 
 Everything prv writes for a checkout lives in `<git-dir>/prv/`: threads, explanations, review
-findings, call paths, the ids of its Claude sessions and the cached GitHub data.
+findings, call paths, the ids of its Claude sessions, the cached GitHub data and your pending GitHub
+comments.
 
 ## Tests
 
