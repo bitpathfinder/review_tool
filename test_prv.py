@@ -814,7 +814,16 @@ class GitHubTest(unittest.TestCase):
                          [{"path": "a.txt", "side": "new", "line": 6}, None, {"path": "a.txt", "side": "new", "line": 4}])
         self.assertEqual([(c["user"], c["kind"], c["url"]) for c in v["conversation"]],
                          [("c", "comment", "https://github.com/c"), ("r", "commented", "")])  # only https links
-        self.assertEqual(gh.for_view(self.git_head())["threads"], [])  # threads belong to the "all" view
+        # A commit view gets the threads on its own lines, near GitHub's line number.
+        self.assertEqual([t["anchor"] for t in gh.for_view(self.git_head())["threads"]],
+                         [{"path": "a.txt", "side": "new", "line": 6}, {"path": "a.txt", "side": "new", "line": 4}])
+        far = {**v["threads"][0], "line": 6 + prv.SINCE_NEAR + 1, "original_line": 6 + prv.SINCE_NEAR + 1}
+        self.assertIsNone(prv.place_on_diff(far, self.repo.diff(self.git_head())["files"], near=True))
+        self.assertIsNotNone(prv.place_on_diff(far, self.repo.diff("all")["files"]))
+        # A thread on an added "line 4" is not the commit's context line with that text.
+        self.assertEqual(v["threads"][2]["hunk"].rsplit("\n", 1)[-1], " line 4")
+        added = {**v["threads"][2], "hunk": v["threads"][2]["hunk"].rsplit("\n", 1)[0] + "\n+line 4"}
+        self.assertIsNone(prv.place_on_diff(added, self.repo.diff(self.git_head())["files"], near=True))
         self.assertFalse(gh.fetching)
         # The cache serves the next start before its first fetch.
         self.assertEqual(prv.GitHub(self.repo, self.gh).for_view("all")["pr"]["number"], 55)

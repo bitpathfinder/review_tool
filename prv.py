@@ -3460,10 +3460,12 @@ def gh_threads(comments):
     return out
 
 
-def place_on_diff(t, files, since=False):
+def place_on_diff(t, files, since=False, near=False):
     """The line of a review thread in the local diff, or None. GitHub's line numbers belong to
     the PR head on GitHub, so the commented line's text (the last line of diff_hunk) decides.
-    since: a since view, where a commented line that the author changed is a removed line."""
+    since: a since view, where a commented line that the author changed is a removed line.
+    near: only a line within SINCE_NEAR of GitHub's, as in a since view, and of the same kind (added,
+    removed or context); for a commit view."""
     if since and t["side"] == "LEFT":
         return None  # a base line; the old side of a since view holds the old tip's lines
     want = t["hunk"].rstrip("\n").rsplit("\n", 1)[-1]
@@ -3479,6 +3481,9 @@ def place_on_diff(t, files, since=False):
             for ln in h["lines"]:
                 if ln["s"] != want[1:]:
                     continue
+                # A commit shows a later commit's added line as context: only the same kind of line is it.
+                if near and ln["t"] != want[0]:
+                    continue
                 if ln["t"] == "-" and (old or since):
                     cand, at = {"side": "old", "line": ln["o"]}, ln["o"]
                 elif ln["t"] != "-" and not old:
@@ -3489,7 +3494,7 @@ def place_on_diff(t, files, since=False):
                     continue
                 # A since view leaves unchanged lines out, so a far match is another line with the
                 # same text, such as a "return 0;".
-                if since and abs(at - num) > SINCE_NEAR:
+                if (since or near) and abs(at - num) > SINCE_NEAR:
                     continue
                 if best is None or abs(at - num) < best[0]:
                     best = (abs(at - num), cand)
@@ -3690,15 +3695,17 @@ class GitHub:
                "own": bool(self.login and pr and pr.get("user") == self.login),
                "jira": [{"key": k, "url": self.jira_url + k} for k in d.get("jira") or [] if isinstance(k, str)],
                "threads": [], "conversation": d.get("conversation") or []}
-        since = view.startswith(SINCE)
-        if (view == "all" or since) and d.get("threads"):
+        since, commit = view.startswith(SINCE), bool(SHA_RE.match(view))
+        if (view == "all" or since or commit) and d.get("threads"):
             try:
                 files = self.repo.diff(view)["files"]
             except GitError:
                 if not since:
                     raise
                 files = []  # a typed sha with no history: the main pane shows why; the threads go to the list
-            out["threads"] = [{**t, "anchor": place_on_diff(t, files, since)} for t in d["threads"]]
+            out["threads"] = [{**t, "anchor": place_on_diff(t, files, since, near=commit)} for t in d["threads"]]
+            if commit:  # most threads are on other commits' lines; the GitHub card lists them in "All changes"
+                out["threads"] = [t for t in out["threads"] if t["anchor"]]
         return out
 
     def head_sha(self):
@@ -5726,7 +5733,7 @@ function renderGitHub(){
   document.querySelectorAll('.ghrow').forEach(e => e.remove());
   const el = $('#ghcard');
   if (!el || !S.diff) return;
-  if (!g || g.disabled || (S.view !== 'all' && !S.view.startsWith(SINCE))) { el.hidden = true; return; }
+  if (!g || g.disabled) { el.hidden = true; return; }
   const threads = g.threads || [], conv = g.conversation || [], loose = [];
   threads.forEach((t, ti) => {
     const at = t.anchor && lineK(t.anchor);
@@ -5734,6 +5741,8 @@ function renderGitHub(){
     const row = lowestRow(at[0], at[1], at[1]);
     row.insertAdjacentHTML('afterend', `<tr class="trow ghrow" data-gh="${ti}"><td colspan="${colCount(row)}"><div class="thread gh"><div class="thead"><span>GitHub · ${esc(t.path.split('/').pop())}:${lineRef(t.anchor)}</span><span class="sp"></span><a data-ghask="${ti}">Discuss with Claude</a></div>${ghComments(t.comments)}</div></td></tr>`);
   });
+  // A commit view gets only the threads on its own lines, inline; the card belongs to the PR's views.
+  if (S.view !== 'all' && !S.view.startsWith(SINCE)) { el.hidden = true; return; }
   let h = '';
   if (g.error) h += `<div class="err">GitHub: ${esc(g.error)}</div>`;
   const parts = [];
