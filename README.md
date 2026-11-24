@@ -200,14 +200,16 @@ A sha typed into the box works too. The view has two parts:
   nothing. A file whose replay conflicts is left out; its commits above still compare.
 
 GitHub review threads show beside the lines they were written on, including lines the author has
-since changed, unless the new base moved that line more than 20 lines.
+since changed, unless the new base moved that line more than 20 lines. **Hide GitHub** in the header hides
+them; your pending comments stay.
 
 ## GitHub review
 
-In "All changes" of a PR, select lines and press **GitHub comment** in the question box, or press
-**Reply** under a GitHub thread. prv saves the text as a pending comment in
-`<git-dir>/prv/github-drafts.json` and shows it under its line, with edit and delete. **Review** in the
-header lists the pending comments and posts them, with an optional summary, as one GitHub review:
+In "All changes" of a PR, select lines, switch the question box to **GitHub comment** and press **Save to
+review**, or press **Reply** under a GitHub thread. The question box keeps the last mode per browser. prv
+saves the text as a pending comment in `<git-dir>/prv/github-drafts.json` and shows it under its line,
+with edit and delete. **Review** in the header lists the pending comments and posts them, with an
+optional summary, as one GitHub review:
 Comment, Approve or Request changes. Replies go to their threads in the same step. prv asks before it
 posts. A comment or reply that GitHub refuses stays pending. A comment goes on lines of one hunk of the
 PR's diff, as GitHub requires, so lines that only "Whole file" shows take none.

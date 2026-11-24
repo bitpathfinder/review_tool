@@ -5175,6 +5175,13 @@ span.queued{color:var(--accent)}
 .composer textarea{width:100%;min-height:60px;padding:6px 8px;resize:vertical}
 .composer .row{display:flex;gap:8px;align-items:center;font-size:12px;flex-wrap:wrap}
 .composer .row .sp{flex:1}
+.composer .modes{display:flex;font-size:12px}
+.composer .modes button{border-radius:0}.composer .modes button:first-child{border-radius:6px 0 0 6px}
+.composer .modes button:last-child{border-radius:0 6px 6px 0;margin-left:-1px}
+.composer .modes button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+.thread:not(.ghmode) .ghadd,.thread.ghmode .composer .model,.thread.ghmode .composer label,
+.thread.ghmode .composer .queue,.thread.ghmode .composer .ask{display:none}
+body.ghhide tr.ghrow:not(.ghdraft){display:none}
 .conv{margin-bottom:16px}
 .pushcard{position:fixed;top:52px;right:16px;z-index:6;width:min(560px,calc(100vw - 32px));max-height:70vh;overflow:auto;background:var(--bg);border:1px solid var(--border);border-radius:8px;box-shadow:0 4px 16px rgba(0,0,0,.25);padding:10px 14px;font-size:13px}
 .pushcard pre{white-space:pre-wrap;font-size:12px;margin:4px 0}
@@ -5271,6 +5278,7 @@ body.xon .hunk{grid-template-columns:minmax(0,1fr)}.xcell{border-left:0;border-t
 <body>
 <header><span class="title" id="title">prv</span><span class="range" id="range"></span><span class="ghlinks" id="ghpr"></span><span class="prtitle" id="prtitle"></span><span class="ghlinks" id="ghlinks"></span><span class="sp"></span>
 <button id="tfold" hidden title="Hide or show the Claude threads in this view; a hidden thread keeps a one-line header">Hide threads</button>
+<button id="ghfold" hidden title="Hide or show the GitHub review threads beside the diff; your pending comments stay">Hide GitHub</button>
 <button id="xtoggle" hidden title="Show or hide the explanations next to the diff">Notes</button>
 <button id="back" hidden title="Back to where you jumped to a definition from (b)">← Back</button>
 <button id="chprev" title="Previous change (p)" aria-label="Previous change">↑</button><button id="chnext" title="Next change (n)" aria-label="Next change">↓</button>
@@ -5845,9 +5853,20 @@ function composerHtml(running, gh, queued){
   // gh: lines of "All changes" in a PR, where the text can also become a pending GitHub comment.
   // queued: the thread waits for the batch; it takes no question, and has nothing to stop.
   const busy = running || queued;
-  return `<div class="composer"><textarea placeholder="Ask Claude… (Ctrl+Enter to send)"></textarea>
+  const modes = gh ? '<div class="modes"><button class="mode" data-mode="claude">Ask Claude</button><button class="mode" data-mode="gh">GitHub comment</button></div>' : '';
+  return `<div class="composer">${modes}<textarea placeholder="${ASK_PH}"></textarea>
     <div class="row">${modelSelect()}<label title="Let Claude edit files in the working tree (no commits)"><input type="checkbox" class="edits"> Allow edits</label>
-    <span class="sp"></span><button class="cancel">Cancel</button><button class="stop" ${running ? '' : 'hidden'}>Stop</button>${gh ? '<button class="ghadd" title="Save the text as a pending GitHub comment on these lines; Review in the header posts it">GitHub comment</button>' : ''}<button class="queue" ${busy ? 'disabled' : ''} title="Save the question; 'Process N questions' in the header asks them all, one at a time">Add to batch</button><button class="primary ask" ${busy ? 'disabled' : ''}>Ask</button></div></div>`;
+    <span class="sp"></span><button class="cancel">Cancel</button><button class="stop" ${running ? '' : 'hidden'}>Stop</button>${gh ? '<button class="primary ghadd" title="Save the text as a pending GitHub comment on these lines; Review in the header posts it">Save to review</button>' : ''}<button class="queue" ${busy ? 'disabled' : ''} title="Save the question; 'Process N questions' in the header asks them all, one at a time">Add to batch</button><button class="primary ask" ${busy ? 'disabled' : ''}>Ask</button></div></div>`;
+}
+
+const ASK_PH = 'Ask Claude… (Ctrl+Enter to send)', GH_PH = 'Write a GitHub comment… (Ctrl+Enter to save; Review in the header posts it)';
+function setMode(th, mode, remember){
+  // Kept per browser: someone who comments on GitHub tends to write several comments in a row.
+  if (!$('.modes', th)) return;
+  th.classList.toggle('ghmode', mode === 'gh');
+  th.querySelectorAll('.mode').forEach(b => b.classList.toggle('on', b.dataset.mode === mode));
+  $('textarea', th).placeholder = mode === 'gh' ? GH_PH : ASK_PH;
+  if (remember) ls.set('prv:linemode', mode);
 }
 
 function renderMd(text){
@@ -5975,11 +5994,14 @@ $('#main').addEventListener('click', e => {
   if (e.target.closest('.ask')) return submit(th);
   if (e.target.closest('.queue')) return queueQuestion(th);
   if (e.target.closest('.ghadd')) return addGhDraft(th);
+  const md = e.target.closest('.mode');
+  if (md) { setMode(th, md.dataset.mode, true); return $('textarea', th).focus(); }
 });
 $('#main').addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && e.target.tagName === 'TEXTAREA') {
     e.preventDefault();
     if (e.target.classList.contains('ghta')) $('[data-ghsave]', e.target.closest('.ghcomposer'))?.click();
+    else if (e.target.closest('.thread')?.classList.contains('ghmode')) addGhDraft(e.target.closest('.thread'));
     else submit(e.target.closest('.thread'));
   }
   if (e.key === 'Escape' && e.target.closest('.thread.new')) clearSel();
@@ -6007,6 +6029,7 @@ function selectLine(fi, k, extend){
   row.insertAdjacentHTML('afterend', `<tr class="trow new"><td colspan="${colCount(row)}"><div class="thread new">
     <div class="thead"><span>${anchorLabel(anchor)}</span></div>${composerHtml(false, S.view === 'all' && !!S.gh?.pr)}</div></td></tr>`);
   const th = $('.thread.new'); th._anchor = anchor;
+  setMode(th, ls.get('prv:linemode') === 'gh' ? 'gh' : 'claude');
   const ta = $('textarea', th); ta.value = draft; ta.focus();
 }
 function openViewComposer(){
@@ -6124,8 +6147,8 @@ function drawGitHub(){
   setTitle();
   document.querySelectorAll('.ghrow').forEach(e => e.remove());
   const el = $('#ghcard');
-  if (!el || !S.diff) return;
-  if (!g || g.disabled) { el.hidden = true; return; }
+  if (!el || !S.diff) return ghFoldLabel();
+  if (!g || g.disabled) { el.hidden = true; return ghFoldLabel(); }
   const threads = g.threads || [], conv = g.conversation || [], loose = [];
   threads.forEach((t, ti) => {
     const at = t.anchor && lineK(t.anchor);
@@ -6140,8 +6163,9 @@ function drawGitHub(){
     const at = lineK({path: d.path, side: d.end.side, line: d.end.line});
     if (!at) continue;
     const row = lowestRow(at[0], at[1], at[1]);
-    row.insertAdjacentHTML('afterend', `<tr class="trow ghrow"><td colspan="${colCount(row)}"><div class="thread gh draft"><div class="thead"><span>GitHub · ${esc(d.path.split('/').pop())}:${rangeRef(d)}</span></div>${ghDraftHtml(d)}</div></td></tr>`);
+    row.insertAdjacentHTML('afterend', `<tr class="trow ghrow ghdraft"><td colspan="${colCount(row)}"><div class="thread gh draft"><div class="thead"><span>GitHub · ${esc(d.path.split('/').pop())}:${rangeRef(d)}</span></div>${ghDraftHtml(d)}</div></td></tr>`);
   }
+  ghFoldLabel();
   // A commit view gets only the threads on its own lines, inline; the card belongs to the PR's views.
   if (S.view !== 'all' && !S.view.startsWith(SINCE)) { el.hidden = true; return; }
   let h = '';
@@ -6162,6 +6186,20 @@ function drawGitHub(){
   if (el._html !== h) { el.innerHTML = h; el._html = h; }
   el.hidden = false;
 }
+// GitHub threads hidden beside the diff, per browser and repository, as the hidden Claude threads.
+function ghHidden(){ return !!S.meta && ls.get('prv:ghhide:' + S.meta.root) === '1'; }
+function ghFoldLabel(){
+  const hidden = ghHidden();
+  document.body.classList.toggle('ghhide', hidden);
+  $('#ghfold').hidden = !document.querySelector('#main tr.ghrow:not(.ghdraft)');
+  $('#ghfold').textContent = hidden ? 'Show GitHub' : 'Hide GitHub';
+}
+$('#ghfold').addEventListener('click', () => {
+  const a = S.diff && pageAnchor();
+  ls.set('prv:ghhide:' + S.meta.root, ghHidden() ? '0' : '1');
+  ghFoldLabel();
+  if (a) keepAnchor(a);
+});
 function ghDraftHtml(d){
   return `<div class="m gh draft" data-draft="${esc(d.id)}"><div class="who">Pending ${d.reply_to != null ? 'reply' : 'comment'}, posted with your review · <a data-ghedit="${esc(d.id)}">edit</a> · <a data-ghdel="${esc(d.id)}">delete</a></div><div class="dbody">${renderMd(d.body)}</div></div>`;
 }
@@ -6280,6 +6318,7 @@ function ghDiscuss(t, c){
     selectLine(at[0], at[1], false);
     th = $('.thread.new');
   } else th = openViewComposer();
+  setMode(th, 'claude');
   const cs = t ? t.comments : [c];
   const where = t ? `${t.path}:${t.line ?? t.original_line ?? ''}${at ? '' : ' (outdated; the code it was written on is below)'}` : 'the pull request';
   th._anchor.note = `GitHub ${t ? 'review thread' : 'comment'} on ${where}:\n` + (t && !at ? t.hunk.split('\n').slice(-8).join('\n') + '\n\n' : '')
@@ -6580,6 +6619,7 @@ function askNote(ni){
   S.sel0 = {f:a.i, k:k0};
   selectLine(a.i, k1, true);
   const th = $('.thread.new');
+  setMode(th, 'claude');
   th._anchor.note = n.finding ? findingText(n.finding) : n.text;
   if (n.finding || n.cpath) th._anchor.note_kind = n.finding ? 'finding' : 'callpath';
   $('.thead span', th).insertAdjacentText('beforeend', n.finding ? ' · about the finding' : n.cpath ? ' · about the call path' : ' · about the note');
