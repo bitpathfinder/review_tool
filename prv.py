@@ -1353,9 +1353,12 @@ class Runner:
             session_id = t["session_id"]
             anchor = t["anchor"]
             tree = t.get("tree")
-            asks = [m for m in t["messages"] if m["role"] == "user"]
-            # Edits go to the reviewer's checkout; other turns read the commit's worktree.
-            moved = tree and not first and len(asks) > 1 and bool(asks[-2].get("edits")) != edits
+            # Edits go to the reviewer's checkout; other turns read the commit's worktree. Compared with the
+            # last turn that started claude: a turn refused before that leaves the session where it was.
+            ran = [m["in_tree"] for m in t["messages"] if m["role"] == "assistant" and "in_tree" in m]
+            if not ran:  # saved before in_tree: the previous question's edits flag
+                ran = [not m.get("edits") for m in t["messages"] if m["role"] == "user"][-2:-1]
+            moved = tree and not first and bool(ran) and ran[-1] != (not edits)
         msg = {"role": "assistant", "text": "", "tools": [], "model": model,
                "edits": edits, "cost": None, "error": None}
         with st.lock:
@@ -1444,6 +1447,9 @@ class Runner:
                             if t["session_id"] != out["session_id"]:
                                 new_sid, label = out["session_id"], thread_label(t)
                             t["session_id"] = out["session_id"]
+                            if "in_tree" not in msg:  # claude started, so the session moves to cwd
+                                msg["in_tree"] = cwd != self.repo.root
+                                st.save_locked()  # kept past a prv crash mid-answer
                         elif out["type"] == "text":
                             msg["text"] += out["text"]
                         elif out["type"] == "tool":
@@ -1479,6 +1485,7 @@ class Runner:
             with st.lock:
                 new_sid = t["session_id"] != done_ev["session_id"]
                 t["session_id"], label = done_ev["session_id"], thread_label(t)
+                msg.setdefault("in_tree", cwd != self.repo.root)  # no init event: claude started all the same
             if new_sid:  # no init event carried the id, as in Explainer._claude
                 record_session(self.repo.git_dir, done_ev["session_id"], "thread", label)
         self._finish(t, msg, cost=done_ev.get("cost"),

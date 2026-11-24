@@ -468,7 +468,8 @@ if "--json-schema" in sys.argv:
          "total_cost_usd": 0.25, "result": "", "structured_output": res})
     sys.exit(0)
 print("42", flush=True)  # a non-object JSON line is skipped
-out({"type": "system", "subtype": "init", "session_id": sid})
+if not os.environ.get("FAKE_CLAUDE_NO_INIT"):
+    out({"type": "system", "subtype": "init", "session_id": sid})
 out({"type": "stream_event", "parent_tool_use_id": None,
      "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "answer"}}})
 out({"type": "result", "subtype": "success", "is_error": False, "session_id": sid,
@@ -3699,6 +3700,70 @@ class ServerTest(unittest.TestCase):
                         "queued": True, "messages": [{"role": "assistant", "text": "a"}]}], fh)
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(prv.Store(self.repo.git_dir).threads, {})
+
+    def test_moved_turn_compares_with_the_last_turn_that_ran(self):
+        # A turn refused before claude starts leaves the session where the turn before it ran.
+        lines = [json.loads(l) for l in self.req("/api/ask", {"question": "q", "model": "haiku",
+                                                               "anchor": {"view": "all"}}).splitlines()]
+        tid = lines[0]["thread"]["id"]
+        self.runner.edit_lock.acquire()
+        try:
+            done = json.loads(self.req("/api/ask", {"id": tid, "question": "e1", "model": "haiku",
+                                                    "edits": True}).splitlines()[-1])
+        finally:
+            self.runner.edit_lock.release()
+        self.assertIn("Another thread is editing", done["error"])
+        self.req("/api/ask", {"id": tid, "question": "e2", "model": "haiku", "edits": True})
+        calls = self.fake_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(os.path.realpath(calls[1]["cwd"]), self.root)
+        self.assertRegex(calls[1]["prompt"], r"^This turn runs in the reviewer's checkout, .*\n\ne2\Z")
+
+    def test_moved_turn_ignores_a_turn_where_claude_did_not_start(self):
+        # A turn whose claude fails to start, or exits before its session starts, leaves the session in the
+        # commit's worktree.
+        lines = [json.loads(l) for l in self.req("/api/ask", {"question": "q", "model": "haiku",
+                                                               "anchor": {"view": "all"}}).splitlines()]
+        tid = lines[0]["thread"]["id"]
+        dead = os.path.join(self.root, ".git", "dead_claude")
+        with open(dead, "w") as fh:
+            fh.write("#!/bin/sh\nexit 1\n")
+        os.chmod(dead, 0o755)
+        for claude, error in ((os.path.join(self.root, "no-such-claude"), "cannot start claude"), (dead, "")):
+            self.runner.claude = claude
+            done = json.loads(self.req("/api/ask", {"id": tid, "question": "e1", "model": "haiku",
+                                                    "edits": True}).splitlines()[-1])
+            self.assertTrue(done["is_error"])
+            self.assertIn(error, done["error"])
+        self.runner.claude = self.fake
+        self.req("/api/ask", {"id": tid, "question": "e2", "model": "haiku", "edits": True})
+        calls = self.fake_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertRegex(calls[1]["prompt"], r"^This turn runs in the reviewer's checkout, .*\n\ne2\Z")
+
+    def test_moved_turn_after_a_turn_without_an_init_event(self):
+        # The result event's session id also shows that claude started, and where the session ran.
+        lines = [json.loads(l) for l in self.req("/api/ask", {"question": "q", "model": "haiku",
+                                                               "anchor": {"view": "all"}}).splitlines()]
+        tid = lines[0]["thread"]["id"]
+        with mock.patch.dict(os.environ, {"FAKE_CLAUDE_NO_INIT": "1"}):
+            self.req("/api/ask", {"id": tid, "question": "e", "model": "haiku", "edits": True})
+        self.req("/api/ask", {"id": tid, "question": "r", "model": "haiku"})
+        calls = self.fake_calls()
+        self.assertEqual(len(calls), 3)
+        self.assertRegex(calls[2]["prompt"], r"^Your working directory is a checkout of commit .*\n\nr\Z")
+
+    def test_moved_turn_in_a_thread_saved_before_in_tree(self):
+        # Answers saved without in_tree: the previous question's edits flag tells where the session ran.
+        lines = [json.loads(l) for l in self.req("/api/ask", {"question": "q", "model": "haiku",
+                                                               "anchor": {"view": "all"}}).splitlines()]
+        tid = lines[0]["thread"]["id"]
+        for m in self.store.threads[tid]["messages"]:
+            m.pop("in_tree", None)
+        self.req("/api/ask", {"id": tid, "question": "e", "model": "haiku", "edits": True})
+        calls = self.fake_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertRegex(calls[1]["prompt"], r"^This turn runs in the reviewer's checkout, .*\n\ne\Z")
 
     def test_question_reads_the_commit_it_is_about(self):
         # A file renamed by a later commit keeps its old name in the earlier commit's worktree.
