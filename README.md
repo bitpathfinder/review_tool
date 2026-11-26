@@ -135,6 +135,22 @@ The commit card in "Uncommitted changes":
    prv prints a URL: open it. The first clone of scylladb from GitHub, with its submodules, took
    50 s in a test on a fast connection. A local scylladb clone and git-lfs are not needed.
 
+## Upgrade
+
+```sh
+cd review_tool
+git pull
+./install.sh --no-deps
+```
+
+`./install.sh` copies prv, so a pull alone does not change the installed one; with `--dev`, the pull
+is enough. The saved `--reference` and `--repo` stay. A running prv keeps the old code: run
+`prv new_review <N>` (or `prv`) again where it runs, answer `y` to stop the old one, and open the new
+URL. Threads, explanations, reviews and pending GitHub comments carry over.
+
+The history was rewritten on 2026-11-23. In a clone made before that, `git pull` fails; run
+`git fetch origin && git reset --hard origin/main` instead, which drops local commits.
+
 ## Install options
 
 `install.sh` first installs the missing tools: git, python3, Universal Ctags and gh with the system
