@@ -1132,8 +1132,13 @@ def anchor_context(repo, anchor, tree=None):
                      f"so changes that came with the base are left out.{cmp}")
     else:
         lines.append(f"Current view: commit {view}. Inspect it with `{GIT_CMD} show {view}`.")
+        if anchor.get("scope") == "pr":
+            lines.append(f"The reviewer asks about the whole range, not only this commit. Answer for the code at "
+                         f"the tip {repo.head} and all commits in {repo.base}..{repo.head}: later commits may change "
+                         f"these lines; see `{GIT_CMD} log {view}..{repo.head} -- <path>`."
+                         + (" Line numbers below are the commit's." if anchor.get("path") else ""))
     if tree:
-        lines.append(tree_note(repo, tree))
+        lines.append(tree_note(repo, tree, anchor))
     path = anchor.get("path")
     if not path:
         lines.append("The question is about this view as a whole. Use git to inspect it.")
@@ -1158,8 +1163,9 @@ def anchor_context(repo, anchor, tree=None):
     return "\n".join(lines + note_context(anchor))
 
 
-def tree_note(repo, tree):
-    return (f"Your working directory is a checkout of commit {tree}, the 'new' side of this view: Read, Grep, "
+def tree_note(repo, tree, anchor):
+    side = "the range's tip" if anchor.get("scope") == "pr" else "the 'new' side of this view"
+    return (f"Your working directory is a checkout of commit {tree}, {side}: Read, Grep, "
             f"Glob and `{GIT_CMD} grep` see the files as that commit has them. Submodules are not checked out "
             f"there. The reviewer's own checkout, {repo.root}, may differ.")
 
@@ -1388,7 +1394,7 @@ class Runner:
                 if first:
                     prompt = anchor_context(self.repo, anchor, None if edits else tree) + "\n\nQuestion:\n" + question
                 elif moved:
-                    prompt = (edit_note(self.repo, tree) if edits else tree_note(self.repo, tree)) + "\n\n" + question
+                    prompt = (edit_note(self.repo, tree) if edits else tree_note(self.repo, tree, anchor)) + "\n\n" + question
                 self._run_proc(t, msg, prompt, model, edits, session_id, emit, cwd)
             finally:
                 if edits:
@@ -3472,15 +3478,16 @@ def make_handler(repo, store, runner, explainer, token, page, github=None, revie
                     "text": str(anchor.get("text") or "")[:4000],
                     "note": str(anchor.get("note") or "")[:8000],
                     "note_kind": anchor.get("note_kind") if anchor.get("note_kind") in ("github", "finding", "callpath") else None,
+                    "scope": "pr" if anchor.get("scope") == "pr" and SHA_RE.match(view) else None,
                 }
                 if anchor["path"] and not (anchor["start"] and anchor["end"]):
                     return self._json({"error": "anchor with a path needs start and end lines"}, 400)
                 # Built by the server, never taken from the page. Kept in the anchor, which rebuilds the
                 # first prompt when a first turn ended without a session.
-                if github and view == "all" and not anchor["path"]:
+                if github and (view == "all" or anchor["scope"]) and not anchor["path"]:
                     anchor["pr"] = github.pr_context()
                 try:
-                    tree = None if view == "wt" else view if SHA_RE.match(view) else repo.head_sha()
+                    tree = None if view == "wt" else view if SHA_RE.match(view) and not anchor["scope"] else repo.head_sha()
                 except GitError as e:
                     return self._json({"error": str(e)}, 400)
             with store.lock:
@@ -5963,24 +5970,38 @@ function rangeRef(a){
   return a.start.side === a.end.side && a.start.line === a.end.line ? lineRef(a.end) : `${lineRef(a.start)}–${lineRef(a.end)}`;
 }
 function anchorLabel(a, detached){
-  if (!a.path) return esc(viewLabel(a.view));
-  return `${esc(a.path)}:${rangeRef(a)}${detached ? ` (${detached})` : ''}`;
+  const whole = a.scope === 'pr' ? ` · whole ${S.gh?.pr ? 'PR' : 'range'}` : '';
+  if (!a.path) return esc(viewLabel(a.view)) + whole;
+  return `${esc(a.path)}:${rangeRef(a)}${detached ? ` (${detached})` : ''}${whole}`;
 }
 
 function modelSelect(){
   const cur = ls.get('prv:model') || S.meta.models[0];
   return `<select class="model">${S.meta.models.map(m => `<option ${m===cur?'selected':''}>${m}</option>`).join('')}</select>`;
 }
-function composerHtml(running, gh, queued){
+function composerHtml(running, gh, queued, scope){
   // gh: lines of "All changes" in a PR, where the text can also become a pending GitHub comment.
   // queued: the thread waits for the batch; it takes no question, and has nothing to stop.
+  // scope: a new thread of a commit view, which can ask about the whole range instead of the commit.
   const busy = running || queued;
   const modes = gh ? '<div class="modes"><button class="mode" data-mode="claude">Ask Claude</button><button class="mode" data-mode="gh">GitHub comment</button></div>' : '';
   return `<div class="composer">${modes}<textarea placeholder="${ASK_PH}"></textarea>
-    <div class="row">${modelSelect()}<label title="Let Claude edit files in the working tree (no commits)"><input type="checkbox" class="edits"> Allow edits</label>
+    <div class="row">${modelSelect()}<label title="Let Claude edit files in the working tree (no commits)"><input type="checkbox" class="edits"> Allow edits</label>${scope ? scopeBox() : ''}
     <span class="sp"></span><button class="cancel">Cancel</button><button class="stop" ${running ? '' : 'hidden'}>Stop</button>${gh ? '<button class="primary ghadd" title="Save the text as a pending GitHub comment on these lines; Review in the header posts it">Save to review</button>' : ''}<button class="queue" ${busy ? 'disabled' : ''} title="Save the question; 'Process N questions' in the header asks them all, one at a time">Add to batch</button><button class="primary ask" ${busy ? 'disabled' : ''}>Ask</button></div></div>`;
 }
 
+function scopeBox(){
+  const what = S.gh?.pr ? 'PR' : 'range';
+  return `<label title="Answer for the whole ${what} at its last commit, not only for this commit"><input type="checkbox" class="scope" ${ls.get('prv:askscope') === 'commit' ? '' : 'checked'}> Whole ${what}</label>`;
+}
+function isCommit(v){ return /^[0-9a-f]{7,40}$/.test(v); }
+document.addEventListener('change', e => { if (e.target.classList.contains('scope')) ls.set('prv:askscope', e.target.checked ? 'pr' : 'commit'); });
+function withScope(th, body){
+  // The box exists only in a new thread of a commit view; the server ignores scope elsewhere.
+  const box = $('.scope', th);
+  if (box) body.anchor = {...body.anchor, scope: box.checked ? 'pr' : null};
+  return body;
+}
 const ASK_PH = 'Ask Claude… (Ctrl+Enter to send)', GH_PH = 'Write a GitHub comment… (Ctrl+Enter to save; Review in the header posts it)';
 function setMode(th, mode, remember){
   // Kept per browser: someone who comments on GitHub tends to write several comments in a row.
@@ -6149,7 +6170,7 @@ function selectLine(fi, k, extend){
   const anchor = {view:S.view, path:filePath(f), start:{side:lineSide(la), line:lineNo(la)}, end:{side:lineSide(lb), line:lineNo(lb)},
     text: f.flat.slice(a, b + 1).map(l => l.t + l.s).join('\n')};
   row.insertAdjacentHTML('afterend', `<tr class="trow new"><td colspan="${colCount(row)}"><div class="thread new">
-    <div class="thead"><span>${anchorLabel(anchor)}</span></div>${composerHtml(false, S.view === 'all' && !!S.gh?.pr)}</div></td></tr>`);
+    <div class="thead"><span>${anchorLabel(anchor)}</span></div>${composerHtml(false, S.view === 'all' && !!S.gh?.pr, false, isCommit(S.view))}</div></td></tr>`);
   const th = $('.thread.new'); th._anchor = anchor;
   setMode(th, ls.get('prv:linemode') === 'gh' ? 'gh' : 'claude');
   const ta = $('textarea', th); ta.value = draft; ta.focus();
@@ -6157,7 +6178,7 @@ function selectLine(fi, k, extend){
 function openViewComposer(){
   clearSel();
   const anchor = {view:S.view, path:null};
-  $('#conv').insertAdjacentHTML('beforeend', `<div class="thread new"><div class="thead"><span>${esc(viewLabel(S.view))}</span></div>${composerHtml(false)}</div>`);
+  $('#conv').insertAdjacentHTML('beforeend', `<div class="thread new"><div class="thead"><span>${esc(viewLabel(S.view))}</span></div>${composerHtml(false, false, false, isCommit(S.view))}</div>`);
   const th = $('#conv .thread.new'); th._anchor = anchor; th.scrollIntoView({block:'center'}); $('textarea', th).focus();
   return th;
 }
@@ -7233,7 +7254,7 @@ async function queueQuestion(th){
   if (!question || $('.queue', th).disabled) return;
   const body = {question, model: $('.model', th).value, edits: $('.edits', th).checked, queue: true};
   const isNew = th.classList.contains('new');
-  if (isNew) body.anchor = th._anchor; else body.id = th.dataset.id;
+  if (isNew) withScope(th, Object.assign(body, {anchor: th._anchor})); else body.id = th.dataset.id;
   $('.queue', th).disabled = true;
   let t;
   try { t = (await api('/api/ask', {method:'POST', body:JSON.stringify(body)})).thread; }
@@ -7275,7 +7296,7 @@ async function submit(th){
   const model = $('.model', th).value, edits = $('.edits', th).checked;
   const body = {question, model, edits};
   const isNew = th.classList.contains('new');
-  if (isNew) body.anchor = th._anchor; else body.id = th.dataset.id;
+  if (isNew) withScope(th, Object.assign(body, {anchor: th._anchor})); else body.id = th.dataset.id;
   $('.ask', th).disabled = true;
   let t = null;
   try {

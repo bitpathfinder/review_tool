@@ -9,13 +9,16 @@ to answer.
 - **Ask about lines.** Click a line number (shift-click for a range), type a question. The answer
   streams in, and the thread is saved in `<git-dir>/prv/threads.json`. **hide** on a thread shrinks
   it to a one-line header; **Hide threads** in the header shrinks every thread in the view.
+  In a commit's view, **Whole PR** in the question box asks about the whole PR instead of the commit:
+  Claude reads the PR's last commit and every commit in the range. The box starts checked and keeps
+  its last setting.
 - **Batch questions.** **Add to batch** in the question box saves the question instead of asking it. When
   you are done, **Process N questions** in the header asks them one at a time, in the order you added them;
   press it again to stop. An "Allow edits" question waits while another thread edits the working tree.
   The queue survives a restart.
 - **Chat about the PR.** In "All changes", **Chat about this PR** starts a thread about the whole PR;
   Claude also gets the PR title, description and Jira keys. In a commit view the same button asks
-  about that commit.
+  about that commit, or with **Whole PR** checked about the whole PR, with the same PR details.
 - **Explanations.** A summary of the PR, and notes next to each hunk or, per commit, next to the
   lines they explain. Run from the page, or with `prv explain` (`prv explain --commits` for line notes).
 - **AI review.** A Claude review (Fable by default) that reports defects with a failure scenario.
@@ -262,7 +265,8 @@ permissions. "Allow edits" in the question box lets Claude edit files (never com
 
 A question about a commit, "All changes" or "Changes since" runs Claude in a worktree of that commit
 (the view's head), under `<git-dir>/prv/wt/`. Grep and Read then see the files as the commit has them,
-so a file renamed by a later commit keeps its old name. The worktree has no submodules. A turn with
+so a file renamed by a later commit keeps its old name. A **Whole PR** question about a commit reads
+the head's worktree instead. The worktree has no submodules. A turn with
 "Allow edits" runs in the checkout itself. prv removes a worktree once no thread uses it. The
 explanations, the AI review and the call paths work the same way: a run reads a worktree of the head, or
 of the commit for a commit's notes, removed when the run ends. A run on the commit the checkout is at,
