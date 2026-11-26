@@ -41,6 +41,11 @@ to answer.
   last commit. With `--allow-push`, **Push** sends HEAD to your own open PR's branch (below).
 - **New review.** `prv new_review <PR>` checks a PR out (or brings an existing checkout up to date),
   with its submodules, and opens it. **Pull** in the header brings it up to date later.
+- **One prv per checkout.** When another prv already serves the checkout, prv asks whether to stop it
+  and serve here; `--replace` stops it without asking. `prv new_review` asks before it touches an
+  existing checkout, so the update never moves files under a running prv. When the update of an
+  existing checkout on branch `pr<N>` fails, for example on uncommitted changes, it serves the
+  checkout as it is.
 - **Go to a definition.** Ctrl-click (Cmd-click on a Mac) a name in the code to jump to where the
   files of the view define or declare it, opening "Whole file" when needed. Several matches show a
   list, those in the clicked file first. **← Back** in the header (key `b`) returns to where you clicked.
@@ -271,7 +276,7 @@ together can cost twice the cap. `prv callpaths --commits` applies it to each co
 
 Everything prv writes for a checkout lives in `<git-dir>/prv/`: threads, explanations, review
 findings, call paths, the ids of its Claude sessions, the cached GitHub data and your pending GitHub
-comments.
+comments. `lock` holds the pid of the prv serving the checkout.
 
 ## Tests
 

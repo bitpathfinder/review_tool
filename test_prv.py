@@ -1044,6 +1044,142 @@ class GitHubTest(unittest.TestCase):
             self.assertIsNone(prv.GitHub(self.repo, self.gh).for_view("all")["pr"])
 
 
+def start_prv(cwd, *args):
+    """A prv serving cwd, once it printed its URL. The caller stops it."""
+    p = subprocess.Popen([sys.executable, prv.__file__, *args, "--host", "127.0.0.1", "--port", "0", "--no-github",
+                          "--claude", "/bin/false"], cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True)
+    watchdog = threading.Timer(60, p.kill)  # readline has no timeout
+    watchdog.start()
+    try:
+        while "open http" not in (line := p.stdout.readline()):
+            if not line:
+                raise AssertionError("prv exited: " + p.stderr.read())
+    finally:
+        watchdog.cancel()
+    return p
+
+
+def stop_prv(p):
+    """Its stderr."""
+    if p.poll() is None:
+        p.terminate()
+    try:
+        return p.communicate(timeout=30)[1]
+    except subprocess.TimeoutExpired:
+        p.kill()
+        return p.communicate()[1]
+
+
+class InstanceTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.realpath(self.tmp.name)
+        g = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=self.root,
+                                      check=True, capture_output=True)
+        g("init", "-q", "-b", "master")
+        g("commit", "-q", "--allow-empty", "-m", "one")
+        g("commit", "-q", "--allow-empty", "-m", "two")
+        self.git_dir = os.path.join(self.root, ".git")
+        self.lock = os.path.join(self.git_dir, "prv", "lock")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def holder(self, write_pid):
+        """A process that is not prv holding the lock, with or without its pid in the file."""
+        os.makedirs(os.path.dirname(self.lock), exist_ok=True)
+        code = ("import fcntl, os, sys, time\nfh = open(sys.argv[1], 'a')\nfcntl.flock(fh, fcntl.LOCK_EX)\n"
+                "if sys.argv[2] == '1': fh.write(str(os.getpid())); fh.flush()\nprint('ok', flush=True)\ntime.sleep(60)\n")
+        p = subprocess.Popen([sys.executable, "-c", code, self.lock, "1" if write_pid else "0"], stdout=subprocess.PIPE,
+                             text=True)
+        self.addCleanup(lambda: (p.kill(), p.wait(), p.stdout.close()))
+        self.assertEqual(p.stdout.readline(), "ok\n")
+        return p
+
+    def take(self, replace=False, tty=False, answer=None):
+        # sys.stderr is read after the redirect: the check must see the StringIO's isatty.
+        with contextlib.redirect_stderr(io.StringIO()) as err, \
+                mock.patch.object(sys.stdin, "isatty", return_value=tty), \
+                mock.patch.object(sys.stderr, "isatty", return_value=tty), \
+                mock.patch("builtins.input", return_value=answer) as ask:
+            got = prv.take_instance(self.git_dir, self.root, replace, wait=30)
+        return got, err.getvalue(), ask.called
+
+    def test_the_lock_names_its_holder(self):
+        fh = prv.lock_instance(self.git_dir)
+        self.addCleanup(fh.close)
+        self.assertEqual(prv.lock_holder(self.lock), os.getpid())
+        self.assertIsNone(prv.lock_instance(self.git_dir))
+
+    @unittest.skipUnless(os.path.exists("/proc/locks"), "needs /proc/locks")
+    def test_holder_of_an_older_prv_comes_from_proc_locks(self):
+        p = self.holder(write_pid=False)
+        self.assertEqual(prv.lock_holder(self.lock), p.pid)
+
+    @unittest.skipUnless(os.path.exists("/proc/locks"), "needs /proc/locks")
+    def test_a_stale_pid_in_the_file_is_not_the_holder(self):
+        # An older prv holds the lock and leaves the pid of the prv before it in the file.
+        os.makedirs(os.path.dirname(self.lock), exist_ok=True)
+        with open(self.lock, "w") as fh:
+            fh.write(f"{os.getpid()}\n")
+        p = self.holder(write_pid=False)
+        self.assertEqual(prv.lock_holder(self.lock), p.pid)
+
+    def test_off_a_terminal_it_refuses_unless_replace(self):
+        p = self.holder(write_pid=True)
+        got, err, asked = self.take()
+        self.assertEqual((got, asked), (None, False))
+        self.assertIn(f"another prv (pid {p.pid}) is already serving {self.root}; stop it first, or pass --replace", err)
+
+    def test_a_process_that_is_not_prv_is_left_alone(self):
+        p = self.holder(write_pid=True)
+        got, err, _ = self.take(replace=True)
+        self.assertIsNone(got)
+        self.assertIn("cannot tell which process serves", err)
+        self.assertIsNone(p.poll())
+
+    def test_a_prv_with_a_long_command_line_is_recognized(self):
+        # ps cuts its output to the terminal width, which would cut "prv.py" off a deep path.
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "x" * 300, "prv"])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        with mock.patch.dict(os.environ, {"COLUMNS": "80"}):
+            self.assertTrue(prv.is_prv(p.pid))
+
+    def test_a_holder_that_exited_meanwhile_frees_the_lock(self):
+        # The first attempt lost to a prv that exited before lock_holder() looked: only its pid is in the file.
+        os.makedirs(os.path.dirname(self.lock), exist_ok=True)
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        with open(self.lock, "w") as fh:
+            fh.write(f"{dead.pid}\n")
+        real = prv.lock_instance
+        with mock.patch.object(prv, "lock_instance", side_effect=[None, real(self.git_dir)]):
+            got, err, asked = self.take(replace=True)
+        self.addCleanup(got.close)
+        self.assertEqual((err, asked), ("", False))
+        self.assertEqual(prv.lock_holder(self.lock), os.getpid())
+
+    def test_the_user_decides_on_a_terminal(self):
+        srv = start_prv(self.root, "HEAD~1")
+        try:
+            self.decide(srv)
+        finally:
+            stop_prv(srv)
+
+    def decide(self, srv):
+        got, err, asked = self.take(tty=True, answer="n")
+        self.assertEqual((got, asked, srv.poll()), (None, True, None))
+        self.assertIn("Stop it and serve here? [y/N]", err)  # on stderr, the terminal that was checked
+        got, err, _ = self.take(tty=True, answer="y")
+        self.assertIsNotNone(got, err)
+        self.addCleanup(got.close)
+        self.assertIn(f"stopping another prv (pid {srv.pid})", err)
+        self.assertEqual(srv.wait(timeout=30), 0)  # its own shutdown, not a kill
+        self.assertEqual(prv.lock_holder(self.lock), os.getpid())
+
+
 class NewReviewTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1249,6 +1385,90 @@ class NewReviewTest(unittest.TestCase):
                 err = p.communicate()[1]
         self.assertIn("open http://127.0.0.1:", lines[1], err)
         self.assertIn("no commits in the range, so no explanations are written", lines[2])
+
+    def new_review_cmd(self):
+        """`prv new_review 7` serving on a random local port, and the env with the fake gh."""
+        cmd = [sys.executable, prv.__file__, "new_review", "7", "--repo", "o/r", "--reference", self.reference,
+               "--upstream-url", self.up, "--no-explain", "--claude", "/bin/false", "--host", "127.0.0.1", "--port", "0"]
+        return cmd, dict(os.environ, PATH=os.path.dirname(self.gh) + os.pathsep + os.environ["PATH"])
+
+    def test_existing_checkout_served_by_another_prv(self):
+        # The other prv is stopped before the update moves the checkout under it, or nothing happens.
+        self.prepare()
+        srv = start_prv(self.d, "upstream/master")
+        try:
+            self.replace_served(srv)
+        finally:  # before tearDown removes the folders the servers write to
+            stop_prv(srv)
+
+    def replace_served(self, srv):
+        self.git(self.up, "checkout", "-q", "feat")
+        p2 = self.write(self.up, "base\nfeature\nmore\n", "more")
+        self.git(self.up, "checkout", "-q", "master")
+        self.set_pr(p2)
+        cmd, env = self.new_review_cmd()
+        r = subprocess.run(cmd, cwd=self.parent, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=60)
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("pass --replace", r.stderr)
+        self.assertEqual((self.head()[0], srv.poll()), (self.p1, None))
+        nr = subprocess.Popen(cmd + ["--replace"], cwd=self.parent, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        watchdog = threading.Timer(60, nr.kill)
+        watchdog.start()
+        try:
+            lines = [nr.stdout.readline() for _ in range(2)]
+            self.assertIn("open http://127.0.0.1:", lines[1])
+            self.assertEqual(srv.wait(timeout=30), 0)
+            self.assertEqual(self.head(), (p2, "pr7"))
+        finally:
+            watchdog.cancel()
+            stop_prv(nr)
+
+    def test_failed_update_of_an_existing_checkout_still_serves_it(self):
+        # The prv serving it is already stopped: a refused update must not leave nothing running.
+        self.prepare()
+        srv = start_prv(self.d, "upstream/master")
+        try:
+            self.git(self.up, "checkout", "-q", "feat")
+            self.set_pr(self.write(self.up, "base\nfeature\nmore\n", "more"))
+            self.git(self.up, "checkout", "-q", "master")
+            with open(os.path.join(self.d, "f.txt"), "a") as fh:
+                fh.write("local edit\n")
+            cmd, env = self.new_review_cmd()
+            nr = subprocess.Popen(cmd + ["--replace"], cwd=self.parent, env=env, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            watchdog = threading.Timer(60, nr.kill)
+            watchdog.start()
+            try:
+                lines = [nr.stdout.readline() for _ in range(2)]
+                self.assertIn("open http://127.0.0.1:", lines[1])
+                self.assertEqual(srv.wait(timeout=30), 0)
+                self.assertEqual(self.head(), (self.p1, "pr7"))
+            finally:
+                watchdog.cancel()
+                err = stop_prv(nr)
+            self.assertIn("has uncommitted changes", err)
+            self.assertIn(f"the update failed; serving {self.d} as it is", err)
+        finally:
+            stop_prv(srv)
+
+    def test_checkout_on_another_branch_is_not_served_as_the_pr(self):
+        # Nor is the prv serving that branch stopped: new_review refuses the checkout anyway.
+        self.prepare()
+        self.git(self.d, "checkout", "-q", "-b", "mine")
+        srv = start_prv(self.d, "upstream/master")
+        try:
+            cmd, env = self.new_review_cmd()
+            r = subprocess.run(cmd + ["--replace"], cwd=self.parent, env=env, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("is on branch mine, not pr7", r.stderr)
+            self.assertNotIn("serving", r.stderr)
+            self.assertNotIn("stopping", r.stderr)
+            self.assertIsNone(srv.poll())
+        finally:
+            stop_prv(srv)
 
     def test_local_work_stops_the_update(self):
         self.prepare()

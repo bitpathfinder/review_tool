@@ -4446,7 +4446,8 @@ def local_ip():
 
 def lock_instance(git_dir):
     """Hold <git-dir>/prv/lock for the process lifetime: two servers in one
-    checkout would overwrite each other's threads.json. None if already held."""
+    checkout would overwrite each other's threads.json. None if already held.
+    The holder writes its pid there, so another prv can stop it."""
     d = os.path.join(git_dir, "prv")
     try:
         os.makedirs(d, exist_ok=True)
@@ -4459,7 +4460,96 @@ def lock_instance(git_dir):
     except BlockingIOError:
         fh.close()
         return None
+    try:
+        fh.truncate(0)
+        fh.write(f"{os.getpid()}\n")
+        fh.flush()
+    except OSError:
+        pass  # the lock still holds; only stopping this prv from another one needs the pid
     return fh
+
+
+def lock_holder(path):
+    """The pid holding the flock on path, or None. From /proc/locks (Linux) first: the file keeps the pid
+    of the last prv that wrote it, stale while a prv version that writes no pid holds the lock."""
+    try:
+        st = os.stat(path)
+        # The device too: an inode number alone may name a lock on another file system.
+        key = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+        with open("/proc/locks") as fh:
+            for line in fh:
+                f = line.split()
+                # "1: FLOCK  ADVISORY  WRITE 2038450 00:2c:1234567 0 EOF"; a blocked waiter has "->" after "1:".
+                # Pid 0: a holder outside this pid namespace, whose pid in the file names no process here.
+                if len(f) >= 6 and f[1] == "FLOCK" and f[5] == key:
+                    return int(f[4]) or None
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(path) as fh:
+            pid = int(fh.read().strip() or 0)
+        if pid > 0:
+            return pid
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def is_prv(pid):
+    try:
+        r = subprocess.run(["ps", "-ww", "-p", str(pid), "-o", "command="], capture_output=True, text=True)
+    except OSError:  # no ps
+        return False
+    return r.returncode == 0 and re.search(r"(^|[/\s])prv(\.py)?(\s|$)", r.stdout) is not None
+
+
+def take_instance(git_dir, root, replace, wait=20.0):
+    """lock_instance(), or, when another prv holds the lock, stop it and take the lock: with
+    replace, or when the user says yes on a terminal. None, with the reason printed, if not."""
+    lock = lock_instance(git_dir)
+    if lock is not None:
+        return lock
+    path = os.path.join(git_dir, "prv", "lock")
+    pid = lock_holder(path)
+    who = f"another prv (pid {pid})" if pid else "another prv"
+    # sys.stdin is None when prv starts with stdin closed.
+    if not replace and not (sys.stdin and sys.stdin.isatty() and sys.stderr.isatty()):
+        print(f"prv: {who} is already serving {root}; stop it first, or pass --replace", file=sys.stderr)
+        return None
+    # The pid comes from a file anyone with write access to the repository can edit: signal only a prv.
+    # Checked before the question, so a yes is never answered with "cannot".
+    if not pid or not is_prv(pid):
+        # The holder may have exited since lock_instance(), leaving only its pid in the file.
+        lock = lock_instance(git_dir)
+        if lock is None:
+            print(f"prv: cannot tell which process serves {root}; stop it yourself", file=sys.stderr)
+        return lock
+    if not replace:
+        # The question on stderr, which was checked to be a terminal: input() would write it to stdout.
+        print(f"prv: {who} is already serving {root}. Stop it and serve here? [y/N] ", end="", file=sys.stderr,
+              flush=True)
+        try:
+            yes = input()
+        except (EOFError, KeyboardInterrupt):
+            yes = ""
+        if yes.strip().lower() not in ("y", "yes"):
+            return None
+    print(f"prv: stopping {who}", file=sys.stderr)
+    try:
+        os.kill(pid, signal.SIGTERM)  # its shutdown stops its claude runs, then it exits and frees the lock
+    except ProcessLookupError:
+        pass
+    except PermissionError as e:
+        print(f"prv: cannot stop pid {pid}: {e}", file=sys.stderr)
+        return None
+    end = time.monotonic() + wait
+    while time.monotonic() < end:
+        lock = lock_instance(git_dir)
+        if lock is not None:
+            return lock
+        time.sleep(0.2)
+    print(f"prv: pid {pid} did not stop within {wait:.0f} s", file=sys.stderr)
+    return None
 
 
 def resolve(root, ref):
@@ -4755,6 +4845,10 @@ def update_submodules(d, reference, url, say=say, update=None):
     say(f"submodules at the pinned commits: {', '.join(p for _, p in mods)}")
 
 
+def review_dir(parent, n, slug):
+    return os.path.join(parent, f"PR_{n}", slug.split("/")[1])
+
+
 def checkout_pr(n, slug, parent, reference, gh, url):
     pr = gh_api(gh, f"repos/{slug}/pulls/{n}", parent)
     base = pr["base"]["ref"]
@@ -4764,7 +4858,7 @@ def checkout_pr(n, slug, parent, reference, gh, url):
     # GitHub text: control characters would reach the terminal as escape sequences.
     title = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", _str(pr.get("title")))
     say(f"PR #{n} {title} ({_str(pr.get('state'))}), base {base}, head {pr['head']['sha'][:10]}")
-    d = os.path.join(parent, f"PR_{n}", slug.split("/")[1])
+    d = review_dir(parent, n, slug)
     branch = f"pr{n}"
     fresh = not os.path.isdir(os.path.join(d, ".git"))
     if fresh:
@@ -4863,6 +4957,9 @@ def review_parent(cwd):
     return parent
 
 
+REPLACE_HELP = "stop a prv already serving this checkout without asking (default: ask on a terminal)"
+
+
 def new_review_main(argv):
     ap = argparse.ArgumentParser(
         prog="prv new_review", description="Check out a pull request for review, or bring the checkout up to "
@@ -4882,6 +4979,7 @@ def new_review_main(argv):
     ap.add_argument("--port", type=int)
     ap.add_argument("--open", action="store_true")
     ap.add_argument("--claude", default=shutil.which("claude") or "claude", help="claude CLI path")
+    ap.add_argument("--replace", action="store_true", help=REPLACE_HELP)
     args = ap.parse_args(argv)
     # Read only for a missing flag, so -h and explicit flags work around a broken config.
     if args.repo is None or args.reference is None:
@@ -4910,25 +5008,48 @@ def new_review_main(argv):
     if not gh:
         say("new_review needs the gh CLI")
         return 2
+    lock = None
+    # Holding the lock, this run is a prv another `--replace` may stop: let git children die with it.
+    old = _route_term_signals()
     try:
-        d, base = prepare_review(args.pr, args.repo, review_parent(os.getcwd()), args.reference, gh,
-                                 args.upstream_url)
+        parent = review_parent(os.getcwd())
+        # An existing checkout another prv serves: stop that prv before fetching moves the tree under it.
+        d = review_dir(parent, args.pr, args.repo)
+        if os.path.isdir(os.path.join(d, ".git")):
+            # checkout_pr() refuses a checkout on another branch: leave the prv that serves it running.
+            first = not os.path.exists(os.path.join(d, ".git", "index"))
+            if first or git(d, "branch", "--show-current", check=False).strip() == f"pr{args.pr}":
+                git_dir = git(d, "rev-parse", "--absolute-git-dir").strip()
+                lock = take_instance(git_dir, d, args.replace)
+                if lock is None:
+                    return 2
+        d, base = prepare_review(args.pr, args.repo, parent, args.reference, gh, args.upstream_url)
     except (GitError, OSError, KeyError, TypeError, ValueError) as e:  # ValueError: gh printed no JSON
         say(str(e) or type(e).__name__)
-        return 2
+        # An existing checkout of the PR that this run holds, maybe after stopping its prv: serve it as it
+        # is, with the default base, rather than leave nothing serving it. Another branch is not the PR.
+        if lock is None or git(d, "branch", "--show-current", check=False).strip() != f"pr{args.pr}":
+            return 2
+        say(f"the update failed; serving {d} as it is")
+        base = None
     except KeyboardInterrupt:
         return 130
+    finally:
+        for sig, h in old.items():
+            signal.signal(sig, h)
     os.chdir(d)
-    serve = [base, "--pr", str(args.pr), "--host", args.host, "--claude", args.claude]
+    serve = [*([base] if base else []), "--pr", str(args.pr), "--host", args.host, "--claude", args.claude]
     serve += ["--port", str(args.port)] if args.port is not None else []
     serve += ["--open"] if args.open else []
+    serve += ["--replace"] if args.replace else []  # a fresh clone: main() takes the lock
     auto = None if args.no_explain else (args.model, args.max_budget_usd)
-    return main(serve, auto_explain=auto, reference=args.reference)
+    return main(serve, auto_explain=auto, reference=args.reference, instance_lock=lock)
 
 
-def main(argv=None, auto_explain=None, reference=None):
+def main(argv=None, auto_explain=None, reference=None, instance_lock=None):
     """auto_explain: (model, budget) to start a "prepare" explain job once serving (prv new_review).
-    reference: new_review's reference clone, for Pull."""
+    reference: new_review's reference clone, for Pull. instance_lock: new_review's, taken before it
+    updated the checkout."""
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["git"]:
         return git_ro(argv[1:])
@@ -4953,6 +5074,7 @@ def main(argv=None, auto_explain=None, reference=None):
     ap.add_argument("--allow-push", action="store_true",
                     help="show Push for your own open PR: anyone with the URL can then push to its branch")
     ap.add_argument("--jira-url", default=JIRA_URL, help="prefix for Jira links (default: %(default)s)")
+    ap.add_argument("--replace", action="store_true", help=REPLACE_HELP)
     args = ap.parse_args(argv)
 
     try:
@@ -4965,9 +5087,8 @@ def main(argv=None, auto_explain=None, reference=None):
     except KeyboardInterrupt:
         return 130
     root, base, head, label = repo.root, repo.base, repo.head, repo.base_label
-    instance_lock = lock_instance(repo.git_dir)
+    instance_lock = instance_lock or take_instance(repo.git_dir, root, args.replace)
     if instance_lock is None:
-        print(f"prv: another prv is already serving {root}; stop it first", file=sys.stderr)
         return 2
     store = Store(repo.git_dir)
     runner = Runner(repo, store, args.claude)
@@ -5003,19 +5124,20 @@ def main(argv=None, auto_explain=None, reference=None):
         print("prv: no commits in the range, so no explanations are written")
     print("prv: Ctrl-C to stop")
     sys.stdout.flush()
-    if github:
-        github.start()
-    if explain:
-        explainer.start(*auto_explain, kind="prepare")
-        if not callpaths.current():  # the range only: per commit multiplies the cost
-            callpaths.start(CALLPATHS_MODEL, budget=auto_explain[1])
-    if args.open:
-        threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
     # claude runs in its own session, so a closed terminal or `kill` would orphan it; route both through shutdown().
+    # Before the jobs start: `prv --replace` may send SIGTERM right after this prv took the lock.
     for sig in (signal.SIGTERM, signal.SIGHUP):
         if signal.getsignal(sig) is not signal.SIG_IGN:  # keep nohup working
             signal.signal(sig, _interrupt)
     try:
+        if github:
+            github.start()
+        if explain:
+            explainer.start(*auto_explain, kind="prepare")
+            if not callpaths.current():  # the range only: per commit multiplies the cost
+                callpaths.start(CALLPATHS_MODEL, budget=auto_explain[1])
+        if args.open:
+            threading.Thread(target=webbrowser.open, args=(url,), daemon=True).start()
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
