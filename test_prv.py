@@ -1928,11 +1928,16 @@ def node_call(name, *args):
 def node_json(name, *args, deps=()):
     """Runs the page's top-level function name in node on JSON args; returns its result through JSON.
     deps: page functions and consts that name calls; they are emitted before name."""
+    return node_eval(f"{name}(...{json.dumps(list(args))})", (*deps, name))
+
+
+def node_eval(expr, names):
+    """The JSON value of the JS expression expr, after the page's top-level functions and consts names."""
     # One-line functions first: the multi-line pattern would run on to the next function's closing brace.
     fns = [re.search(rf"^(function {re.escape(f)}\([^\n]*}}\n|function {re.escape(f)}\(.*?\n}}\n|const {re.escape(f)} = [^\n]*\n)",
                      prv.PAGE, re.S | re.M).group(0)
-           for f in (*deps, name)]
-    js = "".join(fns) + f"process.stdout.write(JSON.stringify({name}(...{json.dumps(list(args))})));"
+           for f in names]
+    js = "".join(fns) + f"process.stdout.write(JSON.stringify({expr}));"
     return json.loads(subprocess.run(["node", "-e", js], capture_output=True, text=True, check=True).stdout)
 
 
@@ -2061,6 +2066,75 @@ class WholeFileAnchorTest(unittest.TestCase):
         self.assertEqual(self.nearest(flat, "new", 500), 5)  # a line far below the hunk
         self.assertEqual(self.nearest(flat, "new", 1), 0)
         self.assertEqual(self.nearest([], "new", 3), -1)
+
+
+@unittest.skipUnless(shutil.which("node"), "needs node")
+class ExpandTest(unittest.TestCase):
+    """The expand buttons between hunks, on a real diff: lines 10 and 50 of 60 changed."""
+    FNS = ("EXPAND", "newSpan", "gapRange", "setWhole", "expandedHunks")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = tmp.name
+        run = lambda *a: subprocess.run(["git", *a], cwd=d, check=True, capture_output=True)
+        run("init", "-q", "-b", "master")
+        path = os.path.join(d, "f.txt")
+        with open(path, "w") as fh:
+            fh.write("".join(f"l{n}\n" for n in range(1, 61)))
+        run("add", "."); run("commit", "-qm", "base")
+        with open(path, "w") as fh:
+            fh.write("".join(f"{'L' if n in (10, 50) else 'l'}{n}\n" for n in range(1, 61)))
+        run("commit", "-qam", "change")
+        repo = prv.Repo(d, prv.git(d, "rev-parse", "HEAD~1").strip(), "HEAD", "master")
+        self.f = repo.diff("all")["files"][0]
+        self.whole = repo.diff("all", paths=["f.txt"])["files"][0]["hunks"]
+
+    def run_js(self, body):
+        return node_eval(f"(() => {{ const f = {json.dumps(self.f)}; {body} }})()", self.FNS)
+
+    def test_hidden_lines_between_and_around_the_hunks(self):
+        self.assertEqual([h["header"].split("@@")[1] for h in self.f["hunks"]], [" -7,7 +7,7 ", " -47,7 +47,7 "])
+        # Below the last hunk the end of the file is unknown until the whole file is fetched.
+        self.assertEqual(self.run_js("return [0, 1, 2].map(g => String(gapRange(f, g)));"),
+                         ["1,6", "14,46", "54,Infinity"])
+        self.assertEqual(self.run_js(f"setWhole(f, {json.dumps(self.whole)}); return [f.total, String(gapRange(f, 2))];"),
+                         [60, "54,60"])
+
+    def test_revealed_lines_grow_and_merge_the_hunks(self):
+        def after(reveal):
+            return self.run_js(f"setWhole(f, {json.dumps(self.whole)}); f.reveal = new Set({json.dumps(list(reveal))}); "
+                               "f.hunks = expandedHunks(f); return f.hunks.map(h => [h.header, h.lines.map(l => l.n ?? -l.o)]);")
+        # 20 lines above the second hunk, 20 below the first.
+        (h1, n1), (h2, n2) = after(range(27, 47))
+        self.assertEqual((h1.split("@@")[1], h2), (" -7,7 +7,7 ", "@@ -27,27 +27,27 @@"))
+        self.assertEqual(n2[:3] + n2[-3:], [27, 28, 29, 51, 52, 53])
+        (h1, _), _ = after(range(14, 34))
+        self.assertEqual(h1.split("@@")[1], " -7,27 +7,27 ")
+        # The whole gap revealed: one hunk, carrying the first hunk's header text after its @@.
+        [(h, n)] = after(range(14, 47))
+        self.assertEqual(h, "@@ -7,47 +7,47 @@" + self.f["hunks"][0]["header"].split("@@")[2])
+        self.assertEqual([x for x in n if x > 0], list(range(7, 54)))
+        self.assertEqual([x for x in n if x < 0], [-10, -50])  # the removed lines stay where they were
+        # Lines above the first hunk start at line 1.
+        self.assertEqual(after(range(1, 7))[0][0].split("@@")[1], " -1,13 +1,13 ")
+
+    def test_a_whole_file_that_does_not_match_the_hunks_is_not_expanded(self):
+        # The whole file is fetched after the page loaded; in "Uncommitted changes" the file may have changed since.
+        def full(edit):
+            bad = json.loads(json.dumps(self.whole))
+            edit(bad[0]["lines"])
+            return self.run_js(f"setWhole(f, {json.dumps(bad)}); return f.full && f.full.length;")
+        self.assertEqual(full(lambda ls: None), 62)
+        self.assertIsNone(full(lambda ls: ls[6].update(n=99)))  # line 7, where the first hunk starts, moved
+        self.assertIsNone(full(lambda ls: ls[10].update(s="Z10")))  # a changed line now reads differently
+        # A change in a gap, where the page shows none: line 30 replaced.
+        self.assertIsNone(full(lambda ls: ls.__setitem__(slice(30, 31), [{"t": "-", "o": 30, "s": "l30"},
+                                                                         {"t": "+", "n": 30, "s": "X30"}])))
+
+    def test_a_file_without_a_newline_at_the_end_ends_at_the_last_hunk(self):
+        self.assertEqual(self.run_js("return String(gapRange(f, 2));"), "54,Infinity")
+        self.assertEqual(self.run_js("f.hunks[1].lines.at(-1).nonl = true; return String(gapRange(f, 2));"), "null")
 
 
 @unittest.skipUnless(prv.universal_ctags(), "needs Universal Ctags")

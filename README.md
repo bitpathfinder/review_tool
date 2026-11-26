@@ -49,6 +49,10 @@ to answer.
   existing checkout, so the update never moves files under a running prv. When the update of an
   existing checkout on branch `pr<N>` fails, for example on uncommitted changes, it serves the
   checkout as it is.
+- **Unfold the code.** The buttons on a hunk's header show the hidden lines above it, as on GitHub:
+  20 at a time (↑ next to the hunk, ↓ below the hunk before it), or the whole gap with **all N**, or
+  with one button when 20 lines or fewer are hidden. A row under the last hunk shows the lines below it.
+  **Whole file** in the file's header shows every line; **Changes only** goes back to the hunks.
 - **Go to a definition.** Ctrl-click (Cmd-click on a Mac) a name in the code to jump to where the
   files of the view define or declare it, opening "Whole file" when needed. Several matches show a
   list, those in the clicked file first. **← Back** in the header (key `b`) returns to where you clicked.

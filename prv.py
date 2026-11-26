@@ -5277,6 +5277,7 @@ td.add.code{background:var(--addbg)} td.add.no{background:var(--addno)}
 td.del.code{background:var(--delbg)} td.del.no{background:var(--delno)}
 td.empty{background:var(--bg2)}
 tr.hh td{background:var(--hunk);color:var(--muted);padding:3px 8px}
+tr.hh .exp button{font-size:11px;padding:0 6px;margin-right:6px}
 td.sel{background:var(--sel)!important}
 tr.ln.flash>td{background:var(--sel)}
 .note{padding:10px;color:var(--muted);font-size:13px}
@@ -5719,14 +5720,17 @@ function fileTable(f, i){
   const cols = split ? '<col style="width:50px"><col><col style="width:50px"><col>' : '<col style="width:50px"><col style="width:50px"><col>';
   let out = '', k = 0;
   f.flat = []; f.hk = [];
+  const hrow = text => split ? `<tr class="hh"><td class="no"></td><td colspan="3">${text}</td></tr>`
+    : `<tr class="hh"><td class="no"></td><td class="no"></td><td>${text}</td></tr>`;
   f.hunks.forEach((h, hi) => {
-    const hh = split ? `<tr class="hh"><td class="no"></td><td colspan="3">${esc(h.header)}</td></tr>`
-      : `<tr class="hh"><td class="no"></td><td class="no"></td><td>${esc(h.header)}</td></tr>`;
+    const hh = hrow(expHtml(f, i, hi) + esc(h.header));
+    // The last hunk ends with a row for the lines below it.
+    const below = hi === f.hunks.length - 1 && expHtml(f, i, hi + 1);
     const k0 = k;
     for (const l of h.lines) f.flat.push(l);  // push(...lines) overflows the stack past ~120k lines
     k += h.lines.length;
     f.hk.push([k0, k - 1]);
-    out += `<div class="hunk"><table class="diff"><colgroup>${cols}</colgroup><tbody>${hh}${(split ? splitRows : unifiedRows)(h, i, k0, lang)}</tbody></table><div class="xcell" id="x${i}-${hi}"></div></div>`;
+    out += `<div class="hunk"><table class="diff"><colgroup>${cols}</colgroup><tbody>${hh}${(split ? splitRows : unifiedRows)(h, i, k0, lang)}${below ? hrow(below) : ''}</tbody></table><div class="xcell" id="x${i}-${hi}"></div></div>`;
   });
   return out;
 }
@@ -5753,7 +5757,7 @@ function renderMain(){
     const vkey =`prv:viewed:${S.meta.root}:${v}:${p}:${f.fp}`;
     const viewed = ls.get(vkey) === '1';
     const lines = f.hunks.reduce((a, x) => a + x.lines.length, 0);
-    const big = lines > BIG && !f.whole;  // "Whole file" was asked for explicitly
+    const big = lines > BIG && !f.whole && !f.reveal?.size;  // "Whole file" or expanded lines were asked for explicitly
     const name = f.status === 'R' || f.status === 'C' ? `${esc(f.old_path)} → ${esc(f.new_path)}` : esc(p);
     // Added and deleted files already show every line.
     const whole = f.hunks.length && !f.binary && f.status !== 'A' && f.status !== 'D'
@@ -5831,29 +5835,126 @@ function insertTable(i){
   el.classList.remove('collapsed');
   return true;
 }
+async function loadWhole(i, btn){
+  // The whole file as one hunk, fetched once per file of this diff. False when the view changed or the fetch failed.
+  const f = S.diff.files[i], seq = S.seq;
+  if (f.wholeHunks) return true;
+  // A layout change re-renders the button enabled while the fetch runs; a second click must not start another.
+  if (f.loading) return false;
+  btn.disabled = f.loading = true;
+  const ps = [...new Set([f.old_path, f.new_path].filter(Boolean))];
+  let d;
+  try { d = await api('/api/diff?view=' + encodeURIComponent(S.view) + ps.map(p => '&path=' + encodeURIComponent(p)).join('')); }
+  catch(e){ btn.disabled = false; alert(e.message); return false; }
+  finally { f.loading = false; }
+  if (S.seq !== seq || S.diff?.files[i] !== f) return false;  // the view changed meanwhile
+  const w = d.files.find(x => filePath(x) === filePath(f) && x.status === f.status);
+  if (!w) { btn.disabled = false; alert('The file is not in this view any more; Refresh.'); return false; }
+  setWhole(f, w.hunks);
+  return true;
+}
+function setWhole(f, hunks){
+  f.changes ??= f.hunks; f.wholeHunks = hunks;
+  // Where each changed hunk sits in the whole file. Expanding needs every hunk there line for line, and no other
+  // change: a file edited since the page loaded ("Uncommitted changes") shows as the whole file instead.
+  const full = hunks.length === 1 ? hunks[0].lines : [], at = new Map();
+  full.forEach((l, j) => at.set(`${l.t}${l.o}:${l.n}`, j));
+  const same = (x, y) => y && x.t === y.t && x.o === y.o && x.n === y.n && x.s === y.s;
+  f.spans = f.changes.map(h => [at.get(`${h.lines[0].t}${h.lines[0].o}:${h.lines[0].n}`), 0]);
+  f.spans.forEach((sp, hi) => { sp[1] = sp[0] + f.changes[hi].lines.length - 1; });
+  const inSpan = new Uint8Array(full.length);
+  for (const [a, b] of f.spans) if (a !== undefined) inSpan.fill(1, a, b + 1);
+  const ok = full.length && f.spans.every(([a], hi) => a !== undefined && f.changes[hi].lines.every((l, j) => same(l, full[a + j])))
+    && full.every((l, j) => inSpan[j] || l.t === ' ');
+  f.full = ok ? full : null;
+  f.total = full.filter(l => l.t !== '-').length;
+}
 async function toggleWhole(i, btn){
   // Swaps a file's hunks for one hunk holding the whole file, and back. Anchors are line numbers,
   // so threads, notes and GitHub comments land on the same lines either way.
-  const f = S.diff.files[i], seq = S.seq;
-  if (f.whole) { f.hunks = f.changes; f.whole = false; }
+  const f = S.diff.files[i];
+  if (f.whole) { f.hunks = f.changes; f.whole = false; f.reveal = null; }
   else {
-    // A layout change re-renders the button enabled while the fetch runs; a second click must not start another.
-    if (f.loading) return;
-    btn.disabled = f.loading = true;
-    const ps = [...new Set([f.old_path, f.new_path].filter(Boolean))];
-    let d;
-    try { d = await api('/api/diff?view=' + encodeURIComponent(S.view) + ps.map(p => '&path=' + encodeURIComponent(p)).join('')); }
-    catch(e){ btn.disabled = false; return alert(e.message); }
-    finally { f.loading = false; }
-    if (S.seq !== seq || S.diff?.files[i] !== f) return;  // the view changed meanwhile
-    const w = d.files.find(x => filePath(x) === filePath(f) && x.status === f.status);
-    if (!w) { btn.disabled = false; return alert('The file is not in this view any more; Refresh.'); }
-    f.changes = f.hunks; f.hunks = w.hunks; f.whole = true;
+    if (!await loadWhole(i, btn)) return;
+    f.hunks = f.wholeHunks; f.whole = true;
   }
   // The file's first visible line stays where it was. "Changes only" may drop that line; the nearest shown line stays instead.
   // A collapsed file has no anchor and keeps its place on "Changes only".
   const a = rowAnchor(i);  // after the fetch: the page may have scrolled meanwhile
   if (!rerenderDiff(a) && (a || f.whole)) document.getElementById('f' + i)?.scrollIntoView({block:'start'});
+}
+// GitHub's expand arrows: the unchanged lines between hunks, EXPAND at a time. f.reveal holds the new-side
+// numbers of the lines shown besides the changed hunks; the hunks are rebuilt from the whole file.
+const EXPAND = 20;
+function newSpan(h){
+  // The hunk's first new-side line and the line after its last. A hunk without new lines sits after line c.
+  const m = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(h.header);
+  if (!m) return null;
+  const c = +m[1], d = m[2] === undefined ? 1 : +m[2], first = d ? c : c + 1;
+  return [first, first + d];
+}
+function gapRange(f, g){
+  // New-side lines hidden before hunk g, [lo, hi]; g = f.hunks.length is below the last hunk.
+  const a = g ? newSpan(f.hunks[g - 1]) : [0, 1], b = g < f.hunks.length ? newSpan(f.hunks[g]) : null;
+  if (!a || (g < f.hunks.length && !b)) return null;
+  if (b) return [a[1], b[0] - 1];
+  if (f.full) return [a[1], f.total];
+  // Not fetched yet: git gives a hunk 3 lines of context after it unless the file ends sooner.
+  const L = f.hunks[g - 1].lines;
+  if (L.at(-1)?.nonl) return null;  // the last line has no newline: the file ends here
+  let ctx = 0;
+  while (ctx < 3 && L[L.length - 1 - ctx]?.t === ' ') ctx++;
+  return ctx < 3 ? null : [a[1], Infinity];
+}
+function expHtml(f, i, g){
+  if (f.whole || f.binary || f.status === 'A' || f.status === 'D' || !f.hunks.length) return '';
+  const r = gapRange(f, g);
+  if (!r || r[0] > r[1]) return '';
+  const n = r[1] - r[0] + 1, b = (dir, text, title) => `<button data-exp="${i}:${g}:${dir}" title="${title}">${text}</button>`;
+  const below = g === f.hunks.length;
+  if (n <= EXPAND) return `<span class="exp">${b('all', `${below ? '↓' : g ? '↕' : '↑'} ${n} line${n === 1 ? '' : 's'}`, 'Show the hidden lines')}</span>`;
+  const more = Number.isFinite(n) ? ` (${n} hidden)` : '';
+  return `<span class="exp">${g ? b('down', `↓ ${EXPAND}`, `Show ${EXPAND} more lines below the hunk above${more}`) : ''}${below ? ''
+    : b('up', `↑ ${EXPAND}`, `Show ${EXPAND} more lines above this hunk${more}`)}${Number.isFinite(n) ? b('all', `all ${n}`, 'Show all hidden lines here') : ''}</span>`;
+}
+function expandedHunks(f){
+  // The changed hunks plus the revealed lines, as hunks of the whole file; neighbours merge into one.
+  const full = f.full, on = new Uint8Array(full.length);
+  for (const [a, b] of f.spans) on.fill(1, a, b + 1);
+  full.forEach((l, j) => { if (l.t === ' ' && f.reveal.has(l.n)) on[j] = 1; });
+  const out = [];
+  let o = 0, n = 0, cur = null;  // old and new lines before full[j]
+  full.forEach((l, j) => {
+    if (!on[j]) cur = null;
+    else {
+      if (!cur) out.push(cur = {o, n, lines: []});
+      cur.lines.push(l);
+    }
+    if (l.t !== '+') o++;
+    if (l.t !== '-') n++;
+  });
+  return out.map(h => {
+    const co = h.lines.filter(l => l.t !== '+').length, cn = h.lines.filter(l => l.t !== '-').length;
+    // git's function name after the second @@, when the hunk starts where a changed hunk starts.
+    const same = f.changes.find(x => x.lines[0].t === h.lines[0].t && x.lines[0].o === h.lines[0].o && x.lines[0].n === h.lines[0].n);
+    const tail = same ? same.header.replace(/^@@[^@]*@@/, '') : '';
+    return {header: `@@ -${co ? h.o + 1 : h.o},${co} +${cn ? h.n + 1 : h.n},${cn} @@${tail}`, lines: h.lines};
+  });
+}
+async function expandHunk(btn){
+  const [i, g, dir] = btn.dataset.exp.split(':'), f = S.diff.files[+i];
+  const r = gapRange(f, +g);  // before the fetch: g counts the hunks on the page now
+  if (!r || !await loadWhole(+i, btn)) return;
+  if (!f.full) { f.hunks = f.wholeHunks; f.whole = true; }
+  else {
+    const hi = Math.min(r[1], f.total), [lo, up] = dir === 'up' ? [Math.max(r[0], hi - EXPAND + 1), hi]
+      : dir === 'down' ? [r[0], Math.min(hi, r[0] + EXPAND - 1)] : [r[0], hi];
+    f.reveal ||= new Set();
+    for (let n = lo; n <= up; n++) f.reveal.add(n);
+    f.hunks = expandedHunks(f);
+  }
+  const a = rowAnchor(+i);
+  if (!rerenderDiff(a) && a) document.getElementById('f' + i)?.scrollIntoView({block:'start'});
 }
 function rowAnchor(i){
   // The first line of file i below its sticky header, and where it shows in the window.
@@ -5899,9 +6000,9 @@ function nearestLine(flat, side, line){
   return k;
 }
 function hunkRange(loc, a){
-  // Flat indexes of the changed hunk holding a; in "Whole file" the file is one hunk, so use the original one.
+  // Flat indexes of the changed hunk holding a; "Whole file" and expanded lines change the hunks, so use the original one.
   const f = S.diff.files[loc.i];
-  if (!f.whole) return f.hk[loc.hi];
+  if (!f.changes || f.hunks === f.changes) return f.hk[loc.hi];
   const h = f.changes.find(h => h.lines.some(l => lineAt(l, a.side, a.line)));
   const kOf = l => f.flat.findIndex(x => x.t === l.t && x.o === l.o && x.n === l.n);
   return h ? [kOf(h.lines[0]), kOf(h.lines[h.lines.length - 1])] : f.hk[loc.hi];
@@ -6104,6 +6205,8 @@ $('#main').addEventListener('click', e => {
   if (xg) return genExplain(xg);
   const wb = e.target.closest('[data-whole]');
   if (wb) return toggleWhole(+wb.dataset.whole, wb);
+  const xb = e.target.closest('[data-exp]');
+  if (xb) return expandHunk(xb);
   const ga = e.target.closest('[data-ghask]');
   if (ga) return ghDiscuss(S.gh?.threads?.[+ga.dataset.ghask]);
   const gc = e.target.closest('[data-ghconv]');
@@ -6980,6 +7083,9 @@ function rerenderDiff(a){
   const files = [...document.querySelectorAll('#main .file')].map(el => ({loaded: !!$('.slot table.diff', el), collapsed: el.classList.contains('collapsed')}));
   const pending = $('#conv > .thread.new');
   const sel = S.sel, lineTh = $('.trow.new .thread.new');
+  // By line number: Whole file, Changes only and the unfold buttons change the flat indexes.
+  const fl0 = sel && S.diff.files[sel.f]?.flat, at = k => ({side: lineSide(fl0[k]), line: lineNo(fl0[k])});
+  const selAt = sel && lineTh && fl0 ? {a: at(sel.a), b: at(sel.b)} : null;
   const cc = $('#commitcard');
   S.sel = null; S.sel0 = null;
   renderMain();
@@ -6994,11 +7100,15 @@ function rerenderDiff(a){
   if (pending) $('#conv').append(pending);
   renderExplain();
   renderGitHub();
-  if (sel && lineTh) {
+  if (selAt) {
     // Moves the old composer into the new row: a submit in flight still holds that element.
-    S.sel0 = {f:sel.f, k:sel.a};
-    selectLine(sel.f, sel.b, true);
-    $('.trow.new .thread.new').replaceWith(lineTh);
+    const fl = S.diff.files[sel.f].flat || [], find = p => fl.findIndex(l => lineAt(l, p.side, p.line));
+    const ka = find(selAt.a), kb = find(selAt.b);
+    if (ka >= 0 && kb >= 0) {
+      S.sel0 = {f:sel.f, k:ka};
+      selectLine(sel.f, kb, true);
+      $('.trow.new .thread.new').replaceWith(lineTh);
+    } else $('#conv').append(lineTh);  // its lines left the page ("Changes only"); the text and its anchor stay
   }
   window.scrollTo(0, y);
   // A line anchor gone from the page keeps y: its top is not where the file box was.
