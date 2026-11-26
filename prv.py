@@ -1134,14 +1134,15 @@ def anchor_context(repo, anchor, tree=None):
         lines.append(f"Current view: commit {view}. Inspect it with `{GIT_CMD} show {view}`.")
         if anchor.get("scope") == "pr":
             lines.append(f"The reviewer asks about the whole range, not only this commit. Answer for the code at "
-                         f"the tip {repo.head} and all commits in {repo.base}..{repo.head}: later commits may change "
-                         f"these lines; see `{GIT_CMD} log {view}..{repo.head} -- <path>`."
-                         + (" Line numbers below are the commit's." if anchor.get("path") else ""))
+                         f"the tip {repo.head} and all commits in {repo.base}..{repo.head}."
+                         + (f" Later commits may change the selected lines; see `{GIT_CMD} log {view}..{repo.head}"
+                            f" -- <path>`. Line numbers below are the commit's." if anchor.get("path") else ""))
     if tree:
         lines.append(tree_note(repo, tree, anchor))
     path = anchor.get("path")
     if not path:
-        lines.append("The question is about this view as a whole. Use git to inspect it.")
+        what = "the whole range" if anchor.get("scope") == "pr" else "this view as a whole"
+        lines.append(f"The question is about {what}. Use git to inspect it.")
         if anchor.get("pr"):
             lines.append(str(anchor["pr"]))
         return "\n".join(lines + note_context(anchor))
