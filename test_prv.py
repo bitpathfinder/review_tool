@@ -867,7 +867,7 @@ class GitHubTest(unittest.TestCase):
         self.assertEqual(gh.save_draft("first, edited", did=d1["id"])["body"], "first, edited")
         self.assertEqual(len(gh.for_view("all")["drafts"]), 3)
         self.assertEqual(len(prv.GitHub(self.repo, self.gh).drafts()), 3)  # saved
-        for bad in ({"anchor": {**one, "view": head}}, {"anchor": one, "body": " "}, {"reply_to": 2},
+        for bad in ({"anchor": {**one, "view": "wt"}}, {"anchor": one, "body": " "}, {"reply_to": 2},
                     {"anchor": {**one, "head": "c" * 40}}, {"anchor": "x"},
                     # Line 1 is outside the PR diff's hunk: GitHub would refuse the whole review.
                     {"anchor": {**one, "start": {"side": "new", "line": 1}, "end": {"side": "new", "line": 1}}}):
@@ -882,6 +882,94 @@ class GitHubTest(unittest.TestCase):
             {"path": "a.txt", "body": "second", "line": 7, "side": "RIGHT", "start_line": 5, "start_side": "LEFT"}]})
         self.assertEqual(reply, {"path": "repos/scylla/db/pulls/55/comments/1/replies", "body": {"body": "a reply"}})
         self.assertEqual(gh.drafts(), [])
+
+    def test_comment_written_in_a_commit_goes_on_the_heads_lines(self):
+        g = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=self.root,
+                                      check=True, capture_output=True)
+        lines = lambda *ls: "".join(f"{l}\n" for l in ls)
+        old = [f"line {i}" for i in range(1, 11)]
+        with open(os.path.join(self.root, "a.txt"), "w") as fh:  # c1: two lines after line 5
+            fh.write(lines(*old[:5], "new five", "new six", *old[5:]))
+        g("commit", "-qam", "c1")
+        c1 = self.git_head()
+        with open(os.path.join(self.root, "a.txt"), "w") as fh:  # c2: two lines on top; "new six" and line 8 change
+            fh.write(lines("top a", "top b", *old[:5], "new five", "NEW six", *old[5:7], "LINE 8", *old[8:]))
+        g("commit", "-qam", "c2")
+        head = self.git_head()
+        gh = self.review_pr(head, **{"POST repos/scylla/db/pulls/55/reviews": {"html_url": "https://github.com/r"}})
+        at = lambda view, side, line, end=None: {"view": view, "path": "a.txt", "start": {"side": side, "line": line},
+                                                 "end": {"side": side, "line": end or line}, "head": head}
+        d = gh.save_draft("on c1", at(c1, "new", 6))  # "new five": line 8 at the head
+        self.assertEqual((d["start"], d["end"], d["commit"], d["cstart"]),
+                         ({"side": "new", "line": 8}, {"side": "new", "line": 8}, c1, {"side": "new", "line": 6}))
+        # A removed line is numbered as the base has it: line 8 is line 10 in c1.
+        self.assertEqual(gh.save_draft("on c2", at(head, "old", 10))["start"], {"side": "old", "line": 8})
+        for view, side, line, why in ((c1, "new", 7, "a later commit"), (c1, "new", 10, "a later commit"),
+                                      (head, "old", 7, "an earlier commit"), (self.repo.base, "new", 1, "not in the PR"),
+                                      # Its ends are unchanged, but a later commit changes "new six" between them.
+                                      (c1, "new", (6, 8), "a later commit")):
+            with self.assertRaises(prv.ChangeError, msg=(view, line)) as cm:
+                gh.save_draft("x", at(view, side, *(line if isinstance(line, tuple) else (line,))))
+            self.assertIn(why, str(cm.exception))
+        # Lines 8 and 9 of c1, "line 6" and "line 7", are unchanged at the head.
+        r = gh.save_draft("x", at(c1, "new", 8, 9))
+        self.assertEqual((r["start"], r["end"]), ({"side": "new", "line": 10}, {"side": "new", "line": 11}))
+        gh.delete_draft(r["id"])
+        self.assertEqual(len(prv.GitHub(self.repo, self.gh).drafts()), 2)  # the commit fields pass the load check
+        gh.submit("COMMENT", "")
+        self.assertEqual(self.posts()[0]["body"]["comments"], [
+            {"path": "a.txt", "body": "on c1", "line": 8, "side": "RIGHT"},
+            {"path": "a.txt", "body": "on c2", "line": 8, "side": "LEFT"}])
+
+    def test_comment_written_in_a_commit_follows_renames(self):
+        g = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=self.root,
+                                      check=True, capture_output=True)
+        g("mv", "a.txt", "b.txt")
+        g("commit", "-qm", "rename to b")
+        with open(os.path.join(self.root, "b.txt")) as fh:
+            text = fh.read()
+        with open(os.path.join(self.root, "b.txt"), "w") as fh:  # removes "line 8", line 9 of b.txt
+            fh.write(text.replace("line 8\n", ""))
+        g("commit", "-qam", "drop line 8")
+        c = self.git_head()
+        g("mv", "b.txt", "c.txt")
+        g("commit", "-qm", "rename to c")
+        head = self.git_head()
+        gh = self.review_pr(head, **{"POST repos/scylla/db/pulls/55/reviews": {"html_url": "https://github.com/r"}})
+        at = lambda side, line: {"view": c, "path": "b.txt", "start": {"side": side, "line": line},
+                                 "end": {"side": side, "line": line}, "head": head}
+        # The base names the file a.txt, where the removed line is line 8; the head names it c.txt.
+        d = gh.save_draft("removed", at("old", 9))
+        self.assertEqual((d["path"], d["start"], d["cpath"], d["cstart"]),
+                         ("c.txt", {"side": "old", "line": 8}, "b.txt", {"side": "old", "line": 9}))
+        d = gh.save_draft("kept", at("new", 6))
+        self.assertEqual((d["path"], d["start"], d["cpath"]), ("c.txt", {"side": "new", "line": 6}, "b.txt"))
+        self.assertEqual(len(prv.GitHub(self.repo, self.gh).drafts()), 2)  # cpath passes the load check
+        gh.submit("COMMENT", "")
+        self.assertEqual(self.posts()[0]["body"]["comments"], [
+            {"path": "c.txt", "body": "removed", "line": 8, "side": "LEFT"},
+            {"path": "c.txt", "body": "kept", "line": 6, "side": "RIGHT"}])
+
+    def test_commit_lines_map_through_a_path_that_reads_as_a_glob(self):
+        # The pathspec "p[1].txt" as a glob matches p1.txt too; its two new top lines must not shift p[1].txt.
+        g = lambda *a: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=self.root,
+                                      check=True, capture_output=True)
+        body = "".join(f"line {i}\n" for i in range(1, 21))
+        for name in ("p[1].txt", "p1.txt"):
+            with open(os.path.join(self.root, name), "w") as fh:
+                fh.write(body)
+        g("add", "."); g("commit", "-qm", "two files")
+        with open(os.path.join(self.root, "p[1].txt"), "w") as fh:
+            fh.write(body.replace("line 10\n", "LINE 10\n"))
+        g("commit", "-qam", "c1")
+        c1 = self.git_head()
+        with open(os.path.join(self.root, "p1.txt"), "w") as fh:
+            fh.write("a\nb\n" + body)
+        g("commit", "-qam", "c2")
+        self.assertEqual(prv.map_lines(self.root, c1, self.git_head(), "p[1].txt", 10, 10, "p[1].txt"), (10, 10))
+        g("mv", "p[1].txt", "q.txt")
+        g("commit", "-qm", "c3")
+        self.assertEqual(prv.map_lines(self.root, c1, self.git_head(), "p[1].txt", 10, 10, "q.txt"), (10, 10))
 
     def test_review_refused_unless_head_is_the_prs(self):
         gh = self.review_pr("b" * 40, **{"POST repos/scylla/db/pulls/55/reviews": "!",

@@ -233,14 +233,21 @@ them; your pending comments stay.
 
 ## GitHub review
 
-In "All changes" of a PR, select lines, switch the question box to **GitHub comment** and press **Save to
-review**, or press **Reply** under a GitHub thread. The question box keeps the last mode per browser. prv
+In "All changes" or a commit's view of a PR, select lines, switch the question box to **GitHub comment**
+and press **Save to review**, or press **Reply** under a GitHub thread. The question box keeps the last
+mode per browser. prv
 saves the text as a pending comment in `<git-dir>/prv/github-drafts.json` and shows it under its line,
 with edit and delete. **Review** in the header lists the pending comments and posts them, with an
 optional summary, as one GitHub review:
 Comment, Approve or Request changes. Replies go to their threads in the same step. prv asks before it
 posts. A comment or reply that GitHub refuses stays pending. A comment goes on lines of one hunk of the
-PR's diff, as GitHub requires, so lines that only "Whole file" shows take none.
+PR's diff, as GitHub requires, so lines that only "Whole file" or the unfold buttons show take none.
+
+A review goes to one commit, the PR head. A comment written in a commit's view goes on the same lines of
+code at the head: added and unchanged lines as the head numbers them, removed lines as the base does. It
+shows in that commit's view and in "All changes". Lines that a later commit changes, and removed lines that an earlier
+commit of the PR added, have no place in the head's diff; prv refuses them. **GitHub comment** is
+disabled while the reviewed head is not the PR's head on GitHub.
 
 Review is refused when HEAD is not the PR head GitHub reports, or when a pending line comment was written
 on an older head, since GitHub places a comment by its line number in the PR head. Pull, or delete the

@@ -3701,7 +3701,86 @@ def check_gh_draft(d):
         return False
     if "reply_to" in d:
         return type(d["reply_to"]) is int
-    return isinstance(d.get("path"), str) and pos(d.get("start")) and pos(d.get("end")) and isinstance(d.get("head"), str)
+    # commit, cstart and cend: a comment written in a commit's view, on these lines of the commit;
+    # cpath: the file's path there when a later commit renames it.
+    return (isinstance(d.get("path"), str) and pos(d.get("start")) and pos(d.get("end")) and isinstance(d.get("head"), str)
+            and ("commit" not in d or (isinstance(d["commit"], str) and re.fullmatch(r"[0-9a-f]{40}", d["commit"])
+                                       and pos(d.get("cstart")) and pos(d.get("cend"))
+                                       and isinstance(d.get("cpath", ""), str))))
+
+
+def renamed(root, a, b, path):
+    """path of commit a as commit b names it: path, or where a rename between them moved it; None when b deletes it."""
+    out = git(root, "diff", "-M", "--name-status", "-z", "--no-color", "--no-ext-diff", a, b).split("\0")
+    i = 0
+    while i + 1 < len(out):
+        st, p = out[i], out[i + 1]
+        if st[:1] in ("R", "C"):  # status, source, destination
+            if st[0] == "R" and p == path:
+                return out[i + 2]
+            i += 3
+            continue
+        if st == "D" and p == path:
+            return None
+        i += 2
+    return path
+
+
+def map_lines(root, a, b, path, lo, hi, bpath):
+    """Lines lo..hi of path as commit a has them, numbered as commit b, where the file is bpath, has them;
+    None when a..b changes, removes or inserts any of them, or bpath is None (b deletes the file)."""
+    if bpath is None:
+        return None
+    paths = ["--no-renames", "--", path] if bpath == path else ["-M", "--", path, bpath]
+    # --literal-pathspecs: a path such as "p[1].txt" must not act as a glob and add another file's hunks.
+    out = git(root, "--literal-pathspecs", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", a, b, *paths)
+    shift = 0
+    for m in re.finditer(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,(\d+))? @@", out, re.M):
+        s, c = int(m[1]), 1 if m[2] is None else int(m[2])
+        d = 1 if m[3] is None else int(m[3])
+        if c == 0:  # lines inserted after line s
+            if s >= hi:
+                break
+            if s >= lo:
+                return None
+        elif s > hi:
+            break
+        elif s + c > lo:
+            return None
+        shift += d - c
+    return lo + shift, hi + shift
+
+
+def commit_lines_at_head(repo, commit, path, start, end):
+    """(path, start, end) of lines start and end of path in commit's view, as GitHub takes them: the path and new
+    lines as the PR head has them, removed lines as the base has them. Raises ChangeError when a later commit
+    changes the lines, or an earlier one added the removed lines."""
+    if not is_ancestor(repo.root, commit, repo.head) or is_ancestor(repo.root, commit, repo.base):
+        raise ChangeError("that commit is not in the PR any more; reload the page", 409)
+    f = next((f for f in repo.diff(commit)["files"] if file_path(f) == path), None)
+    if f is None:
+        raise ChangeError(f"{path} is not in that commit")
+    head = repo.head_sha()
+    hpath = renamed(repo.root, commit, head, path)  # None: a later commit deletes the file
+
+    def at_head(side, lo, hi):
+        if side == "new":
+            r = map_lines(repo.root, commit, head, path, lo, hi, hpath)
+            why = "a later commit of the PR changes these lines"
+        else:  # removed lines: GitHub's old side is the base
+            old = f.get("old_path") or path
+            r = map_lines(repo.root, f"{commit}^", repo.base, old, lo, hi, renamed(repo.root, f"{commit}^", repo.base, old))
+            why = "an earlier commit of the PR added these removed lines"
+        if r is None:
+            raise ChangeError(f"{why}, so GitHub has no place for the comment; write it in \"All changes\"")
+        return r
+    # A range on one side is checked line by line: a later change inside it would put other code under the comment.
+    if start["side"] == end["side"]:
+        lo, hi = at_head(start["side"], min(start["line"], end["line"]), max(start["line"], end["line"]))
+        a, b = (lo, hi) if start["line"] <= end["line"] else (hi, lo)
+    else:
+        a, b = at_head(start["side"], start["line"], start["line"])[0], at_head(end["side"], end["line"], end["line"])[0]
+    return hpath or path, {"side": start["side"], "line": a}, {"side": end["side"], "line": b}
 
 
 def gh_range(files, path, start, end):
@@ -3773,8 +3852,8 @@ class GitHub:
         os.replace(self.dpath + ".tmp", self.dpath)
 
     def save_draft(self, body, anchor=None, reply_to=None, did=None):
-        """Adds a draft, or changes the body of draft did. anchor: lines of the "All changes" view, with the
-        head the page drew them from, for a new comment; reply_to: the id of a thread's first comment, for a reply. Raises ChangeError or OSError."""
+        """Adds a draft, or changes the body of draft did. anchor: lines of the "All changes" view or of a commit's
+        view, with the head the page drew them from, for a new comment; reply_to: the id of a thread's first comment, for a reply. Raises ChangeError or OSError."""
         body = body.strip()
         if not body or len(body) > MAX_GH_BODY:
             raise ChangeError(f"a comment needs 1 to {MAX_GH_BODY} characters")
@@ -3782,13 +3861,22 @@ class GitHub:
             # Checked before dlock: the diff of a large PR takes seconds, and every /api/github reads the drafts.
             anchor = anchor if isinstance(anchor, dict) else {}
             start, end = _pos(anchor.get("start")), _pos(anchor.get("end"))
-            if anchor.get("view") != "all" or not isinstance(anchor.get("path"), str) or not (start and end):
-                raise ChangeError("a GitHub comment goes on lines of the \"All changes\" view")
+            view, commit = anchor.get("view"), None
+            if view != "all" and isinstance(view, str) and SHA_RE.match(view):
+                try:
+                    commit = self.repo.check_view(view)
+                except GitError:
+                    pass
+            if (view != "all" and not commit) or not isinstance(anchor.get("path"), str) or not (start and end):
+                raise ChangeError("a GitHub comment goes on lines of \"All changes\" or of a commit")
             # GitHub numbers lines as the PR head has them: submit() checks that HEAD is still this one.
             if anchor.get("head") != self.repo.head_sha():
                 raise ChangeError("HEAD moved since the page drew these lines; reload the page", 409)
+            path, cstart, cend = anchor["path"], start, end
+            if commit:  # one review goes to one commit, the head: a commit's lines are renumbered as the head has them
+                path, start, end = commit_lines_at_head(self.repo, commit, anchor["path"], start, end)
             # GitHub refuses the whole review over one line outside its diff, such as a "Whole file" line.
-            span = gh_range(self.repo.diff("all")["files"], anchor["path"], start, end)
+            span = gh_range(self.repo.diff("all")["files"], path, start, end)
             if not span:
                 raise ChangeError("GitHub takes comments only on lines of one hunk of the PR's diff, "
                                   "and a range that ends on a removed line cannot start on an added one")
@@ -3808,8 +3896,12 @@ class GitHub:
                 d = {"id": uuid.uuid4().hex[:12], "created": time.time(), "body": body, "reply_to": reply_to}
                 self._drafts.append(d)
             else:
-                d = {"id": uuid.uuid4().hex[:12], "created": time.time(), "body": body, "path": anchor["path"],
+                d = {"id": uuid.uuid4().hex[:12], "created": time.time(), "body": body, "path": path,
                      "start": start, "end": end, "head": anchor["head"]}
+                if commit:
+                    d.update(commit=commit, cstart=cstart, cend=cend)
+                    if path != anchor["path"]:  # a later commit renames the file
+                        d["cpath"] = anchor["path"]
                 self._drafts.append(d)
             self._save_drafts_locked()
             return dict(d)
@@ -6082,11 +6174,13 @@ function modelSelect(){
   return `<select class="model">${S.meta.models.map(m => `<option ${m===cur?'selected':''}>${m}</option>`).join('')}</select>`;
 }
 function composerHtml(running, gh, queued, scope){
-  // gh: lines of "All changes" in a PR, where the text can also become a pending GitHub comment.
+  // gh: lines of "All changes" or of a commit in a PR, where the text can also become a pending GitHub comment;
+  // 'stale' when the reviewed head is not the PR's head on GitHub, whose line numbers then differ.
   // queued: the thread waits for the batch; it takes no question, and has nothing to stop.
   // scope: a new thread of a commit view, which can ask about the whole range instead of the commit.
   const busy = running || queued;
-  const modes = gh ? '<div class="modes"><button class="mode" data-mode="claude">Ask Claude</button><button class="mode" data-mode="gh">GitHub comment</button></div>' : '';
+  const off = gh === 'stale' ? ' disabled title="The reviewed head is not the PR\'s head on GitHub, so the line numbers differ; pull first"' : '';
+  const modes = gh ? `<div class="modes"><button class="mode" data-mode="claude">Ask Claude</button><button class="mode" data-mode="gh"${off}>GitHub comment</button></div>` : '';
   return `<div class="composer">${modes}<textarea placeholder="${ASK_PH}"></textarea>
     <div class="row">${modelSelect()}<label title="Let Claude edit files in the working tree (no commits)"><input type="checkbox" class="edits"> Allow edits</label>${scope ? scopeBox() : ''}
     <span class="sp"></span><button class="cancel">Cancel</button><button class="stop" ${running ? '' : 'hidden'}>Stop</button>${gh ? '<button class="primary ghadd" title="Save the text as a pending GitHub comment on these lines; Review in the header posts it">Save to review</button>' : ''}<button class="queue" ${busy ? 'disabled' : ''} title="Save the question; 'Process N questions' in the header asks them all, one at a time">Add to batch</button><button class="primary ask" ${busy ? 'disabled' : ''}>Ask</button></div></div>`;
@@ -6274,10 +6368,15 @@ function selectLine(fi, k, extend){
   const anchor = {view:S.view, path:filePath(f), start:{side:lineSide(la), line:lineNo(la)}, end:{side:lineSide(lb), line:lineNo(lb)},
     text: f.flat.slice(a, b + 1).map(l => l.t + l.s).join('\n')};
   row.insertAdjacentHTML('afterend', `<tr class="trow new"><td colspan="${colCount(row)}"><div class="thread new">
-    <div class="thead"><span>${anchorLabel(anchor)}</span></div>${composerHtml(false, S.view === 'all' && !!S.gh?.pr, false, isCommit(S.view))}</div></td></tr>`);
+    <div class="thead"><span>${anchorLabel(anchor)}</span></div>${composerHtml(false, ghLines(), false, isCommit(S.view))}</div></td></tr>`);
   const th = $('.thread.new'); th._anchor = anchor;
-  setMode(th, ls.get('prv:linemode') === 'gh' ? 'gh' : 'claude');
+  setMode(th, ls.get('prv:linemode') === 'gh' && ghLines() === true ? 'gh' : 'claude');
   const ta = $('textarea', th); ta.value = draft; ta.focus();
+}
+function ghLines(){
+  // Lines that can take a GitHub comment: true, 'stale' when GitHub has another head, false outside a PR's lines.
+  if (!S.gh?.pr || !(S.view === 'all' || isCommit(S.view))) return false;
+  return S.gh.pr.head === S.meta.commits.at(-1)?.sha ? true : 'stale';
 }
 function openViewComposer(){
   clearSel();
@@ -6403,14 +6502,16 @@ function drawGitHub(){
     const row = lowestRow(at[0], at[1], at[1]);
     row.insertAdjacentHTML('afterend', `<tr class="trow ghrow" data-gh="${ti}"><td colspan="${colCount(row)}"><div class="thread gh"><div class="thead"><span>GitHub · ${esc(t.path.split('/').pop())}:${lineRef(t.anchor)}</span><span class="sp"></span><a data-ghask="${ti}">Discuss with Claude</a></div>${ghComments(t.comments)}${ghReplies(t)}</div></td></tr>`);
   });
-  // GitHub numbers lines as the PR head has them, which is what "All changes" shows.
+  // GitHub numbers lines as the PR head has them, which is what "All changes" shows; a draft written in a
+  // commit's view also keeps that commit's lines, and shows there too.
   // A draft written on another HEAD would land on whatever line has its number now; the Review card lists it.
   const head = S.meta?.commits.at(-1)?.sha;
-  if (S.view === 'all') for (const d of (g.drafts || []).filter(d => d.path && d.head === head)) {
-    const at = lineK({path: d.path, side: d.end.side, line: d.end.line});
+  for (const d of (g.drafts || []).filter(d => d.path && d.head === head)) {
+    const r = S.view === 'all' ? d : d.commit === S.view ? {path: d.cpath || d.path, start: d.cstart, end: d.cend} : null;
+    const at = r && lineK({path: r.path, side: r.end.side, line: r.end.line});
     if (!at) continue;
     const row = lowestRow(at[0], at[1], at[1]);
-    row.insertAdjacentHTML('afterend', `<tr class="trow ghrow ghdraft"><td colspan="${colCount(row)}"><div class="thread gh draft"><div class="thead"><span>GitHub · ${esc(d.path.split('/').pop())}:${rangeRef(d)}</span></div>${ghDraftHtml(d)}</div></td></tr>`);
+    row.insertAdjacentHTML('afterend', `<tr class="trow ghrow ghdraft"><td colspan="${colCount(row)}"><div class="thread gh draft"><div class="thead"><span>GitHub · ${esc(r.path.split('/').pop())}:${rangeRef(r)}</span></div>${ghDraftHtml(d)}</div></td></tr>`);
   }
   ghFoldLabel();
   // A commit view gets only the threads on its own lines, inline; the card belongs to the PR's views.
@@ -6492,7 +6593,7 @@ function openReview(keep){
   const c = $('#reviewcard'), g = S.gh, ds = g?.drafts || [];
   if (!g?.pr) return;
   const body = keep ? $('.rbody', c)?.value || '' : '', ev = keep ? $('input[name=rev]:checked', c)?.value : 'COMMENT';
-  const where = d => d.path ? `${esc(d.path)}:${rangeRef(d)}` : `reply on ${esc((g.threads || []).find(t => t.id === d.reply_to)?.path || 'a thread')}`;
+  const where = d => d.path ? `${esc(d.path)}:${rangeRef(d)}${d.commit ? ` (written on ${d.commit.slice(0, 7)})` : ''}` : `reply on ${esc((g.threads || []).find(t => t.id === d.reply_to)?.path || 'a thread')}`;
   $('#pushcard').hidden = $('#pullcard').hidden = true;
   c.innerHTML = `<div><b>Review of PR #${g.pr.number}</b> ${esc(g.pr.title)}</div>`
     + (ds.length ? `<ul>${ds.map(d => `<li>${where(d)}: ${esc(d.body.split('\n')[0].slice(0, 120))} <a data-ghdel="${esc(d.id)}">delete</a></li>`).join('')}</ul>`
